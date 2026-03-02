@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 /// The main LicenseSeat SDK client.
@@ -53,8 +53,6 @@ struct LicenseSeatInner {
     http: reqwest::Client,
     cache: LicenseCache,
     event_tx: broadcast::Sender<Event>,
-    /// Current online status.
-    online: RwLock<bool>,
     /// Flag to stop background tasks.
     background_tasks_running: AtomicBool,
 }
@@ -71,7 +69,6 @@ impl LicenseSeat {
             http,
             cache,
             event_tx,
-            online: RwLock::new(true),
             background_tasks_running: AtomicBool::new(false),
         });
 

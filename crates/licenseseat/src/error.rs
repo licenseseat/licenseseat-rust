@@ -133,6 +133,10 @@ impl Error {
 }
 
 /// Common API error codes returned by LicenseSeat.
+///
+/// These constants can be used to match against `Error::code()` for
+/// programmatic error handling.
+#[allow(dead_code)]
 pub mod codes {
     /// License key doesn't exist.
     pub const LICENSE_NOT_FOUND: &str = "license_not_found";

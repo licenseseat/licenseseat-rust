@@ -116,7 +116,8 @@ fn test_base64url_special_characters() {
     let standard = base64::engine::general_purpose::STANDARD.encode(&data);
     let url_safe = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&data);
 
-    // Standard might have + or /
+    // Standard contains + or / (non-URL-safe characters)
+    assert!(standard.contains('+') || standard.contains('/'));
     // URL safe should only have - or _ or alphanumeric
     assert!(url_safe.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
 }
