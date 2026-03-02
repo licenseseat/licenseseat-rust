@@ -14,7 +14,7 @@ pub fn verify_token(
     token: &OfflineTokenResponse,
     signing_key: &SigningKeyResponse,
 ) -> Result<bool> {
-    // Decode the public key
+    // Decode the public key (API returns standard Base64)
     let public_key_bytes = base64::engine::general_purpose::STANDARD
         .decode(&signing_key.public_key)
         .map_err(|e| Error::Crypto(format!("Failed to decode public key: {}", e)))?;
@@ -22,8 +22,8 @@ pub fn verify_token(
     let verifying_key = VerifyingKey::try_from(public_key_bytes.as_slice())
         .map_err(|e| Error::Crypto(format!("Invalid public key: {}", e)))?;
 
-    // Decode the signature
-    let signature_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+    // Decode the signature (API returns standard Base64)
+    let signature_bytes = base64::engine::general_purpose::STANDARD
         .decode(&token.signature.value)
         .map_err(|e| Error::Crypto(format!("Failed to decode signature: {}", e)))?;
 

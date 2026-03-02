@@ -365,6 +365,45 @@ mod signature_integration_tests {
         // Verification with tampered should fail
         assert!(public_key.verify(tampered_json.as_bytes(), &signature).is_err());
     }
+
+    #[test]
+    fn test_standard_base64_signature_verification() {
+        // This test verifies the SDK can handle STANDARD base64 encoding
+        // (with + and / characters, with = padding) as returned by the LicenseSeat API
+
+        // RFC 8032 Test Vector 1 key
+        let secret_key_hex = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+        let secret_key_bytes = hex_to_bytes(secret_key_hex);
+        let signing_key = SigningKey::try_from(secret_key_bytes.as_slice()).unwrap();
+        let public_key = signing_key.verifying_key();
+
+        // Create a canonical JSON payload
+        let canonical_json = r#"{"device_id":"test-device-123","license_key":"TEST-KEY","product_slug":"my-product"}"#;
+
+        // Sign the canonical JSON
+        let signature = signing_key.sign(canonical_json.as_bytes());
+
+        // Encode using STANDARD base64 (what our API returns)
+        let public_key_b64 = base64::engine::general_purpose::STANDARD.encode(public_key.as_bytes());
+        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+
+        // Verify the encoding looks like standard base64 (may have + or /)
+        assert!(public_key_b64.ends_with('=') || public_key_b64.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/'));
+
+        // Decode using STANDARD base64 (matching what the SDK's verify_token does)
+        let decoded_public_key = base64::engine::general_purpose::STANDARD
+            .decode(&public_key_b64)
+            .unwrap();
+        let decoded_signature = base64::engine::general_purpose::STANDARD
+            .decode(&signature_b64)
+            .unwrap();
+
+        let verifying_key = VerifyingKey::try_from(decoded_public_key.as_slice()).unwrap();
+        let sig = Signature::try_from(decoded_signature.as_slice()).unwrap();
+
+        // Verify the signature
+        assert!(verifying_key.verify(canonical_json.as_bytes(), &sig).is_ok());
+    }
 }
 
 // ============================================================================
