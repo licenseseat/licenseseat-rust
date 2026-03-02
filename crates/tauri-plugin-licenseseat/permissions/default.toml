@@ -1,0 +1,13 @@
+[default]
+description = "Default permissions for LicenseSeat plugin"
+permissions = [
+    "allow-activate",
+    "allow-validate",
+    "allow-deactivate",
+    "allow-heartbeat",
+    "allow-get-status",
+    "allow-check-entitlement",
+    "allow-has-entitlement",
+    "allow-get-license",
+    "allow-reset",
+]

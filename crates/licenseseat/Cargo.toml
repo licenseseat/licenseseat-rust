@@ -1,0 +1,70 @@
+[package]
+name = "licenseseat"
+description = "Official Rust SDK for LicenseSeat - simple, secure software licensing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[features]
+default = ["rustls"]
+rustls = ["reqwest/rustls-tls"]
+native-tls = ["reqwest/native-tls"]
+offline = ["dep:ed25519-dalek", "dep:sha2", "dep:base64"]  # Ed25519 offline validation
+
+[dependencies]
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Async
+tokio.workspace = true
+
+# HTTP client
+reqwest.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Time/dates
+chrono.workspace = true
+
+# Crypto (optional, for offline validation)
+ed25519-dalek = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+# Device fingerprinting
+machine-uid = "0.5"
+
+# URL handling
+url = "2"
+
+# Cache directory
+dirs = "5"
+
+# Hostname for device ID fallback
+hostname = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+wiremock = "0.6"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "dev_heartbeat"
+required-features = []
+
+[[example]]
+name = "stress_test"
+required-features = []

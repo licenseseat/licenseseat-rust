@@ -1,0 +1,49 @@
+{
+  "name": "@licenseseat/tauri-plugin",
+  "version": "0.1.0",
+  "description": "Tauri plugin for LicenseSeat software licensing",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "guest-js"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "tauri",
+    "tauri-plugin",
+    "licensing",
+    "license-management",
+    "software-licensing",
+    "licenseseat"
+  ],
+  "author": "LicenseSeat <hello@licenseseat.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/licenseseat/licenseseat-rust.git",
+    "directory": "crates/tauri-plugin-licenseseat"
+  },
+  "homepage": "https://licenseseat.com",
+  "bugs": {
+    "url": "https://github.com/licenseseat/licenseseat-rust/issues"
+  },
+  "peerDependencies": {
+    "@tauri-apps/api": ">=2.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,47 @@
+[package]
+name = "tauri-plugin-licenseseat"
+links = "tauri-plugin-licenseseat"
+description = "Tauri plugin for LicenseSeat software licensing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["tauri", "tauri-plugin", "licensing", "license-management"]
+categories = ["gui", "api-bindings"]
+readme = "README.md"
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+[dependencies]
+# Core SDK (re-exported)
+licenseseat = { workspace = true, features = ["offline"] }
+
+# Tauri
+tauri = "2"
+tauri-plugin = "2"
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Async
+tokio.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
