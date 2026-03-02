@@ -23,6 +23,7 @@ Official Rust SDK and Tauri plugin for [LicenseSeat](https://licenseseat.com) â€
 - [Configuration Reference](#configuration-reference)
 - [Examples](#examples)
 - [Documentation](#documentation)
+- [Publishing](#publishing)
 - [Other SDKs](#other-sdks)
 - [License](#license)
 
@@ -40,12 +41,13 @@ Official Rust SDK and Tauri plugin for [LicenseSeat](https://licenseseat.com) â€
 
 ## Packages
 
-This monorepo contains two crates:
+This monorepo contains:
 
-| Crate | Description | Links |
-|-------|-------------|-------|
+| Package | Description | Links |
+|---------|-------------|-------|
 | [`licenseseat`](./crates/licenseseat) | Core Rust SDK for any Rust application | [![crates.io](https://img.shields.io/crates/v/licenseseat.svg)](https://crates.io/crates/licenseseat) [![docs](https://docs.rs/licenseseat/badge.svg)](https://docs.rs/licenseseat) |
-| [`tauri-plugin-licenseseat`](./crates/tauri-plugin-licenseseat) | Tauri v2 plugin with TypeScript bindings | [![crates.io](https://img.shields.io/crates/v/tauri-plugin-licenseseat.svg)](https://crates.io/crates/tauri-plugin-licenseseat) [![npm](https://img.shields.io/npm/v/@licenseseat/tauri-plugin.svg)](https://www.npmjs.com/package/@licenseseat/tauri-plugin) |
+| [`tauri-plugin-licenseseat`](./crates/tauri-plugin-licenseseat) | Tauri v2 plugin (Rust side) | [![crates.io](https://img.shields.io/crates/v/tauri-plugin-licenseseat.svg)](https://crates.io/crates/tauri-plugin-licenseseat) |
+| [`@licenseseat/tauri-plugin`](./crates/tauri-plugin-licenseseat) | Tauri v2 plugin (JS/TS bindings) | [![npm](https://img.shields.io/npm/v/@licenseseat/tauri-plugin.svg)](https://www.npmjs.com/package/@licenseseat/tauri-plugin) |
 
 ## Quick Start
 
@@ -313,6 +315,53 @@ cargo run --example stress_test
 - **Tauri Plugin:** [docs.rs/tauri-plugin-licenseseat](https://docs.rs/tauri-plugin-licenseseat)
 - **Platform Docs:** [docs.licenseseat.com](https://docs.licenseseat.com)
 - **API Reference:** [docs.licenseseat.com/api](https://docs.licenseseat.com/api)
+
+## Publishing
+
+To release a new version:
+
+**1. Bump version in `Cargo.toml` (workspace) and `package.json`:**
+
+```bash
+# Edit Cargo.toml workspace version
+# Edit crates/tauri-plugin-licenseseat/package.json version
+# Edit crates/tauri-plugin-licenseseat/Cargo.toml dependency version
+```
+
+**2. Update CHANGELOG.md**
+
+**3. Commit, tag, and push:**
+
+```bash
+git add -A
+git commit -m "Bump version to X.Y.Z"
+git tag -a vX.Y.Z -m "Release vX.Y.Z"
+git push origin main --tags
+```
+
+**4. Create GitHub release:**
+
+```bash
+gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes
+```
+
+**5. Publish to crates.io (order matters):**
+
+```bash
+# Core SDK first
+cd crates/licenseseat && cargo publish
+
+# Wait for it to be available, then Tauri plugin
+cd ../tauri-plugin-licenseseat && cargo publish
+```
+
+**6. Publish to npm:**
+
+```bash
+cd crates/tauri-plugin-licenseseat
+npm run build
+npm publish --access public
+```
 
 ## Other SDKs
 
