@@ -99,6 +99,12 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 Some(app.package_info().name.clone())
             });
 
+            // Parse offline fallback mode from config string
+            let offline_fallback_mode = match config.offline_fallback_mode.as_deref() {
+                Some("always") | Some("allow_offline") => licenseseat::OfflineFallbackMode::Always,
+                _ => licenseseat::OfflineFallbackMode::NetworkOnly,
+            };
+
             // Convert plugin config to SDK config
             let sdk_config = licenseseat::Config {
                 api_key: config.api_key.clone(),
@@ -112,6 +118,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 heartbeat_interval: std::time::Duration::from_secs(
                     config.heartbeat_interval.unwrap_or(300),
                 ),
+                offline_fallback_mode,
                 max_offline_days: config.max_offline_days.unwrap_or(0),
                 debug: config.debug.unwrap_or(false),
                 telemetry_enabled: config.telemetry_enabled.unwrap_or(true),
