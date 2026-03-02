@@ -62,6 +62,16 @@ pub enum EventKind {
     /// Offline token verification failed.
     OfflineTokenVerificationFailed,
 
+    // Offline validation
+    /// Offline validation started.
+    OfflineValidationStart,
+    /// Offline validation succeeded.
+    OfflineValidationSuccess,
+    /// Offline validation failed.
+    OfflineValidationFailed,
+    /// Offline assets (token + key) refreshed.
+    OfflineAssetsRefreshed,
+
     // Auto-validation
     /// Auto-validation cycle triggered.
     AutoValidationCycle,
@@ -146,6 +156,10 @@ impl std::fmt::Display for EventKind {
             Self::LicenseRevoked => "license:revoked",
             Self::OfflineTokenVerified => "offlineToken:verified",
             Self::OfflineTokenVerificationFailed => "offlineToken:verificationFailed",
+            Self::OfflineValidationStart => "offlineValidation:start",
+            Self::OfflineValidationSuccess => "offlineValidation:success",
+            Self::OfflineValidationFailed => "offlineValidation:failed",
+            Self::OfflineAssetsRefreshed => "offlineAssets:refreshed",
             Self::AutoValidationCycle => "autovalidation:cycle",
             Self::AutoValidationStopped => "autovalidation:stopped",
             Self::NetworkOnline => "network:online",

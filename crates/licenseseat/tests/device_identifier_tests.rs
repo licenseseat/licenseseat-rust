@@ -113,12 +113,17 @@ async fn test_device_id_is_stable() {
     let sdk2 = LicenseSeat::new(config);
     let _ = sdk2.activate("TEST-KEY").await;
 
-    // Check the requests that were made
+    // Check the requests that were made (filter to activation requests only,
+    // since background tasks may spawn additional requests like offline-token sync)
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2);
+    let activation_requests: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path().contains("/activate"))
+        .collect();
+    assert_eq!(activation_requests.len(), 2);
 
-    let body1: Value = serde_json::from_slice(&requests[0].body).unwrap();
-    let body2: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let body1: Value = serde_json::from_slice(&activation_requests[0].body).unwrap();
+    let body2: Value = serde_json::from_slice(&activation_requests[1].body).unwrap();
 
     let device_id1 = body1["device_id"].as_str().unwrap();
     let device_id2 = body2["device_id"].as_str().unwrap();

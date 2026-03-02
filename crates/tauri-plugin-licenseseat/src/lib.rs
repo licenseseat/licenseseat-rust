@@ -89,6 +89,16 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
         .setup(|app, api| {
             let config = api.config().clone();
 
+            // Auto-detect app version from Tauri package info if not explicitly set
+            let app_version = config.app_version.clone().or_else(|| {
+                Some(app.package_info().version.to_string())
+            });
+
+            // Auto-detect app name for build info if not set
+            let app_build = config.app_build.clone().or_else(|| {
+                Some(app.package_info().name.clone())
+            });
+
             // Convert plugin config to SDK config
             let sdk_config = licenseseat::Config {
                 api_key: config.api_key.clone(),
@@ -105,8 +115,8 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 max_offline_days: config.max_offline_days.unwrap_or(0),
                 debug: config.debug.unwrap_or(false),
                 telemetry_enabled: config.telemetry_enabled.unwrap_or(true),
-                app_version: config.app_version.clone(),
-                app_build: config.app_build.clone(),
+                app_version,
+                app_build,
                 ..Default::default()
             };
 

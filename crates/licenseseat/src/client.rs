@@ -11,10 +11,11 @@ use chrono::Utc;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// The main LicenseSeat SDK client.
 ///
@@ -54,6 +55,8 @@ struct LicenseSeatInner {
     event_tx: broadcast::Sender<Event>,
     /// Current online status.
     online: RwLock<bool>,
+    /// Flag to stop background tasks.
+    background_tasks_running: AtomicBool,
 }
 
 impl LicenseSeat {
@@ -69,6 +72,7 @@ impl LicenseSeat {
             cache,
             event_tx,
             online: RwLock::new(true),
+            background_tasks_running: AtomicBool::new(false),
         });
 
         let sdk = Self { inner };
@@ -76,7 +80,10 @@ impl LicenseSeat {
         // Check for cached license on startup
         if let Some(license) = sdk.inner.cache.get_license() {
             debug!("Loaded cached license: {}", license.license_key);
-            sdk.emit(Event::with_license(EventKind::LicenseLoaded, license));
+            sdk.emit(Event::with_license(EventKind::LicenseLoaded, license.clone()));
+
+            // Start background tasks if we have a cached license
+            sdk.start_background_tasks();
         }
 
         sdk
@@ -142,6 +149,20 @@ impl LicenseSeat {
 
                 self.inner.cache.set_license(&license)?;
                 self.emit(Event::with_license(EventKind::ActivationSuccess, license.clone()));
+
+                // Start background tasks
+                self.start_background_tasks();
+
+                // Sync offline assets (non-blocking)
+                #[cfg(feature = "offline")]
+                {
+                    let sdk = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = sdk.sync_offline_assets().await {
+                            warn!("Failed to sync offline assets: {}", e);
+                        }
+                    });
+                }
 
                 info!("License activated: {}", license_key);
                 Ok(license)
@@ -222,6 +243,9 @@ impl LicenseSeat {
     pub async fn deactivate(&self) -> Result<()> {
         let product_slug = self.require_product_slug()?;
         let license = self.inner.cache.get_license().ok_or(Error::NoActiveLicense)?;
+
+        // Stop background tasks
+        self.stop_background_tasks();
 
         self.emit(Event::new(EventKind::DeactivationStart));
 
@@ -393,6 +417,8 @@ impl LicenseSeat {
 
     /// Reset SDK state (clears cache and stops timers).
     pub fn reset(&self) {
+        // Stop background tasks first
+        self.stop_background_tasks();
         self.inner.cache.clear();
         self.emit(Event::new(EventKind::SdkReset));
         info!("SDK state reset");
@@ -401,6 +427,203 @@ impl LicenseSeat {
     /// Subscribe to SDK events.
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.inner.event_tx.subscribe()
+    }
+
+    // ========================================================================
+    // Background Tasks
+    // ========================================================================
+
+    /// Start background validation and heartbeat tasks.
+    ///
+    /// This is called automatically after activation or when loading a cached license.
+    /// You typically don't need to call this manually.
+    pub fn start_background_tasks(&self) {
+        // Don't start if already running
+        if self.inner.background_tasks_running.swap(true, Ordering::SeqCst) {
+            debug!("Background tasks already running");
+            return;
+        }
+
+        info!("Starting background tasks");
+
+        // Try to spawn on existing runtime, fall back to creating a new one
+        let validate_interval = self.inner.config.auto_validate_interval;
+        let heartbeat_interval = self.inner.config.heartbeat_interval;
+        #[cfg(feature = "offline")]
+        let refresh_interval = self.inner.config.offline_token_refresh_interval;
+
+        // Clone SDK for the background thread
+        let sdk = self.clone();
+
+        // Spawn a dedicated thread with its own Tokio runtime for background tasks
+        // This ensures the tasks run regardless of the caller's runtime context
+        std::thread::Builder::new()
+            .name("licenseseat-background".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        warn!("Failed to create background runtime: {}", e);
+                        sdk.inner.background_tasks_running.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                };
+
+                rt.block_on(async {
+                    let mut tasks = Vec::new();
+
+                    // Start auto-validation task
+                    if !validate_interval.is_zero() {
+                        let sdk_clone = sdk.clone();
+                        tasks.push(tokio::spawn(async move {
+                            sdk_clone.auto_validation_loop(validate_interval).await;
+                        }));
+                    }
+
+                    // Start heartbeat task
+                    if !heartbeat_interval.is_zero() {
+                        let sdk_clone = sdk.clone();
+                        tasks.push(tokio::spawn(async move {
+                            sdk_clone.heartbeat_loop(heartbeat_interval).await;
+                        }));
+                    }
+
+                    // Start offline asset refresh task
+                    #[cfg(feature = "offline")]
+                    if !refresh_interval.is_zero() {
+                        let sdk_clone = sdk.clone();
+                        tasks.push(tokio::spawn(async move {
+                            sdk_clone.offline_refresh_loop(refresh_interval).await;
+                        }));
+                    }
+
+                    // Wait for all tasks (they run until stopped)
+                    for task in tasks {
+                        let _ = task.await;
+                    }
+                });
+
+                info!("Background tasks thread exiting");
+            })
+            .expect("Failed to spawn background thread");
+    }
+
+    /// Stop all background tasks.
+    pub fn stop_background_tasks(&self) {
+        info!("Stopping background tasks");
+        self.inner.background_tasks_running.store(false, Ordering::SeqCst);
+    }
+
+    /// Generic background task loop runner.
+    /// Handles the common pattern of: sleep -> check stop flag -> check license -> run task.
+    async fn run_background_loop<F, Fut>(&self, name: &str, interval: Duration, task: F)
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        debug!("{} loop started with interval {:?}", name, interval);
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            if !self.inner.background_tasks_running.load(Ordering::SeqCst) {
+                debug!("{} loop stopping", name);
+                break;
+            }
+
+            if self.inner.cache.get_license().is_none() {
+                debug!("No active license, skipping {}", name);
+                continue;
+            }
+
+            task().await;
+        }
+    }
+
+    /// Auto-validation loop that runs in the background.
+    async fn auto_validation_loop(&self, interval: Duration) {
+        self.run_background_loop("Auto-validation", interval, || async {
+            debug!("Running auto-validation");
+            match self.validate().await {
+                Ok(result) if result.valid => debug!("Auto-validation successful"),
+                Ok(result) => warn!("Auto-validation failed: {:?}", result.code),
+                Err(e) => warn!("Auto-validation error: {}", e),
+            }
+        })
+        .await;
+    }
+
+    /// Heartbeat loop that runs in the background.
+    async fn heartbeat_loop(&self, interval: Duration) {
+        self.run_background_loop("Heartbeat", interval, || async {
+            debug!("Sending heartbeat");
+            match self.heartbeat().await {
+                Ok(_) => debug!("Heartbeat sent successfully"),
+                Err(e) => warn!("Heartbeat error: {}", e),
+            }
+        })
+        .await;
+    }
+
+    /// Offline asset refresh loop.
+    #[cfg(feature = "offline")]
+    async fn offline_refresh_loop(&self, interval: Duration) {
+        self.run_background_loop("Offline refresh", interval, || async {
+            debug!("Refreshing offline assets");
+            if let Err(e) = self.sync_offline_assets().await {
+                warn!("Offline asset refresh error: {}", e);
+            }
+        })
+        .await;
+    }
+
+    // ========================================================================
+    // Offline Validation
+    // ========================================================================
+
+    /// Sync offline assets (token and signing key) from the server.
+    ///
+    /// This downloads and caches the offline token and signing key for
+    /// offline validation when network is unavailable.
+    #[cfg(feature = "offline")]
+    pub async fn sync_offline_assets(&self) -> Result<()> {
+        use crate::models::{OfflineTokenResponse, SigningKeyResponse};
+
+        let license = self.inner.cache.get_license().ok_or(Error::NoActiveLicense)?;
+        let product_slug = self.require_product_slug()?;
+
+        info!("Syncing offline assets");
+
+        // Fetch offline token via POST with device_id in body
+        let path = format!(
+            "/products/{}/licenses/{}/offline_token",
+            product_slug, license.license_key
+        );
+        let body = serde_json::json!({
+            "device_id": license.device_id
+        });
+        let token: OfflineTokenResponse = self.post(&path, Some(body)).await?;
+
+        // Cache the offline token
+        self.inner.cache.set_offline_token(&token)?;
+        debug!("Offline token cached (expires: {})", token.token.exp);
+
+        // Fetch the signing key for this token
+        let key_id = &token.signature.key_id;
+        let key_path = format!("/signing_keys/{}", key_id);
+        let signing_key: SigningKeyResponse = self.get(&key_path).await?;
+
+        // Cache the signing key
+        self.inner.cache.set_signing_key(key_id, &signing_key)?;
+        debug!("Signing key cached: {}", key_id);
+
+        self.emit(Event::new(EventKind::OfflineAssetsRefreshed));
+        info!("Offline assets synced successfully");
+
+        Ok(())
     }
 
     // ========================================================================
@@ -427,9 +650,87 @@ impl LicenseSeat {
 
     #[cfg(feature = "offline")]
     async fn validate_offline(&self) -> Result<ValidationResult> {
-        // Offline validation implementation would go here
-        // For now, return an error
-        Err(Error::OfflineVerificationFailed("Offline validation not implemented".into()))
+        use crate::offline;
+
+        info!("Attempting offline validation");
+        self.emit(Event::new(EventKind::OfflineValidationStart));
+
+        // Get cached offline token
+        let token = self.inner.cache.get_offline_token().ok_or_else(|| {
+            Error::OfflineVerificationFailed("No offline token cached".into())
+        })?;
+
+        // Get cached signing key
+        let key_id = &token.signature.key_id;
+        let signing_key = self.inner.cache.get_signing_key(key_id).ok_or_else(|| {
+            Error::OfflineVerificationFailed(format!("Signing key {} not found", key_id))
+        })?;
+
+        // Verify the signature
+        let signature_valid = offline::verify_token(&token, &signing_key)?;
+        if !signature_valid {
+            self.emit(Event::with_error(
+                EventKind::OfflineValidationFailed,
+                "Signature verification failed",
+            ));
+            return Err(Error::OfflineVerificationFailed(
+                "Signature verification failed".to_string(),
+            ));
+        }
+        debug!("Offline token signature verified");
+
+        // Check token validity (expiration, not-before)
+        offline::check_token_validity(&token)?;
+        debug!("Offline token time validity confirmed");
+
+        // Check max offline days
+        if self.inner.config.max_offline_days > 0 {
+            if let Some(last_validated) = self.inner.cache.get_license().map(|l| l.last_validated) {
+                let offline_duration = Utc::now().signed_duration_since(last_validated);
+                let max_offline = chrono::Duration::days(self.inner.config.max_offline_days as i64);
+                if offline_duration > max_offline {
+                    self.emit(Event::with_error(
+                        EventKind::OfflineValidationFailed,
+                        "Exceeded maximum offline days",
+                    ));
+                    return Err(Error::OfflineVerificationFailed(format!(
+                        "Exceeded maximum offline period ({} days)",
+                        self.inner.config.max_offline_days
+                    )));
+                }
+            }
+        }
+
+        // Clock tampering detection
+        let now = Utc::now().timestamp();
+        if let Some(last_seen) = self.inner.cache.get_last_seen_timestamp() {
+            let max_skew = self.inner.config.max_clock_skew.as_secs() as i64;
+            if now < last_seen - max_skew {
+                self.emit(Event::with_error(
+                    EventKind::OfflineValidationFailed,
+                    "Clock tampering detected",
+                ));
+                return Err(Error::OfflineVerificationFailed(
+                    "Clock tampering detected: system clock appears to have gone backwards".to_string(),
+                ));
+            }
+        }
+        // Update last seen timestamp
+        let _ = self.inner.cache.set_last_seen_timestamp(now);
+
+        // Convert token to ValidationResult
+        let result = offline::token_to_validation_result(&token);
+
+        // Update cache with offline validation result
+        self.inner.cache.update_validation(&result)?;
+
+        self.emit(Event::with_validation(
+            EventKind::OfflineValidationSuccess,
+            result.clone(),
+        ));
+        info!("Offline validation successful");
+
+        Ok(result)
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
