@@ -749,9 +749,8 @@ impl LicenseSeat {
     ) -> Result<T> {
         let url = format!("{}{}", self.inner.config.api_base_url, path);
 
-        let mut request = self.inner.http.request(method, &url);
-
-        if let Some(b) = body {
+        // Prepare body once (with telemetry if enabled)
+        let json_body: Option<serde_json::Value> = if let Some(b) = body {
             let mut json_body = serde_json::to_value(&b)?;
 
             // Add telemetry if enabled
@@ -765,10 +764,12 @@ impl LicenseSeat {
                 }
             }
 
-            request = request.json(&json_body);
-        }
+            Some(json_body)
+        } else {
+            None
+        };
 
-        // Retry logic
+        // Retry logic - rebuild request for each attempt (reqwest bodies can't always be cloned)
         let mut last_error = None;
         for attempt in 0..=self.inner.config.max_retries {
             if attempt > 0 {
@@ -777,7 +778,13 @@ impl LicenseSeat {
                 debug!("Retry attempt {} for {}", attempt, path);
             }
 
-            match request.try_clone().unwrap().send().await {
+            // Build fresh request for each attempt
+            let mut request = self.inner.http.request(method.clone(), &url);
+            if let Some(ref body) = json_body {
+                request = request.json(body);
+            }
+
+            match request.send().await {
                 Ok(response) => {
                     let status = response.status().as_u16();
 
