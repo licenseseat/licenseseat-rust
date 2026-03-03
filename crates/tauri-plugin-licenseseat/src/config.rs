@@ -41,8 +41,10 @@ pub struct PluginConfig {
     pub heartbeat_interval: Option<u64>,
 
     /// Offline fallback mode: "networkOnly", "always", or "allow_offline".
+    ///
     /// - "networkOnly": Only fall back to offline validation for network errors
     /// - "always" / "allow_offline": Always fall back to offline validation
+    ///
     /// Default: "networkOnly"
     #[serde(default)]
     pub offline_fallback_mode: Option<String>,
