@@ -2,8 +2,8 @@
 
 use chrono::{TimeZone, Utc};
 use licenseseat::{
-    ActivationOptions, Config, Entitlement, EntitlementReason, EntitlementStatus,
-    LicenseStatus, LicenseStatusDetails, OfflineFallbackMode,
+    ActivationOptions, Config, Entitlement, EntitlementReason, EntitlementStatus, LicenseStatus,
+    LicenseStatusDetails, OfflineFallbackMode,
 };
 
 // ============================================================================

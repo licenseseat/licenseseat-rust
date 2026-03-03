@@ -27,7 +27,9 @@ impl LicenseCache {
 
     /// Get the path for a cache key.
     fn path(&self, key: &str) -> Option<PathBuf> {
-        self.cache_dir.as_ref().map(|d| d.join(format!("{}{}.json", self.prefix, key)))
+        self.cache_dir
+            .as_ref()
+            .map(|d| d.join(format!("{}{}.json", self.prefix, key)))
     }
 
     /// Ensure the cache directory exists.
@@ -124,7 +126,11 @@ impl LicenseCache {
 
     /// Store a signing key.
     #[cfg(feature = "offline")]
-    pub fn set_signing_key(&self, key_id: &str, key: &crate::models::SigningKeyResponse) -> Result<()> {
+    pub fn set_signing_key(
+        &self,
+        key_id: &str,
+        key: &crate::models::SigningKeyResponse,
+    ) -> Result<()> {
         self.set(&format!("signing_key_{}", key_id), key)
     }
 

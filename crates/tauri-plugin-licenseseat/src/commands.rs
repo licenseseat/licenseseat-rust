@@ -157,36 +157,28 @@ pub async fn activate(
 
 /// Validate the current license.
 #[tauri::command]
-pub async fn validate(
-    sdk: State<'_, licenseseat::LicenseSeat>,
-) -> Result<ValidationResult> {
+pub async fn validate(sdk: State<'_, licenseseat::LicenseSeat>) -> Result<ValidationResult> {
     let result = sdk.validate().await?;
     Ok(result)
 }
 
 /// Deactivate the current license.
 #[tauri::command]
-pub async fn deactivate(
-    sdk: State<'_, licenseseat::LicenseSeat>,
-) -> Result<()> {
+pub async fn deactivate(sdk: State<'_, licenseseat::LicenseSeat>) -> Result<()> {
     sdk.deactivate().await?;
     Ok(())
 }
 
 /// Send a heartbeat.
 #[tauri::command]
-pub async fn heartbeat(
-    sdk: State<'_, licenseseat::LicenseSeat>,
-) -> Result<()> {
+pub async fn heartbeat(sdk: State<'_, licenseseat::LicenseSeat>) -> Result<()> {
     sdk.heartbeat().await?;
     Ok(())
 }
 
 /// Get the current license status.
 #[tauri::command]
-pub fn get_status(
-    sdk: State<'_, licenseseat::LicenseSeat>,
-) -> StatusResponse {
+pub fn get_status(sdk: State<'_, licenseseat::LicenseSeat>) -> StatusResponse {
     sdk.status().into()
 }
 
@@ -201,18 +193,13 @@ pub fn check_entitlement(
 
 /// Check if an entitlement is active (returns bool).
 #[tauri::command]
-pub fn has_entitlement(
-    sdk: State<'_, licenseseat::LicenseSeat>,
-    entitlement_key: String,
-) -> bool {
+pub fn has_entitlement(sdk: State<'_, licenseseat::LicenseSeat>, entitlement_key: String) -> bool {
     sdk.has_entitlement(&entitlement_key)
 }
 
 /// Get the current cached license.
 #[tauri::command]
-pub fn get_license(
-    sdk: State<'_, licenseseat::LicenseSeat>,
-) -> Option<LicenseResponse> {
+pub fn get_license(sdk: State<'_, licenseseat::LicenseSeat>) -> Option<LicenseResponse> {
     sdk.current_license().map(Into::into)
 }
 

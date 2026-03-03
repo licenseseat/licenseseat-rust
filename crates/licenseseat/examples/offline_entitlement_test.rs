@@ -36,10 +36,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("3. Online validation...");
     let result = sdk.validate().await?;
     println!("   Valid: {}", result.valid);
-    println!("   Entitlements from API: {:?}", result.license.active_entitlements);
-    
+    println!(
+        "   Entitlements from API: {:?}",
+        result.license.active_entitlements
+    );
+
     let updates = sdk.check_entitlement("updates");
-    println!("   check_entitlement('updates'): active={}, reason={:?}\n", updates.active, updates.reason);
+    println!(
+        "   check_entitlement('updates'): active={}, reason={:?}\n",
+        updates.active, updates.reason
+    );
 
     // Step 4: Test offline (broken URL)
     println!("4. Testing OFFLINE validation with entitlements...");
@@ -57,15 +63,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let offline_sdk = LicenseSeat::new(offline_config);
-    
+
     match offline_sdk.validate().await {
         Ok(result) => {
             println!("   ✓ Offline validation succeeded!");
-            println!("   Entitlements from offline token: {:?}", result.license.active_entitlements);
-            
+            println!(
+                "   Entitlements from offline token: {:?}",
+                result.license.active_entitlements
+            );
+
             let updates = offline_sdk.check_entitlement("updates");
-            println!("   check_entitlement('updates'): active={}, reason={:?}", updates.active, updates.reason);
-            
+            println!(
+                "   check_entitlement('updates'): active={}, reason={:?}",
+                updates.active, updates.reason
+            );
+
             if updates.active {
                 println!("\n=== SUCCESS: Entitlements work offline! ===");
             } else {

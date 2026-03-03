@@ -5,14 +5,14 @@ use crate::config::{Config, OfflineFallbackMode};
 use crate::error::{Error, Result};
 use crate::events::{Event, EventKind};
 use crate::models::*;
-use crate::telemetry::{generate_device_id, Telemetry};
+use crate::telemetry::{Telemetry, generate_device_id};
 
 use chrono::Utc;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -77,7 +77,10 @@ impl LicenseSeat {
         // Check for cached license on startup
         if let Some(license) = sdk.inner.cache.get_license() {
             debug!("Loaded cached license: {}", license.license_key);
-            sdk.emit(Event::with_license(EventKind::LicenseLoaded, license.clone()));
+            sdk.emit(Event::with_license(
+                EventKind::LicenseLoaded,
+                license.clone(),
+            ));
 
             // Start background tasks if we have a cached license
             sdk.start_background_tasks();
@@ -102,7 +105,8 @@ impl LicenseSeat {
     /// - The seat limit has been exceeded
     /// - Network errors occur
     pub async fn activate(&self, license_key: &str) -> Result<License> {
-        self.activate_with_options(license_key, ActivationOptions::default()).await
+        self.activate_with_options(license_key, ActivationOptions::default())
+            .await
     }
 
     /// Activate a license with custom options.
@@ -131,7 +135,10 @@ impl LicenseSeat {
             body["metadata"] = serde_json::json!(metadata);
         }
 
-        let path = format!("/products/{}/licenses/{}/activate", product_slug, license_key);
+        let path = format!(
+            "/products/{}/licenses/{}/activate",
+            product_slug, license_key
+        );
 
         match self.post::<ActivationResponse>(&path, Some(body)).await {
             Ok(activation) => {
@@ -145,7 +152,10 @@ impl LicenseSeat {
                 };
 
                 self.inner.cache.set_license(&license)?;
-                self.emit(Event::with_license(EventKind::ActivationSuccess, license.clone()));
+                self.emit(Event::with_license(
+                    EventKind::ActivationSuccess,
+                    license.clone(),
+                ));
 
                 // Start background tasks
                 self.start_background_tasks();
@@ -177,7 +187,11 @@ impl LicenseSeat {
     /// If validation fails and offline fallback is enabled, it will
     /// attempt offline validation.
     pub async fn validate(&self) -> Result<ValidationResult> {
-        let license = self.inner.cache.get_license().ok_or(Error::NoActiveLicense)?;
+        let license = self
+            .inner
+            .cache
+            .get_license()
+            .ok_or(Error::NoActiveLicense)?;
         self.validate_key(&license.license_key).await
     }
 
@@ -193,19 +207,34 @@ impl LicenseSeat {
             body.insert("device_id".into(), serde_json::json!(id));
         }
 
-        let path = format!("/products/{}/licenses/{}/validate", product_slug, license_key);
-        let body = if body.is_empty() { None } else { Some(serde_json::Value::Object(body)) };
+        let path = format!(
+            "/products/{}/licenses/{}/validate",
+            product_slug, license_key
+        );
+        let body = if body.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(body))
+        };
 
         match self.post::<ValidationResult>(&path, body).await {
             Ok(result) => {
                 self.inner.cache.update_validation(&result)?;
-                self.inner.cache.set_last_seen_timestamp(Utc::now().timestamp())?;
+                self.inner
+                    .cache
+                    .set_last_seen_timestamp(Utc::now().timestamp())?;
 
                 if result.valid {
-                    self.emit(Event::with_validation(EventKind::ValidationSuccess, result.clone()));
+                    self.emit(Event::with_validation(
+                        EventKind::ValidationSuccess,
+                        result.clone(),
+                    ));
                     info!("License validated successfully");
                 } else {
-                    self.emit(Event::with_validation(EventKind::ValidationFailed, result.clone()));
+                    self.emit(Event::with_validation(
+                        EventKind::ValidationFailed,
+                        result.clone(),
+                    ));
                     warn!("License validation failed: {:?}", result.code);
                 }
 
@@ -239,7 +268,11 @@ impl LicenseSeat {
     /// This releases the seat so it can be used on another device.
     pub async fn deactivate(&self) -> Result<()> {
         let product_slug = self.require_product_slug()?;
-        let license = self.inner.cache.get_license().ok_or(Error::NoActiveLicense)?;
+        let license = self
+            .inner
+            .cache
+            .get_license()
+            .ok_or(Error::NoActiveLicense)?;
 
         // Stop background tasks
         self.stop_background_tasks();
@@ -269,8 +302,15 @@ impl LicenseSeat {
                     }
                     if *status == 422 {
                         if let Some(c) = code {
-                            if ["revoked", "already_deactivated", "not_active", "not_found", "suspended", "expired"]
-                                .contains(&c.as_str())
+                            if [
+                                "revoked",
+                                "already_deactivated",
+                                "not_active",
+                                "not_found",
+                                "suspended",
+                                "expired",
+                            ]
+                            .contains(&c.as_str())
                             {
                                 self.inner.cache.clear();
                                 self.emit(Event::new(EventKind::DeactivationSuccess));
@@ -280,7 +320,10 @@ impl LicenseSeat {
                     }
                 }
 
-                self.emit(Event::with_error(EventKind::DeactivationError, e.to_string()));
+                self.emit(Event::with_error(
+                    EventKind::DeactivationError,
+                    e.to_string(),
+                ));
                 Err(e)
             }
         }
@@ -289,7 +332,11 @@ impl LicenseSeat {
     /// Send a heartbeat for the current license.
     pub async fn heartbeat(&self) -> Result<HeartbeatResponse> {
         let product_slug = self.require_product_slug()?;
-        let license = self.inner.cache.get_license().ok_or(Error::NoActiveLicense)?;
+        let license = self
+            .inner
+            .cache
+            .get_license()
+            .ok_or(Error::NoActiveLicense)?;
 
         let path = format!(
             "/products/{}/licenses/{}/heartbeat",
@@ -436,7 +483,11 @@ impl LicenseSeat {
     /// You typically don't need to call this manually.
     pub fn start_background_tasks(&self) {
         // Don't start if already running
-        if self.inner.background_tasks_running.swap(true, Ordering::SeqCst) {
+        if self
+            .inner
+            .background_tasks_running
+            .swap(true, Ordering::SeqCst)
+        {
             debug!("Background tasks already running");
             return;
         }
@@ -464,7 +515,9 @@ impl LicenseSeat {
                     Ok(rt) => rt,
                     Err(e) => {
                         warn!("Failed to create background runtime: {}", e);
-                        sdk.inner.background_tasks_running.store(false, Ordering::SeqCst);
+                        sdk.inner
+                            .background_tasks_running
+                            .store(false, Ordering::SeqCst);
                         return;
                     }
                 };
@@ -511,7 +564,9 @@ impl LicenseSeat {
     /// Stop all background tasks.
     pub fn stop_background_tasks(&self) {
         info!("Stopping background tasks");
-        self.inner.background_tasks_running.store(false, Ordering::SeqCst);
+        self.inner
+            .background_tasks_running
+            .store(false, Ordering::SeqCst);
     }
 
     /// Generic background task loop runner.
@@ -589,7 +644,11 @@ impl LicenseSeat {
     pub async fn sync_offline_assets(&self) -> Result<()> {
         use crate::models::{OfflineTokenResponse, SigningKeyResponse};
 
-        let license = self.inner.cache.get_license().ok_or(Error::NoActiveLicense)?;
+        let license = self
+            .inner
+            .cache
+            .get_license()
+            .ok_or(Error::NoActiveLicense)?;
         let product_slug = self.require_product_slug()?;
 
         info!("Syncing offline assets");
@@ -653,9 +712,10 @@ impl LicenseSeat {
         self.emit(Event::new(EventKind::OfflineValidationStart));
 
         // Get cached offline token
-        let token = self.inner.cache.get_offline_token().ok_or_else(|| {
-            Error::OfflineVerificationFailed("No offline token cached".into())
-        })?;
+        let token =
+            self.inner.cache.get_offline_token().ok_or_else(|| {
+                Error::OfflineVerificationFailed("No offline token cached".into())
+            })?;
 
         // Get cached signing key
         let key_id = &token.signature.key_id;
@@ -708,7 +768,8 @@ impl LicenseSeat {
                     "Clock tampering detected",
                 ));
                 return Err(Error::OfflineVerificationFailed(
-                    "Clock tampering detected: system clock appears to have gone backwards".to_string(),
+                    "Clock tampering detected: system clock appears to have gone backwards"
+                        .to_string(),
                 ));
             }
         }
@@ -734,7 +795,11 @@ impl LicenseSeat {
         self.request(reqwest::Method::GET, path, None::<()>).await
     }
 
-    async fn post<T: DeserializeOwned>(&self, path: &str, body: Option<serde_json::Value>) -> Result<T> {
+    async fn post<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<T> {
         self.request(reqwest::Method::POST, path, body).await
     }
 
@@ -861,7 +926,11 @@ fn build_http_client(config: &Config) -> reqwest::Client {
 
 fn parse_error_response(
     body: &serde_json::Value,
-) -> (Option<String>, String, Option<HashMap<String, serde_json::Value>>) {
+) -> (
+    Option<String>,
+    String,
+    Option<HashMap<String, serde_json::Value>>,
+) {
     // Try new nested format: { "error": { "code": "...", "message": "...", "details": {...} } }
     if let Some(error) = body.get("error").and_then(|e| e.as_object()) {
         let code = error.get("code").and_then(|c| c.as_str()).map(String::from);

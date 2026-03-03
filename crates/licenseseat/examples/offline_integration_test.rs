@@ -6,7 +6,7 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-    
+
     println!("=== Offline Validation Integration Test ===\n");
 
     // Create SDK with Cap's config
@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let offline_sdk = LicenseSeat::new(offline_config);
-    
+
     // This should fail online but succeed offline
     match offline_sdk.validate().await {
         Ok(result) => {

@@ -80,10 +80,9 @@ pub fn token_to_validation_result(token: &OfflineTokenResponse) -> ValidationRes
         .iter()
         .map(|e| Entitlement {
             key: e.key.clone(),
-            expires_at: e.expires_at.map(|ts| {
-                chrono::DateTime::from_timestamp(ts, 0)
-                    .unwrap_or_else(chrono::Utc::now)
-            }),
+            expires_at: e
+                .expires_at
+                .map(|ts| chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)),
             metadata: None,
         })
         .collect();
@@ -99,9 +98,9 @@ pub fn token_to_validation_result(token: &OfflineTokenResponse) -> ValidationRes
             key: payload.license_key.clone(),
             status: "active".into(),
             starts_at: None,
-            expires_at: payload.license_expires_at.and_then(|ts| {
-                chrono::DateTime::from_timestamp(ts, 0)
-            }),
+            expires_at: payload
+                .license_expires_at
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
             mode: payload.mode.clone(),
             plan_key: payload.plan_key.clone(),
             seat_limit: payload.seat_limit,

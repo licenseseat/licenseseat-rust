@@ -99,15 +99,15 @@ impl Default for Config {
             product_slug: String::new(),
             storage_prefix: "licenseseat_".into(),
             device_identifier: None,
-            auto_validate_interval: Duration::from_secs(3600),      // 1 hour
-            heartbeat_interval: Duration::from_secs(300),           // 5 minutes
+            auto_validate_interval: Duration::from_secs(3600), // 1 hour
+            heartbeat_interval: Duration::from_secs(300),      // 5 minutes
             network_recheck_interval: Duration::from_secs(30),
             max_retries: 3,
             retry_delay: Duration::from_secs(1),
             offline_fallback_mode: OfflineFallbackMode::NetworkOnly,
             offline_token_refresh_interval: Duration::from_secs(72 * 3600), // 72 hours
             max_offline_days: 0,
-            max_clock_skew: Duration::from_secs(300),               // 5 minutes
+            max_clock_skew: Duration::from_secs(300), // 5 minutes
             telemetry_enabled: true,
             debug: false,
             app_version: None,

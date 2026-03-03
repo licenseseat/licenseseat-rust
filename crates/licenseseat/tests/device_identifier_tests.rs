@@ -1,7 +1,7 @@
 //! Device identifier generation tests.
 
 use licenseseat::{Config, LicenseSeat};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use wiremock::matchers::{method, path_regex};
@@ -276,8 +276,10 @@ async fn test_device_id_uniqueness_across_different_machines() {
     assert!(license.device_id.len() <= 100);
 
     // Should contain only valid characters
-    assert!(license
-        .device_id
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
+    assert!(
+        license
+            .device_id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    );
 }

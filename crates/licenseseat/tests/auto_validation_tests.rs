@@ -4,8 +4,8 @@
 
 use licenseseat::{Config, EventKind, LicenseSeat};
 use serde_json::json;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -29,7 +29,7 @@ fn test_config(base_url: &str) -> Config {
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
         auto_validate_interval: Duration::from_secs(0), // Disabled by default
-        heartbeat_interval: Duration::from_secs(0), // Disabled by default
+        heartbeat_interval: Duration::from_secs(0),     // Disabled by default
         debug: true,
         ..Default::default()
     }

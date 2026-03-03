@@ -25,10 +25,12 @@
 //!   LICENSESEAT_BASE_URL - API base URL
 //!   RUN_SCENARIO - Run only specific scenario (1-12)
 
-use licenseseat::{LicenseSeat, Config, EventKind, LicenseStatus, EntitlementReason, OfflineFallbackMode};
+use licenseseat::{
+    Config, EntitlementReason, EventKind, LicenseSeat, LicenseStatus, OfflineFallbackMode,
+};
 use std::env;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
@@ -42,8 +44,7 @@ struct TestContext {
 impl TestContext {
     fn from_env() -> Self {
         Self {
-            api_key: env::var("LICENSESEAT_API_KEY")
-                .expect("LICENSESEAT_API_KEY required"),
+            api_key: env::var("LICENSESEAT_API_KEY").expect("LICENSESEAT_API_KEY required"),
             product_slug: env::var("LICENSESEAT_PRODUCT_SLUG")
                 .expect("LICENSESEAT_PRODUCT_SLUG required"),
             license_key: env::var("LICENSESEAT_LICENSE_KEY")
@@ -98,11 +99,18 @@ struct TestRunner {
 
 impl TestRunner {
     fn new() -> Self {
-        Self { results: Vec::new() }
+        Self {
+            results: Vec::new(),
+        }
     }
 
     fn record(&mut self, name: &str, result: ScenarioResult, duration: Duration) {
-        println!("{} {} ({:.2}s)", result.symbol(), name, duration.as_secs_f64());
+        println!(
+            "{} {} ({:.2}s)",
+            result.symbol(),
+            name,
+            duration.as_secs_f64()
+        );
         self.results.push((name.to_string(), result, duration));
     }
 
@@ -117,7 +125,12 @@ impl TestRunner {
         let mut total_time = Duration::ZERO;
 
         for (name, result, duration) in &self.results {
-            println!("  {} {} ({:.2}s)", result.symbol(), name, duration.as_secs_f64());
+            println!(
+                "  {} {} ({:.2}s)",
+                result.symbol(),
+                name,
+                duration.as_secs_f64()
+            );
             total_time += *duration;
             match result {
                 ScenarioResult::Pass => passed += 1,
@@ -127,7 +140,10 @@ impl TestRunner {
         }
 
         println!("\n----------------------------------------");
-        println!("Total: {} passed, {} failed, {} skipped", passed, failed, skipped);
+        println!(
+            "Total: {} passed, {} failed, {} skipped",
+            passed, failed, skipped
+        );
         println!("Time:  {:.2}s", total_time.as_secs_f64());
         println!("========================================\n");
     }
@@ -139,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("licenseseat=info".parse()?)
+                .add_directive("licenseseat=info".parse()?),
         )
         .init();
 
@@ -151,24 +167,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut runner = TestRunner::new();
 
     // Check if user wants specific scenario
-    let run_scenario: Option<u32> = env::var("RUN_SCENARIO")
-        .ok()
-        .and_then(|s| s.parse().ok());
+    let run_scenario: Option<u32> = env::var("RUN_SCENARIO").ok().and_then(|s| s.parse().ok());
 
     // Define scenarios
-    let scenarios: &[(u32, &str, fn(TestContext) -> std::pin::Pin<Box<dyn std::future::Future<Output = ScenarioResult> + Send>>)] = &[
-        (1, "Activation with telemetry", |ctx| Box::pin(scenario_1_activation_telemetry(ctx))),
-        (2, "Validation with telemetry", |ctx| Box::pin(scenario_2_validation_telemetry(ctx))),
-        (3, "Heartbeat patterns", |ctx| Box::pin(scenario_3_heartbeat_patterns(ctx))),
-        (4, "Enriched telemetry", |ctx| Box::pin(scenario_4_enriched_telemetry(ctx))),
-        (5, "Telemetry disabled", |ctx| Box::pin(scenario_5_telemetry_disabled(ctx))),
-        (6, "Entitlement checking", |ctx| Box::pin(scenario_6_entitlement_checking(ctx))),
-        (7, "Entitlement edge cases", |ctx| Box::pin(scenario_7_entitlement_edge_cases(ctx))),
-        (8, "License status", |ctx| Box::pin(scenario_8_license_status(ctx))),
-        (9, "Concurrent stress", |ctx| Box::pin(scenario_9_concurrent_stress(ctx))),
-        (10, "Event subscription", |ctx| Box::pin(scenario_10_event_subscription(ctx))),
-        (11, "Offline validation config", |ctx| Box::pin(scenario_11_offline_validation(ctx))),
-        (12, "Full lifecycle", |ctx| Box::pin(scenario_12_full_lifecycle(ctx))),
+    let scenarios: &[(
+        u32,
+        &str,
+        fn(
+            TestContext,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ScenarioResult> + Send>>,
+    )] = &[
+        (1, "Activation with telemetry", |ctx| {
+            Box::pin(scenario_1_activation_telemetry(ctx))
+        }),
+        (2, "Validation with telemetry", |ctx| {
+            Box::pin(scenario_2_validation_telemetry(ctx))
+        }),
+        (3, "Heartbeat patterns", |ctx| {
+            Box::pin(scenario_3_heartbeat_patterns(ctx))
+        }),
+        (4, "Enriched telemetry", |ctx| {
+            Box::pin(scenario_4_enriched_telemetry(ctx))
+        }),
+        (5, "Telemetry disabled", |ctx| {
+            Box::pin(scenario_5_telemetry_disabled(ctx))
+        }),
+        (6, "Entitlement checking", |ctx| {
+            Box::pin(scenario_6_entitlement_checking(ctx))
+        }),
+        (7, "Entitlement edge cases", |ctx| {
+            Box::pin(scenario_7_entitlement_edge_cases(ctx))
+        }),
+        (8, "License status", |ctx| {
+            Box::pin(scenario_8_license_status(ctx))
+        }),
+        (9, "Concurrent stress", |ctx| {
+            Box::pin(scenario_9_concurrent_stress(ctx))
+        }),
+        (10, "Event subscription", |ctx| {
+            Box::pin(scenario_10_event_subscription(ctx))
+        }),
+        (11, "Offline validation config", |ctx| {
+            Box::pin(scenario_11_offline_validation(ctx))
+        }),
+        (12, "Full lifecycle", |ctx| {
+            Box::pin(scenario_12_full_lifecycle(ctx))
+        }),
     ];
 
     for (num, name, scenario_fn) in scenarios {
@@ -181,7 +225,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n--- Scenario {}: {} ---", num, name);
         let start = Instant::now();
         let result = scenario_fn(ctx.clone()).await;
-        runner.record(&format!("Scenario {}: {}", num, name), result, start.elapsed());
+        runner.record(
+            &format!("Scenario {}: {}", num, name),
+            result,
+            start.elapsed(),
+        );
     }
 
     runner.summary();
@@ -231,8 +279,10 @@ async fn scenario_2_validation_telemetry(ctx: TestContext) -> ScenarioResult {
         Ok(result) => {
             if result.valid {
                 println!("  Validation successful");
-                println!("    Active entitlements: {}",
-                    result.license.active_entitlements.len());
+                println!(
+                    "    Active entitlements: {}",
+                    result.license.active_entitlements.len()
+                );
                 let _ = sdk.deactivate().await;
                 ScenarioResult::Pass
             } else {
@@ -311,7 +361,11 @@ async fn scenario_3_heartbeat_patterns(ctx: TestContext) -> ScenarioResult {
 
     let _ = sdk.deactivate().await;
 
-    if success { ScenarioResult::Pass } else { ScenarioResult::Fail }
+    if success {
+        ScenarioResult::Pass
+    } else {
+        ScenarioResult::Fail
+    }
 }
 
 // ============================================================================
@@ -418,7 +472,10 @@ async fn scenario_6_entitlement_checking(ctx: TestContext) -> ScenarioResult {
     let has_pro = sdk.has_entitlement("pro-features");
     let has_fake = sdk.has_entitlement("fake-feature");
     println!("    has_entitlement(pro-features): {}", has_pro);
-    println!("    has_entitlement(fake-feature): {} (expected: false)", has_fake);
+    println!(
+        "    has_entitlement(fake-feature): {} (expected: false)",
+        has_fake
+    );
     if has_fake {
         println!("    FAIL: Should not have fake-feature");
         success = false;
@@ -426,14 +483,23 @@ async fn scenario_6_entitlement_checking(ctx: TestContext) -> ScenarioResult {
 
     // Test 5: Multiple entitlement checks in sequence
     println!("  Test 5: Sequential entitlement checks...");
-    let entitlements_to_check = ["pro-features", "premium-support", "api-access", "export-pdf"];
+    let entitlements_to_check = [
+        "pro-features",
+        "premium-support",
+        "api-access",
+        "export-pdf",
+    ];
     for key in &entitlements_to_check {
         let active = sdk.has_entitlement(key);
         println!("    {}: {}", key, if active { "YES" } else { "no" });
     }
 
     let _ = sdk.deactivate().await;
-    if success { ScenarioResult::Pass } else { ScenarioResult::Fail }
+    if success {
+        ScenarioResult::Pass
+    } else {
+        ScenarioResult::Fail
+    }
 }
 
 // ============================================================================
@@ -463,7 +529,10 @@ async fn scenario_7_entitlement_edge_cases(ctx: TestContext) -> ScenarioResult {
     println!("  Test 2: Check entitlement before validation...");
     let status = sdk.check_entitlement("pro-features");
     println!("    active: {} (expected: false)", status.active);
-    println!("    reason: {:?} (expected: NoLicense - no validation yet)", status.reason);
+    println!(
+        "    reason: {:?} (expected: NoLicense - no validation yet)",
+        status.reason
+    );
     // Note: This might be NoLicense since validation hasn't populated entitlements
 
     // Validate
@@ -488,7 +557,10 @@ async fn scenario_7_entitlement_edge_cases(ctx: TestContext) -> ScenarioResult {
     println!("      active: {},", status.active);
     println!("      reason: {:?},", status.reason);
     println!("      expires_at: {:?},", status.expires_at);
-    println!("      entitlement: {:?}", status.entitlement.as_ref().map(|e| &e.key));
+    println!(
+        "      entitlement: {:?}",
+        status.entitlement.as_ref().map(|e| &e.key)
+    );
     println!("    }}");
 
     // Test 5: Multiple missing entitlements all return NotFound
@@ -499,7 +571,10 @@ async fn scenario_7_entitlement_edge_cases(ctx: TestContext) -> ScenarioResult {
         let status = sdk.check_entitlement(key);
         if status.reason != Some(EntitlementReason::NotFound) {
             all_not_found = false;
-            println!("    FAIL: {} should be NotFound, got {:?}", key, status.reason);
+            println!(
+                "    FAIL: {} should be NotFound, got {:?}",
+                key, status.reason
+            );
         }
     }
     println!("    All returned NotFound: {}", all_not_found);
@@ -613,7 +688,8 @@ async fn scenario_9_concurrent_stress(ctx: TestContext) -> ScenarioResult {
                 failures += 1;
             }
             total_time += duration;
-            println!("    Validation {}: {} ({:.2}ms)",
+            println!(
+                "    Validation {}: {} ({:.2}ms)",
                 i,
                 if success { "OK" } else { "FAIL" },
                 duration.as_millis()
@@ -717,7 +793,10 @@ async fn scenario_11_offline_validation(ctx: TestContext) -> ScenarioResult {
         api_base_url: ctx.base_url.clone(),
         ..Default::default()
     };
-    println!("    offline_fallback_mode: {:?} (expected: NetworkOnly)", default_config.offline_fallback_mode);
+    println!(
+        "    offline_fallback_mode: {:?} (expected: NetworkOnly)",
+        default_config.offline_fallback_mode
+    );
     if default_config.offline_fallback_mode != OfflineFallbackMode::NetworkOnly {
         println!("    FAIL: Expected NetworkOnly as default");
         return ScenarioResult::Fail;
@@ -732,7 +811,10 @@ async fn scenario_11_offline_validation(ctx: TestContext) -> ScenarioResult {
         offline_fallback_mode: OfflineFallbackMode::Always,
         ..Default::default()
     };
-    println!("    offline_fallback_mode: {:?}", always_config.offline_fallback_mode);
+    println!(
+        "    offline_fallback_mode: {:?}",
+        always_config.offline_fallback_mode
+    );
 
     // Test 3: Max offline days configuration
     println!("  Test 3: Max offline days configuration...");
@@ -743,7 +825,10 @@ async fn scenario_11_offline_validation(ctx: TestContext) -> ScenarioResult {
         max_offline_days: 7,
         ..Default::default()
     };
-    println!("    max_offline_days: {} (set to 7)", offline_config.max_offline_days);
+    println!(
+        "    max_offline_days: {} (set to 7)",
+        offline_config.max_offline_days
+    );
     if offline_config.max_offline_days != 7 {
         println!("    FAIL: Expected max_offline_days = 7");
         return ScenarioResult::Fail;
@@ -769,7 +854,10 @@ async fn scenario_11_offline_validation(ctx: TestContext) -> ScenarioResult {
         offline_token_refresh_interval: Duration::from_secs(24 * 3600), // 24 hours
         ..Default::default()
     };
-    println!("    offline_token_refresh_interval: {:?}", refresh_config.offline_token_refresh_interval);
+    println!(
+        "    offline_token_refresh_interval: {:?}",
+        refresh_config.offline_token_refresh_interval
+    );
 
     // Test 6: SDK with offline config
     println!("  Test 6: Create SDK with offline configuration...");
@@ -848,7 +936,10 @@ async fn scenario_12_full_lifecycle(ctx: TestContext) -> ScenarioResult {
                 let _ = sdk.deactivate().await;
                 return ScenarioResult::Fail;
             }
-            println!("    OK - {} entitlements", result.license.active_entitlements.len());
+            println!(
+                "    OK - {} entitlements",
+                result.license.active_entitlements.len()
+            );
         }
         Err(e) => {
             println!("    Failed: {}", e);

@@ -4,8 +4,8 @@
 
 use licenseseat::{Config, EventKind, LicenseSeat};
 use serde_json::json;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -67,8 +67,16 @@ fn activation_response(entitlements: Vec<serde_json::Value>) -> serde_json::Valu
 }
 
 fn validation_response(valid: bool, entitlements: Vec<serde_json::Value>) -> serde_json::Value {
-    let code = if valid { serde_json::Value::Null } else { json!("license_invalid") };
-    let message = if valid { serde_json::Value::Null } else { json!("License is invalid") };
+    let code = if valid {
+        serde_json::Value::Null
+    } else {
+        json!("license_invalid")
+    };
+    let message = if valid {
+        serde_json::Value::Null
+    } else {
+        json!("License is invalid")
+    };
     let status = if valid { "active" } else { "suspended" };
 
     json!({
@@ -140,9 +148,11 @@ async fn test_scenario_new_user_activation() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response(vec![
-            json!({"key": "basic", "expires_at": null, "metadata": null}),
-        ])))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response(vec![
+                json!({"key": "basic", "expires_at": null, "metadata": null}),
+            ])),
+        )
         .mount(&server)
         .await;
 
@@ -150,7 +160,10 @@ async fn test_scenario_new_user_activation() {
 
     // Initially no license
     assert!(sdk.current_license().is_none());
-    assert!(matches!(sdk.status(), licenseseat::LicenseStatus::Inactive { .. }));
+    assert!(matches!(
+        sdk.status(),
+        licenseseat::LicenseStatus::Inactive { .. }
+    ));
 
     // Activate
     let license = sdk.activate("NEW-USER-KEY").await.unwrap();
@@ -215,13 +228,17 @@ async fn test_scenario_feature_gating_with_entitlements() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response(entitlements.clone())))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response(entitlements.clone())),
+        )
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/.*/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(validation_response(true, entitlements)))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(validation_response(true, entitlements)),
+        )
         .mount(&server)
         .await;
 
@@ -250,19 +267,22 @@ async fn test_scenario_expired_entitlement() {
 
     // Entitlement that expired in the past
     let past_time = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-    let entitlements = vec![
-        json!({"key": "expired-feature", "expires_at": past_time, "metadata": null}),
-    ];
+    let entitlements =
+        vec![json!({"key": "expired-feature", "expires_at": past_time, "metadata": null})];
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response(entitlements.clone())))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response(entitlements.clone())),
+        )
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/.*/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(validation_response(true, entitlements)))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(validation_response(true, entitlements)),
+        )
         .mount(&server)
         .await;
 
@@ -310,7 +330,10 @@ async fn test_scenario_clean_deactivation() {
 
     // License should be cleared
     assert!(sdk.current_license().is_none());
-    assert!(matches!(sdk.status(), licenseseat::LicenseStatus::Inactive { .. }));
+    assert!(matches!(
+        sdk.status(),
+        licenseseat::LicenseStatus::Inactive { .. }
+    ));
 }
 
 #[tokio::test]
@@ -546,7 +569,10 @@ async fn test_scenario_validate_without_activation() {
     // Try to validate without activating
     let result = sdk.validate().await;
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), licenseseat::Error::NoActiveLicense));
+    assert!(matches!(
+        result.unwrap_err(),
+        licenseseat::Error::NoActiveLicense
+    ));
 }
 
 #[tokio::test]
@@ -558,7 +584,10 @@ async fn test_scenario_deactivate_without_activation() {
     // Try to deactivate without activating
     let result = sdk.deactivate().await;
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), licenseseat::Error::NoActiveLicense));
+    assert!(matches!(
+        result.unwrap_err(),
+        licenseseat::Error::NoActiveLicense
+    ));
 }
 
 #[tokio::test]
@@ -570,7 +599,10 @@ async fn test_scenario_heartbeat_without_activation() {
     // Try to heartbeat without activating
     let result = sdk.heartbeat().await;
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), licenseseat::Error::NoActiveLicense));
+    assert!(matches!(
+        result.unwrap_err(),
+        licenseseat::Error::NoActiveLicense
+    ));
 }
 
 #[tokio::test]

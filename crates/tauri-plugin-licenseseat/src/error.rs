@@ -31,13 +31,16 @@ impl Serialize for Error {
         }
 
         let response = match self {
-            Error::Sdk(licenseseat::Error::Api { status, code, message, .. }) => {
-                ErrorResponse {
-                    code: code.clone(),
-                    message: message.clone(),
-                    status: Some(*status),
-                }
-            }
+            Error::Sdk(licenseseat::Error::Api {
+                status,
+                code,
+                message,
+                ..
+            }) => ErrorResponse {
+                code: code.clone(),
+                message: message.clone(),
+                status: Some(*status),
+            },
             Error::Sdk(e) => ErrorResponse {
                 code: e.code().map(String::from),
                 message: e.to_string(),

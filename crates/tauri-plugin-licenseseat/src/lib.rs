@@ -65,8 +65,8 @@ mod config;
 mod error;
 
 use tauri::{
-    plugin::{Builder, TauriPlugin},
     Manager, Runtime,
+    plugin::{Builder, TauriPlugin},
 };
 
 pub use config::PluginConfig;
@@ -90,14 +90,16 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             let config = api.config().clone();
 
             // Auto-detect app version from Tauri package info if not explicitly set
-            let app_version = config.app_version.clone().or_else(|| {
-                Some(app.package_info().version.to_string())
-            });
+            let app_version = config
+                .app_version
+                .clone()
+                .or_else(|| Some(app.package_info().version.to_string()));
 
             // Auto-detect app name for build info if not set
-            let app_build = config.app_build.clone().or_else(|| {
-                Some(app.package_info().name.clone())
-            });
+            let app_build = config
+                .app_build
+                .clone()
+                .or_else(|| Some(app.package_info().name.clone()));
 
             // Parse offline fallback mode from config string
             let offline_fallback_mode = match config.offline_fallback_mode.as_deref() {
@@ -109,9 +111,9 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             let sdk_config = licenseseat::Config {
                 api_key: config.api_key.clone(),
                 product_slug: config.product_slug.clone(),
-                api_base_url: config.api_base_url.unwrap_or_else(|| {
-                    "https://licenseseat.com/api/v1".into()
-                }),
+                api_base_url: config
+                    .api_base_url
+                    .unwrap_or_else(|| "https://licenseseat.com/api/v1".into()),
                 auto_validate_interval: std::time::Duration::from_secs(
                     config.auto_validate_interval.unwrap_or(3600),
                 ),

@@ -23,8 +23,14 @@ fn test_config_default_values() {
     assert_eq!(config.network_recheck_interval, Duration::from_secs(30));
     assert_eq!(config.max_retries, 3);
     assert_eq!(config.retry_delay, Duration::from_secs(1));
-    assert_eq!(config.offline_fallback_mode, OfflineFallbackMode::NetworkOnly);
-    assert_eq!(config.offline_token_refresh_interval, Duration::from_secs(72 * 3600));
+    assert_eq!(
+        config.offline_fallback_mode,
+        OfflineFallbackMode::NetworkOnly
+    );
+    assert_eq!(
+        config.offline_token_refresh_interval,
+        Duration::from_secs(72 * 3600)
+    );
     assert_eq!(config.max_offline_days, 0);
     assert_eq!(config.max_clock_skew, Duration::from_secs(300));
     assert!(config.telemetry_enabled);
@@ -57,16 +63,15 @@ fn test_config_builder_with_debug() {
 
 #[test]
 fn test_config_builder_with_auto_validate_interval() {
-    let config = Config::new("key", "product")
-        .with_auto_validate_interval(Duration::from_secs(1800)); // 30 minutes
+    let config =
+        Config::new("key", "product").with_auto_validate_interval(Duration::from_secs(1800)); // 30 minutes
 
     assert_eq!(config.auto_validate_interval, Duration::from_secs(1800));
 }
 
 #[test]
 fn test_config_builder_with_offline_fallback() {
-    let config = Config::new("key", "product")
-        .with_offline_fallback(OfflineFallbackMode::Always);
+    let config = Config::new("key", "product").with_offline_fallback(OfflineFallbackMode::Always);
 
     assert_eq!(config.offline_fallback_mode, OfflineFallbackMode::Always);
 }
@@ -125,7 +130,10 @@ fn test_config_custom_device_identifier() {
         ..Default::default()
     };
 
-    assert_eq!(config.device_identifier, Some("my-custom-device-id".to_string()));
+    assert_eq!(
+        config.device_identifier,
+        Some("my-custom-device-id".to_string())
+    );
 }
 
 #[test]
@@ -213,7 +221,10 @@ fn test_config_offline_settings() {
     };
 
     assert_eq!(config.offline_fallback_mode, OfflineFallbackMode::Always);
-    assert_eq!(config.offline_token_refresh_interval, Duration::from_secs(24 * 3600));
+    assert_eq!(
+        config.offline_token_refresh_interval,
+        Duration::from_secs(24 * 3600)
+    );
     assert_eq!(config.max_offline_days, 30);
     assert_eq!(config.max_clock_skew, Duration::from_secs(600));
 }
@@ -293,7 +304,7 @@ fn test_config_special_characters_in_slug() {
 #[test]
 fn test_config_unicode_in_values() {
     let config = Config {
-        product_slug: "产品".into(), // Chinese for "product"
+        product_slug: "产品".into(),          // Chinese for "product"
         storage_prefix: "ライセンス_".into(), // Japanese for "license"
         ..Default::default()
     };
@@ -335,11 +346,14 @@ fn test_config_very_short_intervals() {
 fn test_config_very_long_intervals() {
     let config = Config {
         auto_validate_interval: Duration::from_secs(86400 * 365), // 1 year
-        heartbeat_interval: Duration::from_secs(86400 * 30), // 30 days
+        heartbeat_interval: Duration::from_secs(86400 * 30),      // 30 days
         ..Default::default()
     };
 
-    assert_eq!(config.auto_validate_interval, Duration::from_secs(86400 * 365));
+    assert_eq!(
+        config.auto_validate_interval,
+        Duration::from_secs(86400 * 365)
+    );
     assert_eq!(config.heartbeat_interval, Duration::from_secs(86400 * 30));
 }
 
@@ -354,7 +368,7 @@ fn test_config_development_setup() {
         product_slug: "my-app-dev".into(),
         api_base_url: "http://localhost:3000/api/v1".into(),
         debug: true,
-        telemetry_enabled: false, // Disable for dev
+        telemetry_enabled: false,                        // Disable for dev
         auto_validate_interval: Duration::from_secs(60), // Faster for testing
         ..Default::default()
     };
@@ -392,7 +406,7 @@ fn test_config_offline_first_setup() {
         offline_fallback_mode: OfflineFallbackMode::Always,
         max_offline_days: 14,
         offline_token_refresh_interval: Duration::from_secs(12 * 3600), // 12 hours
-        max_clock_skew: Duration::from_secs(3600), // 1 hour tolerance
+        max_clock_skew: Duration::from_secs(3600),                      // 1 hour tolerance
         ..Default::default()
     };
 

@@ -15,7 +15,7 @@
 //!   LICENSESEAT_BASE_URL - API base URL (default: https://licenseseat.com/api/v1)
 //!   HEARTBEAT_INTERVAL_SECS - Heartbeat interval in seconds (default: 30)
 
-use licenseseat::{LicenseSeat, Config, EventKind};
+use licenseseat::{Config, EventKind, LicenseSeat};
 use std::env;
 use std::time::Duration;
 use tokio::signal;
@@ -26,15 +26,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("licenseseat=debug".parse()?)
+                .add_directive("licenseseat=debug".parse()?),
         )
         .init();
 
     println!("=== LicenseSeat DevHeartbeat Demo ===\n");
 
     // Read configuration from environment
-    let api_key = env::var("LICENSESEAT_API_KEY")
-        .expect("LICENSESEAT_API_KEY environment variable required");
+    let api_key =
+        env::var("LICENSESEAT_API_KEY").expect("LICENSESEAT_API_KEY environment variable required");
     let product_slug = env::var("LICENSESEAT_PRODUCT_SLUG")
         .expect("LICENSESEAT_PRODUCT_SLUG environment variable required");
     let license_key = env::var("LICENSESEAT_LICENSE_KEY")
@@ -123,7 +123,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(result) => {
             if result.valid {
                 println!("  License valid!");
-                println!("  Entitlements: {:?}",
+                println!(
+                    "  Entitlements: {:?}",
                     result.license.active_entitlements.len()
                 );
             } else {
@@ -175,7 +176,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  License deactivated successfully!");
         }
         Err(e) => {
-            println!("  Deactivation error: {} (this is normal if already deactivated)", e);
+            println!(
+                "  Deactivation error: {} (this is normal if already deactivated)",
+                e
+            );
         }
     }
 

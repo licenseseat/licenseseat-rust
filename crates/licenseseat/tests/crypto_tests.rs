@@ -40,8 +40,15 @@ fn test_base64_standard_decode() {
     ];
 
     for (input, expected) in cases {
-        let decoded = base64::engine::general_purpose::STANDARD.decode(input).unwrap();
-        assert_eq!(String::from_utf8(decoded).unwrap(), expected, "Failed for input: {}", input);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(input)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            expected,
+            "Failed for input: {}",
+            input
+        );
     }
 }
 
@@ -50,7 +57,9 @@ fn test_base64_binary_data() {
     // Test with binary data (all byte values)
     let binary_data: Vec<u8> = (0u8..=255).collect();
     let encoded = base64::engine::general_purpose::STANDARD.encode(&binary_data);
-    let decoded = base64::engine::general_purpose::STANDARD.decode(&encoded).unwrap();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&encoded)
+        .unwrap();
     assert_eq!(decoded, binary_data);
 }
 
@@ -100,8 +109,15 @@ fn test_base64url_decode() {
     ];
 
     for (input, expected) in cases {
-        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(input).unwrap();
-        assert_eq!(String::from_utf8(decoded).unwrap(), expected, "Failed for input: {}", input);
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(input)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            expected,
+            "Failed for input: {}",
+            input
+        );
     }
 }
 
@@ -119,7 +135,11 @@ fn test_base64url_special_characters() {
     // Standard contains + or / (non-URL-safe characters)
     assert!(standard.contains('+') || standard.contains('/'));
     // URL safe should only have - or _ or alphanumeric
-    assert!(url_safe.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
+    assert!(
+        url_safe
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    );
 }
 
 #[test]
@@ -243,13 +263,15 @@ mod ed25519_tests {
     fn test_ed25519_wrong_public_key() {
         let secret_key_hex = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
         // Different public key
-        let wrong_public_key_hex = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
+        let wrong_public_key_hex =
+            "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
 
         let secret_key_bytes = hex_decode(secret_key_hex);
         let wrong_public_key_bytes = hex_decode(wrong_public_key_hex);
 
         let signing_key = SigningKey::try_from(secret_key_bytes.as_slice()).unwrap();
-        let wrong_verifying_key = VerifyingKey::try_from(wrong_public_key_bytes.as_slice()).unwrap();
+        let wrong_verifying_key =
+            VerifyingKey::try_from(wrong_public_key_bytes.as_slice()).unwrap();
 
         let message = b"test message";
         let signature = signing_key.sign(message);
@@ -329,8 +351,10 @@ mod signature_integration_tests {
         let signature = signing_key.sign(canonical_json.as_bytes());
 
         // Encode for transport
-        let public_key_b64 = base64::engine::general_purpose::STANDARD.encode(public_key.as_bytes());
-        let signature_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes());
+        let public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(public_key.as_bytes());
+        let signature_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
         // Now simulate verification (what the SDK does)
         let decoded_public_key = base64::engine::general_purpose::STANDARD
@@ -344,7 +368,11 @@ mod signature_integration_tests {
         let sig = Signature::try_from(decoded_signature.as_slice()).unwrap();
 
         // Verify
-        assert!(verifying_key.verify(canonical_json.as_bytes(), &sig).is_ok());
+        assert!(
+            verifying_key
+                .verify(canonical_json.as_bytes(), &sig)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -361,10 +389,18 @@ mod signature_integration_tests {
         let signature = signing_key.sign(canonical_json.as_bytes());
 
         // Verification with original should succeed
-        assert!(public_key.verify(canonical_json.as_bytes(), &signature).is_ok());
+        assert!(
+            public_key
+                .verify(canonical_json.as_bytes(), &signature)
+                .is_ok()
+        );
 
         // Verification with tampered should fail
-        assert!(public_key.verify(tampered_json.as_bytes(), &signature).is_err());
+        assert!(
+            public_key
+                .verify(tampered_json.as_bytes(), &signature)
+                .is_err()
+        );
     }
 
     #[test]
@@ -385,11 +421,17 @@ mod signature_integration_tests {
         let signature = signing_key.sign(canonical_json.as_bytes());
 
         // Encode using STANDARD base64 (what our API returns)
-        let public_key_b64 = base64::engine::general_purpose::STANDARD.encode(public_key.as_bytes());
+        let public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(public_key.as_bytes());
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
 
         // Verify the encoding looks like standard base64 (may have + or /)
-        assert!(public_key_b64.ends_with('=') || public_key_b64.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/'));
+        assert!(
+            public_key_b64.ends_with('=')
+                || public_key_b64
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '+' || c == '/')
+        );
 
         // Decode using STANDARD base64 (matching what the SDK's verify_token does)
         let decoded_public_key = base64::engine::general_purpose::STANDARD
@@ -403,7 +445,11 @@ mod signature_integration_tests {
         let sig = Signature::try_from(decoded_signature.as_slice()).unwrap();
 
         // Verify the signature
-        assert!(verifying_key.verify(canonical_json.as_bytes(), &sig).is_ok());
+        assert!(
+            verifying_key
+                .verify(canonical_json.as_bytes(), &sig)
+                .is_ok()
+        );
     }
 }
 
@@ -484,7 +530,10 @@ fn test_hex_encode_decode() {
         (vec![0x00], "00"),
         (vec![0xff], "ff"),
         (vec![0xde, 0xad, 0xbe, 0xef], "deadbeef"),
-        ((0u8..16).collect::<Vec<_>>(), "000102030405060708090a0b0c0d0e0f"),
+        (
+            (0u8..16).collect::<Vec<_>>(),
+            "000102030405060708090a0b0c0d0e0f",
+        ),
     ];
 
     for (bytes, expected_hex) in test_cases {

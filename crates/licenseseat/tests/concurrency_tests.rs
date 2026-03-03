@@ -5,8 +5,8 @@
 
 use licenseseat::{Config, EventKind, LicenseSeat};
 use serde_json::json;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -146,9 +146,7 @@ async fn test_concurrent_validations() {
     let mut handles = vec![];
     for _ in 0..10 {
         let sdk_clone = Arc::clone(&sdk);
-        handles.push(tokio::spawn(async move {
-            sdk_clone.validate().await
-        }));
+        handles.push(tokio::spawn(async move { sdk_clone.validate().await }));
     }
 
     // All validations should succeed
@@ -182,9 +180,7 @@ async fn test_concurrent_heartbeats() {
     let mut handles = vec![];
     for _ in 0..10 {
         let sdk_clone = Arc::clone(&sdk);
-        handles.push(tokio::spawn(async move {
-            sdk_clone.heartbeat().await
-        }));
+        handles.push(tokio::spawn(async move { sdk_clone.heartbeat().await }));
     }
 
     // All heartbeats should succeed
@@ -346,9 +342,7 @@ async fn test_concurrent_event_subscriptions() {
     let sdk = LicenseSeat::new(test_config(&server.uri()));
 
     // Create multiple subscribers
-    let counters: Vec<Arc<AtomicUsize>> = (0..5)
-        .map(|_| Arc::new(AtomicUsize::new(0)))
-        .collect();
+    let counters: Vec<Arc<AtomicUsize>> = (0..5).map(|_| Arc::new(AtomicUsize::new(0))).collect();
 
     let mut handles = vec![];
     for counter in &counters {
@@ -356,7 +350,10 @@ async fn test_concurrent_event_subscriptions() {
         let counter = Arc::clone(counter);
         handles.push(tokio::spawn(async move {
             while let Ok(event) = rx.recv().await {
-                if matches!(event.kind, EventKind::ActivationStart | EventKind::ActivationSuccess) {
+                if matches!(
+                    event.kind,
+                    EventKind::ActivationStart | EventKind::ActivationSuccess
+                ) {
                     counter.fetch_add(1, Ordering::SeqCst);
                 }
             }
@@ -448,13 +445,9 @@ async fn test_sdk_clone_concurrent_operations() {
     for i in 0..10 {
         let sdk_clone = sdk.clone();
         if i % 2 == 0 {
-            validate_handles.push(tokio::spawn(async move {
-                sdk_clone.validate().await
-            }));
+            validate_handles.push(tokio::spawn(async move { sdk_clone.validate().await }));
         } else {
-            heartbeat_handles.push(tokio::spawn(async move {
-                sdk_clone.heartbeat().await
-            }));
+            heartbeat_handles.push(tokio::spawn(async move { sdk_clone.heartbeat().await }));
         }
     }
 

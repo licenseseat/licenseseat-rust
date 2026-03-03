@@ -223,12 +223,18 @@ fn test_clock_within_acceptable_skew() {
     // Small forward drift
     let current_time = last_seen + 120; // 2 minutes forward
     let time_diff = (current_time - last_seen).abs();
-    assert!(time_diff <= max_clock_skew, "Small drift should be acceptable");
+    assert!(
+        time_diff <= max_clock_skew,
+        "Small drift should be acceptable"
+    );
 
     // Small backward drift (NTP correction)
     let current_time = last_seen - 60; // 1 minute backward
     let time_diff = (current_time - last_seen).abs();
-    assert!(time_diff <= max_clock_skew, "Small NTP correction should be acceptable");
+    assert!(
+        time_diff <= max_clock_skew,
+        "Small NTP correction should be acceptable"
+    );
 }
 
 #[test]
@@ -237,7 +243,10 @@ fn test_monotonic_time_tracking() {
     let timestamps: Vec<i64> = vec![1000, 1100, 1200, 1300, 1400];
 
     let is_monotonic = timestamps.windows(2).all(|w| w[1] >= w[0]);
-    assert!(is_monotonic, "Timestamps should be monotonically increasing");
+    assert!(
+        is_monotonic,
+        "Timestamps should be monotonically increasing"
+    );
 
     // Detect non-monotonic sequence
     let bad_timestamps: Vec<i64> = vec![1000, 1100, 900, 1300]; // 900 is suspicious

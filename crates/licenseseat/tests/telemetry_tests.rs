@@ -1,7 +1,7 @@
 //! Telemetry collection and API integration tests.
 
 use licenseseat::{Config, LicenseSeat};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use wiremock::matchers::{method, path_regex};
@@ -179,9 +179,7 @@ async fn test_telemetry_excluded_when_disabled() {
 
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     // Telemetry should be null or missing
-    assert!(
-        body["telemetry"].is_null() || !body.as_object().unwrap().contains_key("telemetry")
-    );
+    assert!(body["telemetry"].is_null() || !body.as_object().unwrap().contains_key("telemetry"));
 }
 
 #[tokio::test]

@@ -4,9 +4,7 @@
 //! SDK flow from activation through validation and deactivation.
 
 use chrono::Utc;
-use licenseseat::{
-    Config, EntitlementReason, LicenseSeat, LicenseStatus, OfflineFallbackMode,
-};
+use licenseseat::{Config, EntitlementReason, LicenseSeat, LicenseStatus, OfflineFallbackMode};
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -326,10 +324,10 @@ async fn test_activation_invalid_license() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(
-            ResponseTemplate::new(404)
-                .set_body_json(api_error_response("license_not_found", "License key not found")),
-        )
+        .respond_with(ResponseTemplate::new(404).set_body_json(api_error_response(
+            "license_not_found",
+            "License key not found",
+        )))
         .mount(&server)
         .await;
 
@@ -763,12 +761,10 @@ async fn test_api_error_422_seat_limit() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(
-            ResponseTemplate::new(422).set_body_json(api_error_response(
-                "seat_limit_exceeded",
-                "License seat limit exceeded",
-            )),
-        )
+        .respond_with(ResponseTemplate::new(422).set_body_json(api_error_response(
+            "seat_limit_exceeded",
+            "License seat limit exceeded",
+        )))
         .mount(&server)
         .await;
 
@@ -776,12 +772,7 @@ async fn test_api_error_422_seat_limit() {
     let result = sdk.activate("TEST-KEY").await;
 
     assert!(result.is_err());
-    if let licenseseat::Error::Api {
-        status,
-        code,
-        ..
-    } = result.unwrap_err()
-    {
+    if let licenseseat::Error::Api { status, code, .. } = result.unwrap_err() {
         assert_eq!(status, 422);
         assert_eq!(code.as_deref(), Some("seat_limit_exceeded"));
     } else {
@@ -861,8 +852,7 @@ async fn test_auth_header_present() {
         .and(path_regex(r"/products/.*/licenses/.*/activate"))
         .and(header("Authorization", "Bearer test-api-key"))
         .respond_with(
-            ResponseTemplate::new(201)
-                .set_body_json(activation_response("TEST-KEY", "device-123")),
+            ResponseTemplate::new(201).set_body_json(activation_response("TEST-KEY", "device-123")),
         )
         .mount(&server)
         .await;

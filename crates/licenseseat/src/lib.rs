@@ -53,27 +53,26 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
 
+mod cache;
 mod client;
 mod config;
 mod error;
-mod models;
-mod cache;
-mod telemetry;
 mod events;
+mod models;
+mod telemetry;
 
 #[cfg(feature = "offline")]
 mod offline;
 
-pub use client::{LicenseSeat, ActivationOptions};
+pub use client::{ActivationOptions, LicenseSeat};
 pub use config::{Config, OfflineFallbackMode};
 pub use error::{Error, Result};
-pub use models::{
-    License, LicenseStatus, LicenseStatusDetails,
-    Entitlement, EntitlementStatus, EntitlementReason,
-    ValidationResult, ActivationResponse, DeactivationResponse,
-    HeartbeatResponse, HealthResponse,
-};
 pub use events::{Event, EventKind};
+pub use models::{
+    ActivationResponse, DeactivationResponse, Entitlement, EntitlementReason, EntitlementStatus,
+    HealthResponse, HeartbeatResponse, License, LicenseStatus, LicenseStatusDetails,
+    ValidationResult,
+};
 
 /// SDK version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
