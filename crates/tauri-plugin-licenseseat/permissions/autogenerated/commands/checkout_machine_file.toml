@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-checkout-machine-file"
+description = "Enables the checkout_machine_file command without any pre-configured scope."
+commands.allow = ["checkout_machine_file"]
+
+[[permission]]
+identifier = "deny-checkout-machine-file"
+description = "Denies the checkout_machine_file command without any pre-configured scope."
+commands.deny = ["checkout_machine_file"]

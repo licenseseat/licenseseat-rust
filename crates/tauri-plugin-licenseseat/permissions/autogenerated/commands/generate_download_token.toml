@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-generate-download-token"
+description = "Enables the generate_download_token command without any pre-configured scope."
+commands.allow = ["generate_download_token"]
+
+[[permission]]
+identifier = "deny-generate-download-token"
+description = "Denies the generate_download_token command without any pre-configured scope."
+commands.deny = ["generate_download_token"]

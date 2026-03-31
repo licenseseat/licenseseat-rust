@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-sync-offline-assets"
+description = "Enables the sync_offline_assets command without any pre-configured scope."
+commands.allow = ["sync_offline_assets"]
+
+[[permission]]
+identifier = "deny-sync-offline-assets"
+description = "Denies the sync_offline_assets command without any pre-configured scope."
+commands.deny = ["sync_offline_assets"]

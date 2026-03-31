@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-verify-machine-file"
+description = "Enables the verify_machine_file command without any pre-configured scope."
+commands.allow = ["verify_machine_file"]
+
+[[permission]]
+identifier = "deny-verify-machine-file"
+description = "Denies the verify_machine_file command without any pre-configured scope."
+commands.deny = ["verify_machine_file"]

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-verify-offline-token"
+description = "Enables the verify_offline_token command without any pre-configured scope."
+commands.allow = ["verify_offline_token"]
+
+[[permission]]
+identifier = "deny-verify-offline-token"
+description = "Denies the verify_offline_token command without any pre-configured scope."
+commands.deny = ["verify_offline_token"]
