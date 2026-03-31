@@ -126,11 +126,12 @@ import {
   activate,
   deactivate,
   getState,
-  restoreAndGetState,
+  bootstrapState,
   subscribeState,
   hasAnyEntitlement,
   LICENSESEAT_EVENTS,
   listenEvent,
+  normalizeError,
 } from '@licenseseat/tauri-plugin';
 
 // Activate a license (first launch or new key)
@@ -147,7 +148,7 @@ async function activateLicense(key: string) {
 
 // Restore and read the current state (app startup)
 async function bootstrapLicense() {
-  const state = await restoreAndGetState();
+  const state = await bootstrapState();
 
   console.log('Client status:', state.clientStatus);
   console.log('Online:', state.isOnline);
@@ -606,14 +607,14 @@ onUnmounted(() => {
 ## Error Handling
 
 ```typescript
-import { activate } from '@licenseseat/tauri-plugin';
+import { activate, normalizeError } from '@licenseseat/tauri-plugin';
 
 try {
   const license = await activate(key);
   showSuccess('License activated!');
 } catch (error) {
-  // Error is a string message from the backend
-  const message = error as string;
+  const licenseError = normalizeError(error);
+  const message = licenseError.message;
 
   if (message.includes('invalid')) {
     showError('Invalid license key');

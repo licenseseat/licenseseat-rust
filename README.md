@@ -347,21 +347,34 @@ To release a new version:
 # Edit crates/tauri-plugin-licenseseat/Cargo.toml dependency version
 ```
 
-**2. Update CHANGELOG.md**
+**2. Update `CHANGELOG.md` and the release notes under `docs/releases/`:**
 
-**3. Commit, tag, and push:**
+**3. Run release verification:**
+
+```bash
+cargo fmt --all
+cargo test -p licenseseat
+cargo test -p tauri-plugin-licenseseat
+cargo clippy -p licenseseat --tests -- -D warnings
+cargo clippy -p tauri-plugin-licenseseat --tests -- -D warnings
+
+cd crates/tauri-plugin-licenseseat
+npm ci
+npm run build
+npm run pack:check
+cd ../..
+
+cd crates/licenseseat && cargo publish --dry-run
+cd ../tauri-plugin-licenseseat && cargo publish --dry-run
+cd ../..
+```
+
+**4. Commit and push `main`:**
 
 ```bash
 git add -A
-git commit -m "Bump version to X.Y.Z"
-git tag -a vX.Y.Z -m "Release vX.Y.Z"
-git push origin main --tags
-```
-
-**4. Create GitHub release:**
-
-```bash
-gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes
+git commit -m "Release X.Y.Z"
+git push origin main
 ```
 
 **5. Publish to crates.io (order matters):**
@@ -378,8 +391,17 @@ cd ../tauri-plugin-licenseseat && cargo publish
 
 ```bash
 cd crates/tauri-plugin-licenseseat
-npm run build
 npm publish --access public
+```
+
+This requires an npm account with publish access to the `@licenseseat` scope.
+
+**7. Tag the release commit and create the GitHub release:**
+
+```bash
+git tag -a vX.Y.Z -m "Release vX.Y.Z"
+git push origin vX.Y.Z
+gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes
 ```
 
 ## Other SDKs
