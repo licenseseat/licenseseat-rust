@@ -35,14 +35,14 @@ Official Tauri v2 plugin for [LicenseSeat](https://licenseseat.com) — simple, 
 - **TypeScript Bindings** — Fully typed API with autocomplete
 - **Entitlement Checking** — Feature gating made simple
 - **Event System** — React to license changes in real-time
-- **Offline Support** — Ed25519 cryptographic validation (optional)
+- **Offline Support** — Machine-file-first Ed25519 + AES-256-GCM offline validation
 - **Zero Config** — Just add your API key and product slug
 - **Tauri v2** — Built for the latest Tauri architecture
 
 ## Requirements
 
 - Tauri v2.0.0 or later
-- Rust 1.70+
+- Rust 1.85+
 - Node.js 18+ (for the JS bindings)
 
 ## Installation
@@ -133,7 +133,7 @@ import {
 async function activateLicense(key: string) {
   try {
     const license = await activate(key);
-    console.log(`Activated! Device ID: ${license.deviceId}`);
+    console.log(`Activated! Fingerprint: ${license.deviceId}`);
     return license;
   } catch (error) {
     console.error('Activation failed:', error);
@@ -174,11 +174,18 @@ async function showStatus() {
     case 'active':
       showActiveBadge();
       break;
-    case 'expired':
-      showRenewalPrompt();
+    case 'offline_valid':
+      showOfflineBadge();
       break;
-    case 'not_activated':
+    case 'inactive':
       showActivationPrompt();
+      break;
+    case 'pending':
+      showPendingBadge();
+      break;
+    case 'invalid':
+    case 'offline_invalid':
+      showRenewalPrompt();
       break;
   }
 }
@@ -216,38 +223,68 @@ async fn custom_validation(app: tauri::AppHandle) -> Result<bool, String> {
 | Function | Description | Returns |
 |----------|-------------|---------|
 | `activate(key)` | Activate a license key | `Promise<License>` |
+| `validateKey(key)` | Validate an explicit license key | `Promise<ValidationResult>` |
 | `validate()` | Validate current license | `Promise<ValidationResult>` |
 | `deactivate()` | Deactivate and release seat | `Promise<void>` |
+| `deactivateKey(key, fingerprint?)` | Deactivate an explicit license/fingerprint pair | `Promise<void>` |
 | `getStatus()` | Get current license status | `Promise<LicenseStatus>` |
+| `getClientStatus()` | Get the stable client-status string | `Promise<LicenseStatus['status']>` |
+| `isOnline()` | Check whether the SDK currently believes the API is reachable | `Promise<boolean>` |
+| `getFingerprint()` | Get the current SDK fingerprint | `Promise<string>` |
+| `restoreLicense()` | Restore a cached license session | `Promise<RestoreResult>` |
+| `health()` | Check API reachability | `Promise<boolean>` |
 | `hasEntitlement(key)` | Check if entitlement is active | `Promise<boolean>` |
 | `checkEntitlement(key)` | Get detailed entitlement status | `Promise<EntitlementStatus>` |
-| `heartbeat()` | Send heartbeat ping | `Promise<HeartbeatResponse>` |
-| `getEntitlements()` | List all entitlements | `Promise<Entitlement[]>` |
+| `getEntitlements()` | List active entitlements from the cached validation result | `Promise<Entitlement[]>` |
+| `heartbeat()` | Send heartbeat ping | `Promise<void>` |
+| `heartbeatKey(key, fingerprint?)` | Send a heartbeat for an explicit license/fingerprint pair | `Promise<void>` |
+| `getLatestRelease(...)` | Get the latest published release | `Promise<Release>` |
+| `listReleases(...)` | List releases with pagination metadata | `Promise<ReleaseList>` |
+| `generateDownloadToken(...)` | Generate a release download token | `Promise<DownloadToken>` |
+| `generateOfflineToken(key, fingerprint?, ttlDays?)` | Generate a legacy offline token | `Promise<OfflineToken>` |
+| `verifyOfflineToken(token, publicKeyB64?)` | Verify a legacy offline token locally | `Promise<boolean>` |
+| `checkoutMachineFile(...)` | Checkout a machine file for offline validation | `Promise<MachineFile>` |
+| `fetchSigningKey(keyId)` | Fetch and cache a signing key | `Promise<string>` |
+| `verifyMachineFile(file, options?)` | Verify a machine file locally | `Promise<MachineFileVerificationResult>` |
 
 ### Types
 
 ```typescript
 interface License {
-  key: string;
-  status: 'active' | 'expired' | 'suspended' | 'revoked';
-  planKey: string;
-  seatLimit: number;
-  expiresAt?: string;
+  licenseKey: string;
   deviceId: string;
-  activationId?: string;
+  activationId: string;
+  activatedAt: string;
 }
 
 interface ValidationResult {
+  object: string;
   valid: boolean;
   code?: string;
   message?: string;
-  warnings?: string[];
-  license: License;
+  license: {
+    key: string;
+    status: string;
+    planKey: string;
+    activeEntitlements: Array<{
+      key: string;
+      expiresAt?: string;
+    }>;
+  };
 }
 
 interface LicenseStatus {
-  status: 'active' | 'expired' | 'suspended' | 'not_activated';
-  license?: License;
+  status: 'active' | 'inactive' | 'invalid' | 'pending' | 'offline_valid' | 'offline_invalid';
+  message?: string;
+  license?: string;
+  device?: string;
+  activatedAt?: string;
+  lastValidated?: string;
+}
+
+interface EntitlementStatus {
+  active: boolean;
+  reason?: 'nolicense' | 'notfound' | 'expired';
   expiresAt?: string;
 }
 
@@ -255,16 +292,6 @@ interface Entitlement {
   key: string;
   expiresAt?: string;
   metadata?: Record<string, unknown>;
-}
-
-interface EntitlementStatus {
-  active: boolean;
-  reason: 'active' | 'expired' | 'not_found' | 'no_license';
-  expiresAt?: string;
-}
-
-interface HeartbeatResponse {
-  receivedAt: string;
 }
 ```
 
@@ -280,9 +307,16 @@ interface HeartbeatResponse {
       "apiKey": "your-api-key",
       "productSlug": "your-product",
       "apiBaseUrl": "https://licenseseat.com/api/v1",
+      "storagePrefix": "licenseseat_",
+      "deviceIdentifier": "stable-fingerprint",
+      "signingPublicKey": null,
+      "signingKeyId": null,
       "autoValidateInterval": 3600,
       "heartbeatInterval": 300,
+      "networkRecheckInterval": 30,
       "offlineFallbackMode": "network_only",
+      "offlineTokenRefreshInterval": 259200,
+      "enableLegacyOfflineTokens": false,
       "maxOfflineDays": 0,
       "telemetryEnabled": true,
       "debug": false
@@ -298,9 +332,16 @@ interface HeartbeatResponse {
 | `apiKey` | `string` | — | Your LicenseSeat API key (required) |
 | `productSlug` | `string` | — | Your product slug (required) |
 | `apiBaseUrl` | `string` | `https://licenseseat.com/api/v1` | API base URL |
+| `storagePrefix` | `string` | `"licenseseat_"` | Cache namespace prefix |
+| `deviceIdentifier` | `string` | auto-generated | Override the canonical fingerprint |
+| `signingPublicKey` | `string` | `null` | Optional pinned public key for offline verification |
+| `signingKeyId` | `string` | `null` | Optional key ID for `signingPublicKey` |
 | `autoValidateInterval` | `number` | `3600` | Background validation interval (seconds) |
 | `heartbeatInterval` | `number` | `300` | Heartbeat interval (seconds) |
-| `offlineFallbackMode` | `string` | `"network_only"` | `"network_only"`, `"allow_offline"`, or `"offline_first"` |
+| `networkRecheckInterval` | `number` | `30` | Network recheck interval while offline (seconds) |
+| `offlineFallbackMode` | `string` | `"network_only"` | `"network_only"` or `"always"`; `"allow_offline"` / `"offline_first"` remain accepted legacy aliases |
+| `offlineTokenRefreshInterval` | `number` | `259200` | Offline artifact refresh interval (seconds) |
+| `enableLegacyOfflineTokens` | `boolean` | `false` | Allow legacy offline-token fallback after machine-file sync fails |
 | `maxOfflineDays` | `number` | `0` | Grace period for offline mode (days) |
 | `telemetryEnabled` | `boolean` | `true` | Send device telemetry |
 | `debug` | `boolean` | `false` | Enable debug logging |
@@ -343,10 +384,10 @@ if (status.active) {
     case 'expired':
       showUpgradePrompt('Your Pro features have expired');
       break;
-    case 'not_found':
+    case 'notfound':
       showUpgradePrompt('Upgrade to Pro for this feature');
       break;
-    case 'no_license':
+    case 'nolicense':
       showActivationPrompt();
       break;
   }
@@ -397,7 +438,7 @@ await listen('licenseseat://heartbeat-error', () => {
 | `licenseseat://activation-success` | `License` | License activated |
 | `licenseseat://activation-error` | `string` | Activation failed |
 | `licenseseat://validation-success` | `ValidationResult` | Validation succeeded |
-| `licenseseat://validation-failed` | `string` | Validation failed |
+| `licenseseat://validation-failed` | `ValidationResult` | Validation failed |
 | `licenseseat://deactivation-success` | — | License deactivated |
 | `licenseseat://heartbeat-success` | — | Heartbeat acknowledged |
 | `licenseseat://heartbeat-error` | `string` | Heartbeat failed |
@@ -410,7 +451,7 @@ Enable offline validation for air-gapped or unreliable network environments:
 {
   "plugins": {
     "licenseseat": {
-      "offlineFallbackMode": "allow_offline",
+      "offlineFallbackMode": "always",
       "maxOfflineDays": 7
     }
   }
@@ -422,8 +463,7 @@ Enable offline validation for air-gapped or unreliable network environments:
 | Mode | Description |
 |------|-------------|
 | `network_only` | Always require network (default) |
-| `allow_offline` | Fall back to cached token when offline |
-| `offline_first` | Prefer offline, sync when online |
+| `always` | Fall back to cached machine files, then legacy offline tokens if explicitly enabled |
 
 ## React Integration
 
@@ -614,7 +654,7 @@ npm add @licenseseat/tauri-plugin
 ### Offline Validation Not Working
 
 1. Ensure the `offline` feature is enabled (it's built-in for the Tauri plugin)
-2. Check that `offlineFallbackMode` is set to `"allow_offline"` or `"offline_first"`
+2. Check that `offlineFallbackMode` is set to `"always"` (or a legacy alias such as `"allow_offline"`)
 3. Verify `maxOfflineDays` is greater than 0
 
 ### Debug Logging

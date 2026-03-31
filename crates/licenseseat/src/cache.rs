@@ -17,8 +17,8 @@ pub struct LicenseCache {
 
 impl LicenseCache {
     /// Create a new cache with the given prefix.
-    pub fn new(prefix: impl Into<String>) -> Self {
-        let cache_dir = dirs::cache_dir().map(|d| d.join("licenseseat"));
+    pub fn new(prefix: impl Into<String>, cache_dir: Option<PathBuf>) -> Self {
+        let cache_dir = cache_dir.or_else(|| dirs::cache_dir().map(|d| d.join("licenseseat")));
         Self {
             prefix: prefix.into(),
             cache_dir,
@@ -57,13 +57,6 @@ impl LicenseCache {
         serde_json::from_str(&json).ok()
     }
 
-    /// Remove a value from the cache.
-    fn remove(&self, key: &str) {
-        if let Some(path) = self.path(key) {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
     // ========================================================================
     // License-specific methods
     // ========================================================================
@@ -78,14 +71,14 @@ impl LicenseCache {
         self.get("license")
     }
 
-    /// Clear the cached license.
-    pub fn clear_license(&self) {
-        self.remove("license");
-    }
-
     /// Get the cached device ID.
     pub fn get_device_id(&self) -> Option<String> {
         self.get_license().map(|l| l.device_id)
+    }
+
+    /// Preferred alias for the canonical fingerprint.
+    pub fn get_fingerprint(&self) -> Option<String> {
+        self.get_device_id()
     }
 
     /// Update the validation result on the cached license.
@@ -103,21 +96,23 @@ impl LicenseCache {
     // ========================================================================
 
     /// Store the offline token.
-    #[cfg(feature = "offline")]
     pub fn set_offline_token(&self, token: &crate::models::OfflineTokenResponse) -> Result<()> {
         self.set("offline_token", token)
     }
 
     /// Get the cached offline token.
-    #[cfg(feature = "offline")]
     pub fn get_offline_token(&self) -> Option<crate::models::OfflineTokenResponse> {
         self.get("offline_token")
     }
 
-    /// Clear the offline token.
-    #[cfg(feature = "offline")]
-    pub fn clear_offline_token(&self) {
-        self.remove("offline_token");
+    /// Store the machine file.
+    pub fn set_machine_file(&self, machine_file: &crate::models::MachineFile) -> Result<()> {
+        self.set("machine_file", machine_file)
+    }
+
+    /// Get the cached machine file.
+    pub fn get_machine_file(&self) -> Option<crate::models::MachineFile> {
+        self.get("machine_file")
     }
 
     // ========================================================================
@@ -125,7 +120,6 @@ impl LicenseCache {
     // ========================================================================
 
     /// Store a signing key.
-    #[cfg(feature = "offline")]
     pub fn set_signing_key(
         &self,
         key_id: &str,
@@ -135,7 +129,6 @@ impl LicenseCache {
     }
 
     /// Get a cached signing key.
-    #[cfg(feature = "offline")]
     pub fn get_signing_key(&self, key_id: &str) -> Option<crate::models::SigningKeyResponse> {
         self.get(&format!("signing_key_{}", key_id))
     }
@@ -160,14 +153,24 @@ impl LicenseCache {
 
     /// Clear all cached data.
     pub fn clear(&self) {
-        self.clear_license();
-        self.remove("last_seen_ts");
-        #[cfg(feature = "offline")]
-        {
-            self.clear_offline_token();
+        let Some(dir) = &self.cache_dir else {
+            return;
+        };
+
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let matches_prefix = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with(&self.prefix))
+                .unwrap_or(false);
+            if matches_prefix {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }
-
-// Add dirs crate for cache directory
-// This will be in Cargo.toml

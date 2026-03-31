@@ -14,10 +14,10 @@ categories.workspace = true
 readme = "README.md"
 
 [features]
-default = ["rustls"]
+default = ["rustls", "offline"]
 rustls = ["reqwest/rustls-tls"]
 native-tls = ["reqwest/native-tls"]
-offline = ["dep:ed25519-dalek", "dep:sha2", "dep:base64"]  # Ed25519 offline validation
+offline = ["dep:ed25519-dalek", "dep:base64", "dep:aes-gcm"]  # Machine-file + offline-token validation
 
 [dependencies]
 # Serialization
@@ -42,7 +42,8 @@ chrono.workspace = true
 # Crypto (optional, for offline validation)
 ed25519-dalek = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
+sha2.workspace = true
+aes-gcm = { version = "0.10", optional = true }
 
 # Device fingerprinting
 machine-uid = "0.5"

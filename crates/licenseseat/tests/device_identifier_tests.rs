@@ -146,7 +146,9 @@ async fn test_custom_device_id_used() {
 
     let sdk = LicenseSeat::new(test_config(&server.uri()));
     let options = licenseseat::ActivationOptions {
+        fingerprint: None,
         device_id: Some("my-custom-device-id".into()),
+        device_fingerprint: None,
         device_name: None,
         metadata: None,
     };
@@ -157,7 +159,46 @@ async fn test_custom_device_id_used() {
     let requests = server.received_requests().await.unwrap();
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
 
+    assert_eq!(body["fingerprint"].as_str(), Some("my-custom-device-id"));
     assert_eq!(body["device_id"].as_str(), Some("my-custom-device-id"));
+    assert_eq!(
+        body["device_fingerprint"].as_str(),
+        Some("my-custom-device-id")
+    );
+}
+
+#[tokio::test]
+async fn test_device_fingerprint_alias_used() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response("legacy-device-id")),
+        )
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    let options = licenseseat::ActivationOptions {
+        fingerprint: None,
+        device_id: None,
+        device_fingerprint: Some("legacy-device-id".into()),
+        device_name: None,
+        metadata: None,
+    };
+
+    let _ = sdk.activate_with_options("TEST-KEY", options).await;
+
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+
+    assert_eq!(body["fingerprint"].as_str(), Some("legacy-device-id"));
+    assert_eq!(body["device_id"].as_str(), Some("legacy-device-id"));
+    assert_eq!(
+        body["device_fingerprint"].as_str(),
+        Some("legacy-device-id")
+    );
 }
 
 #[tokio::test]
@@ -184,7 +225,12 @@ async fn test_config_device_identifier_used() {
     let requests = server.received_requests().await.unwrap();
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
 
+    assert_eq!(body["fingerprint"].as_str(), Some("config-level-device-id"));
     assert_eq!(body["device_id"].as_str(), Some("config-level-device-id"));
+    assert_eq!(
+        body["device_fingerprint"].as_str(),
+        Some("config-level-device-id")
+    );
 }
 
 #[tokio::test]
@@ -206,7 +252,9 @@ async fn test_activation_options_override_config() {
 
     let sdk = LicenseSeat::new(config);
     let options = licenseseat::ActivationOptions {
+        fingerprint: None,
         device_id: Some("options-device-id".into()),
+        device_fingerprint: None,
         device_name: None,
         metadata: None,
     };
@@ -217,7 +265,12 @@ async fn test_activation_options_override_config() {
     let requests = server.received_requests().await.unwrap();
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
 
+    assert_eq!(body["fingerprint"].as_str(), Some("options-device-id"));
     assert_eq!(body["device_id"].as_str(), Some("options-device-id"));
+    assert_eq!(
+        body["device_fingerprint"].as_str(),
+        Some("options-device-id")
+    );
 }
 
 // ============================================================================

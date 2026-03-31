@@ -238,6 +238,52 @@ async fn test_validation_events() {
 }
 
 #[tokio::test]
+async fn test_validation_auth_failed_event() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "error": {
+                "code": "invalid_api_key",
+                "message": "Unauthorized"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    config.max_retries = 0;
+    let sdk = LicenseSeat::new(config);
+
+    let auth_failed = Arc::new(AtomicUsize::new(0));
+    let auth_failed_clone = auth_failed.clone();
+
+    let mut rx = sdk.subscribe();
+    let handle = tokio::spawn(async move {
+        while let Ok(event) = rx.recv().await {
+            if matches!(event.kind, EventKind::ValidationAuthFailed) {
+                auth_failed_clone.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+
+    let _ = sdk.activate("TEST-KEY").await;
+    let _ = sdk.validate().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(auth_failed.load(Ordering::SeqCst), 1);
+
+    drop(handle);
+}
+
+#[tokio::test]
 async fn test_deactivation_events() {
     let server = MockServer::start().await;
 
@@ -387,12 +433,15 @@ fn test_event_kind_variants() {
         EventKind::ValidationStart,
         EventKind::ValidationSuccess,
         EventKind::ValidationError,
+        EventKind::ValidationAuthFailed,
+        EventKind::ValidationAutoFailed,
         EventKind::DeactivationStart,
         EventKind::DeactivationSuccess,
         EventKind::DeactivationError,
         EventKind::HeartbeatSuccess,
         EventKind::HeartbeatError,
         EventKind::SdkReset,
+        EventKind::SdkError,
     ];
 
     // All should be displayable
@@ -417,6 +466,10 @@ fn test_event_kind_display() {
     assert_eq!(
         format!("{}", EventKind::ValidationSuccess),
         "validation:success"
+    );
+    assert_eq!(
+        format!("{}", EventKind::ValidationAuthFailed),
+        "validation:auth-failed"
     );
     assert_eq!(
         format!("{}", EventKind::DeactivationSuccess),

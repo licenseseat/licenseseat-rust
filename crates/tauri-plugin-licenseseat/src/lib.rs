@@ -5,7 +5,7 @@
 //! ## Features
 //!
 //! - License activation, validation, and deactivation
-//! - Offline validation with Ed25519 signatures
+//! - Machine-file-first offline validation with Ed25519 + AES-256-GCM
 //! - Automatic re-validation in the background
 //! - Entitlement checking for feature flags
 //! - Event emission to the frontend
@@ -16,7 +16,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! tauri-plugin-licenseseat = "0.1"
+//! tauri-plugin-licenseseat = "0.5.1"
 //! ```
 //!
 //! Register the plugin in your Tauri app:
@@ -65,7 +65,7 @@ mod config;
 mod error;
 
 use tauri::{
-    Manager, Runtime,
+    Emitter, Manager, Runtime,
     plugin::{Builder, TauriPlugin},
 };
 
@@ -103,7 +103,10 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
 
             // Parse offline fallback mode from config string
             let offline_fallback_mode = match config.offline_fallback_mode.as_deref() {
-                Some("always") | Some("allow_offline") => licenseseat::OfflineFallbackMode::Always,
+                Some("always")
+                | Some("allow_offline")
+                | Some("offline_first")
+                | Some("offlineFirst") => licenseseat::OfflineFallbackMode::Always,
                 _ => licenseseat::OfflineFallbackMode::NetworkOnly,
             };
 
@@ -114,13 +117,32 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 api_base_url: config
                     .api_base_url
                     .unwrap_or_else(|| "https://licenseseat.com/api/v1".into()),
+                storage_prefix: config
+                    .storage_prefix
+                    .clone()
+                    .unwrap_or_else(|| "licenseseat_".into()),
+                storage_path: config.storage_path.clone().map(Into::into),
+                device_identifier: config.device_identifier.clone(),
+                signing_public_key: config.signing_public_key.clone(),
+                signing_key_id: config.signing_key_id.clone(),
                 auto_validate_interval: std::time::Duration::from_secs(
                     config.auto_validate_interval.unwrap_or(3600),
                 ),
                 heartbeat_interval: std::time::Duration::from_secs(
                     config.heartbeat_interval.unwrap_or(300),
                 ),
+                network_recheck_interval: std::time::Duration::from_secs(
+                    config.network_recheck_interval.unwrap_or(30),
+                ),
+                request_timeout: std::time::Duration::from_secs(
+                    config.timeout_seconds.unwrap_or(30),
+                ),
+                verify_ssl: config.verify_ssl.unwrap_or(true),
                 offline_fallback_mode,
+                offline_token_refresh_interval: std::time::Duration::from_secs(
+                    config.offline_token_refresh_interval.unwrap_or(72 * 3600),
+                ),
+                enable_legacy_offline_tokens: config.enable_legacy_offline_tokens.unwrap_or(false),
                 max_offline_days: config.max_offline_days.unwrap_or(0),
                 debug: config.debug.unwrap_or(false),
                 telemetry_enabled: config.telemetry_enabled.unwrap_or(true),
@@ -131,6 +153,17 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
 
             // Create the SDK instance and manage it
             let sdk = licenseseat::LicenseSeat::new(sdk_config);
+            let event_sdk = sdk.clone();
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut rx = event_sdk.subscribe();
+                while let Ok(event) = rx.recv().await {
+                    let event_name =
+                        format!("licenseseat://{}", event.kind.to_string().replace(':', "-"));
+                    let payload = commands::event_payload_to_json(event.data);
+                    let _ = app_handle.emit(&event_name, payload);
+                }
+            });
             app.manage(sdk);
 
             tracing::info!("LicenseSeat plugin initialized");
@@ -138,13 +171,30 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
         })
         .invoke_handler(tauri::generate_handler![
             commands::activate,
+            commands::validate_key,
             commands::validate,
             commands::deactivate,
+            commands::deactivate_key,
             commands::heartbeat,
+            commands::heartbeat_key,
             commands::get_status,
+            commands::get_client_status,
+            commands::is_online,
+            commands::get_fingerprint,
+            commands::restore_license,
+            commands::health,
             commands::check_entitlement,
+            commands::get_entitlements,
             commands::has_entitlement,
             commands::get_license,
+            commands::get_latest_release,
+            commands::list_releases,
+            commands::generate_download_token,
+            commands::generate_offline_token,
+            commands::verify_offline_token,
+            commands::checkout_machine_file,
+            commands::fetch_signing_key,
+            commands::verify_machine_file,
             commands::reset,
         ])
         .build()

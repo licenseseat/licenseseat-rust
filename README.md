@@ -4,7 +4,7 @@
 [![Tauri Plugin](https://img.shields.io/crates/v/tauri-plugin-licenseseat.svg?label=tauri-plugin)](https://crates.io/crates/tauri-plugin-licenseseat)
 [![Documentation](https://docs.rs/licenseseat/badge.svg)](https://docs.rs/licenseseat)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 
 Official Rust SDK and Tauri plugin for [LicenseSeat](https://licenseseat.com) — the simple, secure licensing platform for desktop apps, games, and plugins.
 
@@ -30,7 +30,7 @@ Official Rust SDK and Tauri plugin for [LicenseSeat](https://licenseseat.com) �
 ## Features
 
 - **License Lifecycle** — Activate, validate, and deactivate licenses with a simple API
-- **Offline Validation** — Ed25519 cryptographic verification for air-gapped environments
+- **Offline Validation** — Machine-file-first Ed25519 + AES-256-GCM offline verification
 - **Automatic Re-validation** — Background validation with configurable intervals
 - **Heartbeat** — Periodic health-check pings for real-time seat tracking
 - **Entitlement Management** — Fine-grained feature access control with expiration support
@@ -105,7 +105,7 @@ import { activate, hasEntitlement, deactivate } from '@licenseseat/tauri-plugin'
 
 // Activate a license
 const license = await activate('USER-LICENSE-KEY');
-console.log(`Device ID: ${license.deviceId}`);
+console.log(`Fingerprint: ${license.deviceId}`);
 
 // Check entitlements
 if (await hasEntitlement('pro-features')) {
@@ -131,7 +131,7 @@ async fn main() -> licenseseat::Result<()> {
 
     // Activate a license
     let license = sdk.activate("USER-LICENSE-KEY").await?;
-    println!("Activated! Device ID: {}", license.device_id);
+    println!("Activated! Fingerprint: {}", license.fingerprint());
 
     // Validate the license
     let result = sdk.validate().await?;
@@ -166,7 +166,7 @@ async fn main() -> licenseseat::Result<()> {
 
 | Method | Description |
 |--------|-------------|
-| `activate(key)` | Activates a license key on this device. Returns device ID and activation details. |
+| `activate(key)` | Activates a license key on this device. Returns fingerprint/device binding and activation details. |
 | `validate()` | Validates the current license. Returns validity status, entitlements, and warnings. |
 | `deactivate()` | Releases the seat. Call on uninstall or when switching devices. |
 | `heartbeat()` | Sends a health-check ping. Used for real-time seat tracking. |
@@ -184,25 +184,28 @@ if sdk.has_entitlement("cloud-sync") {
 // Get detailed status
 let status = sdk.check_entitlement("pro-features");
 match status.reason {
-    EntitlementReason::Active => println!("Active!"),
-    EntitlementReason::Expired => println!("Expired at {:?}", status.expires_at),
-    EntitlementReason::NotFound => println!("Not included in plan"),
-    EntitlementReason::NoLicense => println!("No active license"),
+    None if status.active => println!("Active!"),
+    Some(EntitlementReason::Expired) => println!("Expired at {:?}", status.expires_at),
+    Some(EntitlementReason::NotFound) => println!("Not included in plan"),
+    Some(EntitlementReason::NoLicense) => println!("No active license"),
+    _ => {}
 }
 
-// List all entitlements
-for entitlement in sdk.entitlements() {
-    println!("{}: {:?}", entitlement.key, entitlement.expires_at);
+// List entitlements from the cached validation result
+if let Some(license) = sdk.current_license() {
+    if let Some(validation) = license.validation {
+        for entitlement in validation.license.active_entitlements {
+            println!("{}: {:?}", entitlement.key, entitlement.expires_at);
+        }
+    }
 }
 ```
 
 ## Offline Validation
 
-For air-gapped or unreliable network environments, enable Ed25519 cryptographic offline validation:
-
-```bash
-cargo add licenseseat --features offline
-```
+Offline support is included in the default `licenseseat` build and mirrors the C++ SDK:
+machine files are the preferred offline artifact, with legacy offline tokens available only as an
+explicit compatibility fallback.
 
 ```rust
 use licenseseat::{Config, OfflineFallbackMode};
@@ -210,8 +213,9 @@ use licenseseat::{Config, OfflineFallbackMode};
 let config = Config {
     api_key: "your-api-key".into(),
     product_slug: "your-product".into(),
-    offline_fallback_mode: OfflineFallbackMode::AllowOffline,
+    offline_fallback_mode: OfflineFallbackMode::Always,
     max_offline_days: 7,  // Grace period
+    enable_legacy_offline_tokens: false,
     ..Default::default()
 };
 ```
@@ -221,8 +225,7 @@ let config = Config {
 | Mode | Description |
 |------|-------------|
 | `NetworkOnly` | Always require network validation (default) |
-| `AllowOffline` | Fall back to cached offline token when network unavailable |
-| `OfflineFirst` | Prefer offline validation, sync when online |
+| `Always` | Fall back to cached machine files, then legacy offline tokens if explicitly enabled |
 
 ## Heartbeat & Seat Tracking
 
@@ -289,7 +292,11 @@ tokio::spawn(async move {
 | `auto_validate_interval` | `Duration` | 1 hour | Background validation interval |
 | `heartbeat_interval` | `Duration` | 5 minutes | Heartbeat interval |
 | `offline_fallback_mode` | `OfflineFallbackMode` | `NetworkOnly` | Offline validation behavior |
+| `offline_token_refresh_interval` | `Duration` | 72 hours | Offline artifact refresh interval |
+| `enable_legacy_offline_tokens` | `bool` | `false` | Allow legacy offline-token fallback after machine-file sync fails |
 | `max_offline_days` | `u32` | `0` | Grace period for offline mode |
+| `device_identifier` | `Option<String>` | `None` | Override the canonical device fingerprint |
+| `signing_public_key` | `Option<String>` | `None` | Optional pinned public key for offline verification |
 | `telemetry_enabled` | `bool` | `true` | Send device telemetry |
 | `app_version` | `Option<String>` | `None` | Your app version (for analytics) |
 | `debug` | `bool` | `false` | Enable debug logging |

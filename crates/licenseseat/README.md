@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/licenseseat.svg)](https://crates.io/crates/licenseseat)
 [![Documentation](https://docs.rs/licenseseat/badge.svg)](https://docs.rs/licenseseat)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](../../LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 
 Official Rust SDK for [LicenseSeat](https://licenseseat.com) — simple, secure software licensing for desktop apps, games, CLI tools, and plugins.
 
@@ -38,23 +38,14 @@ Or manually:
 
 ```toml
 [dependencies]
-licenseseat = "0.1"
+licenseseat = "0.5.1"
 ```
 
-### With Offline Validation
-
-For Ed25519 cryptographic offline validation:
-
-```bash
-cargo add licenseseat --features offline
-```
-
-### With Native TLS
-
-To use your system's TLS instead of rustls:
+Offline support is included in the default build. If you disable default features
+and still want machine-file / offline-token verification, add `offline` back explicitly:
 
 ```bash
-cargo add licenseseat --no-default-features --features native-tls
+cargo add licenseseat --no-default-features --features "native-tls,offline"
 ```
 
 ## Quick Start
@@ -102,13 +93,14 @@ let sdk = LicenseSeat::new(Config::new("api-key", "product"));
 
 // Simple activation
 let license = sdk.activate("USER-LICENSE-KEY").await?;
-println!("Device ID: {}", license.device_id);
+println!("Fingerprint: {}", license.fingerprint());
 println!("Activation ID: {:?}", license.activation_id);
 
 // Activation with options
 let license = sdk.activate_with_options(
     "USER-LICENSE-KEY",
     ActivationOptions {
+        fingerprint: None,
         device_name: Some("John's MacBook".into()),
         ..Default::default()
     }
@@ -196,56 +188,60 @@ println!("Active: {}", status.active);
 println!("Expires: {:?}", status.expires_at);
 
 match status.reason {
-    EntitlementReason::Active => {
-        // Entitlement is active and valid
-        enable_feature();
-    }
-    EntitlementReason::Expired => {
+    None if status.active => enable_feature(),
+    Some(EntitlementReason::Expired) => {
         // Was active, now expired
         show_upgrade_prompt();
     }
-    EntitlementReason::NotFound => {
+    Some(EntitlementReason::NotFound) => {
         // Not included in the user's plan
         show_plan_upgrade_prompt();
     }
-    EntitlementReason::NoLicense => {
+    Some(EntitlementReason::NoLicense) => {
         // No license is active
         show_activation_prompt();
     }
+    _ => {}
 }
 ```
 
 ### List All Entitlements
 
 ```rust
-for entitlement in sdk.entitlements() {
-    println!("Key: {}", entitlement.key);
-    println!("Expires: {:?}", entitlement.expires_at);
-    println!("Metadata: {:?}", entitlement.metadata);
+if let Some(license) = sdk.current_license() {
+    if let Some(validation) = license.validation {
+        for entitlement in validation.license.active_entitlements {
+            println!("Key: {}", entitlement.key);
+            println!("Expires: {:?}", entitlement.expires_at);
+            println!("Metadata: {:?}", entitlement.metadata);
+        }
+    }
 }
 ```
 
 ## Offline Validation
 
-For environments with unreliable network or air-gapped systems, enable offline validation:
-
-```bash
-cargo add licenseseat --features offline
-```
+The Rust SDK now matches the C++ SDK's machine-file-first offline flow.
 
 ```rust
 use licenseseat::{Config, OfflineFallbackMode};
-use std::time::Duration;
 
 let config = Config {
     api_key: "your-api-key".into(),
     product_slug: "your-product".into(),
 
-    // Enable offline validation
-    offline_fallback_mode: OfflineFallbackMode::AllowOffline,
+    // Fall back to locally cached offline artifacts when the network is unavailable.
+    offline_fallback_mode: OfflineFallbackMode::Always,
 
-    // Grace period: how long offline validation remains valid
+    // Maximum time the app may continue operating without a successful online validation.
     max_offline_days: 7,
+
+    // Optional pinned signing key. If omitted, the SDK fetches keys by `kid` on demand.
+    signing_public_key: None,
+    signing_key_id: None,
+
+    // Legacy offline tokens are disabled by default. Machine files are preferred.
+    enable_legacy_offline_tokens: false,
 
     ..Default::default()
 };
@@ -258,23 +254,22 @@ let sdk = LicenseSeat::new(config);
 | Mode | Behavior |
 |------|----------|
 | `NetworkOnly` | Always require network. Fail if offline. (Default) |
-| `AllowOffline` | Try network first, fall back to cached token if unavailable |
-| `OfflineFirst` | Use cached token first, sync with server when online |
+| `Always` | Try online first, then fall back to a cached machine file or legacy offline token |
 
 ### How It Works
 
-1. On successful validation, the server returns a signed offline token
-2. The token is cryptographically signed with Ed25519
-3. The SDK caches the token locally
-4. When offline, the SDK verifies the signature and checks expiration
-5. After `max_offline_days`, the token expires and network is required
+1. Activation binds the license to a canonical device fingerprint.
+2. The SDK checks out a machine file from `/machine-file` after activation.
+3. The machine file is Ed25519-signed and AES-256-GCM encrypted using a key derived from `license_key || fingerprint`.
+4. When offline, the SDK verifies the signature, decrypts the payload, and enforces expiry / grace / fingerprint binding locally.
+5. Legacy offline tokens remain available only as an optional compatibility fallback via `enable_legacy_offline_tokens`.
 
 ### Clock Tampering Protection
 
 The SDK includes safeguards against clock manipulation:
-- Tokens include `nbf` (not before) and `exp` (expiration) timestamps
+- Offline artifacts include `nbf` (not before) and `exp` (expiration) timestamps
 - Significant clock jumps are detected and flagged
-- Backward clock movement invalidates offline tokens
+- Backward clock movement invalidates offline validation
 
 ## Heartbeat & Seat Tracking
 
@@ -542,9 +537,9 @@ Scenarios tested:
 
 | Feature | Description | Dependencies Added |
 |---------|-------------|--------------------|
-| `default` | Uses rustls for TLS | `reqwest/rustls-tls` |
+| `default` | Uses rustls for TLS and enables offline machine-file support | `reqwest/rustls-tls`, `ed25519-dalek`, `sha2`, `base64`, `aes-gcm` |
 | `native-tls` | Use system TLS instead | `reqwest/native-tls` |
-| `offline` | Ed25519 offline validation | `ed25519-dalek`, `sha2`, `base64` |
+| `offline` | Enable offline support when using `--no-default-features` | `ed25519-dalek`, `sha2`, `base64`, `aes-gcm` |
 
 ## API Reference
 
@@ -558,7 +553,7 @@ pub struct LicenseSeat { ... }
 
 // Configuration
 pub struct Config { ... }
-pub enum OfflineFallbackMode { NetworkOnly, AllowOffline, OfflineFirst }
+pub enum OfflineFallbackMode { NetworkOnly, Always }
 
 // License data
 pub struct License { ... }
@@ -567,7 +562,7 @@ pub enum LicenseStatus { Active, Expired, Suspended, Revoked }
 // Entitlements
 pub struct Entitlement { ... }
 pub struct EntitlementStatus { ... }
-pub enum EntitlementReason { Active, Expired, NotFound, NoLicense }
+pub enum EntitlementReason { Expired, NotFound, NoLicense }
 
 // Events
 pub struct Event { ... }

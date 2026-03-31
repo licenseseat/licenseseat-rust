@@ -17,10 +17,13 @@ fn test_config_default_values() {
     assert!(config.api_key.is_empty());
     assert!(config.product_slug.is_empty());
     assert_eq!(config.storage_prefix, "licenseseat_");
+    assert!(config.storage_path.is_none());
     assert!(config.device_identifier.is_none());
     assert_eq!(config.auto_validate_interval, Duration::from_secs(3600));
     assert_eq!(config.heartbeat_interval, Duration::from_secs(300));
     assert_eq!(config.network_recheck_interval, Duration::from_secs(30));
+    assert_eq!(config.request_timeout, Duration::from_secs(30));
+    assert!(config.verify_ssl);
     assert_eq!(config.max_retries, 3);
     assert_eq!(config.retry_delay, Duration::from_secs(1));
     assert_eq!(
@@ -124,6 +127,16 @@ fn test_config_custom_storage_prefix() {
 }
 
 #[test]
+fn test_config_custom_storage_path() {
+    let config = Config::new("key", "product").with_storage_path("/tmp/licenseseat-tests");
+
+    assert_eq!(
+        config.storage_path.as_deref(),
+        Some(std::path::Path::new("/tmp/licenseseat-tests"))
+    );
+}
+
+#[test]
 fn test_config_custom_device_identifier() {
     let config = Config {
         device_identifier: Some("my-custom-device-id".into()),
@@ -192,6 +205,16 @@ fn test_config_custom_retry_settings() {
 
     assert_eq!(config.max_retries, 5);
     assert_eq!(config.retry_delay, Duration::from_millis(500));
+}
+
+#[test]
+fn test_config_custom_request_timeout_and_ssl() {
+    let config = Config::new("key", "product")
+        .with_request_timeout(Duration::from_secs(12))
+        .with_verify_ssl(false);
+
+    assert_eq!(config.request_timeout, Duration::from_secs(12));
+    assert!(!config.verify_ssl);
 }
 
 // ============================================================================
