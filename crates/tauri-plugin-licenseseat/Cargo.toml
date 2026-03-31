@@ -31,6 +31,7 @@ tauri-plugin = "2"
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+dirs = "5"
 
 # Logging
 tracing.workspace = true

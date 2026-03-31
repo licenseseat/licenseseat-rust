@@ -96,6 +96,31 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  js-bindings:
+    name: JS Bindings
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/tauri-plugin-licenseseat
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: crates/tauri-plugin-licenseseat/package-lock.json
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Build JS bindings
+        run: npm run build
+
+      - name: Verify package contents
+        run: npm run pack:check
+
   docs:
     name: Documentation
     runs-on: ubuntu-latest

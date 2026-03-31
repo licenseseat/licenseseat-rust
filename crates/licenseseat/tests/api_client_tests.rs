@@ -4,7 +4,7 @@ use licenseseat::{Config, LicenseSeat};
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use wiremock::matchers::{header, method, path_regex};
+use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -174,6 +174,109 @@ async fn test_404_returns_error() {
 
     // SDK should return an error for 404 responses
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_activate_encodes_license_key_in_request_path() {
+    let server = MockServer::start().await;
+    let license_key = "TEST KEY/with#chars";
+
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(activation_response())
+                .append_header("Content-Type", "application/json"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    let result = sdk.activate(license_key).await;
+
+    assert!(result.is_ok());
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url.path(),
+        "/products/test-product/licenses/TEST%20KEY%2Fwith%23chars/activate"
+    );
+}
+
+#[tokio::test]
+async fn test_activate_preserves_api_base_url_prefix_without_trailing_slash() {
+    let server = MockServer::start().await;
+    let base_url = format!("{}/api/v1", server.uri());
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v1/products/test-product/licenses/TEST-KEY/activate",
+        ))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(activation_response())
+                .append_header("Content-Type", "application/json"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&base_url));
+    let result = sdk.activate("TEST-KEY").await;
+
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_activate_preserves_api_base_url_prefix_with_trailing_slash() {
+    let server = MockServer::start().await;
+    let base_url = format!("{}/api/v1/", server.uri());
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v1/products/test-product/licenses/TEST-KEY/activate",
+        ))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(activation_response())
+                .append_header("Content-Type", "application/json"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&base_url));
+    let result = sdk.activate("TEST-KEY").await;
+
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_health_preserves_api_base_url_prefix() {
+    let server = MockServer::start().await;
+    let base_url = format!("{}/api/v1", server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/health"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "object": "health",
+                    "status": "healthy",
+                    "api_version": "v1",
+                    "timestamp": "2026-03-31T04:00:00Z"
+                }))
+                .append_header("Content-Type", "application/json"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&base_url));
+    let result = sdk.health().await;
+
+    assert!(matches!(result, Ok(true)));
 }
 
 #[tokio::test]

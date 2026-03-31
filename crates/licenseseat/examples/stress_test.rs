@@ -82,7 +82,6 @@ impl TestContext {
 enum ScenarioResult {
     Pass,
     Fail,
-    Skip,
 }
 
 impl ScenarioResult {
@@ -90,7 +89,6 @@ impl ScenarioResult {
         match self {
             ScenarioResult::Pass => "[PASS]",
             ScenarioResult::Fail => "[FAIL]",
-            ScenarioResult::Skip => "[SKIP]",
         }
     }
 }
@@ -123,7 +121,6 @@ impl TestRunner {
 
         let mut passed = 0;
         let mut failed = 0;
-        let mut skipped = 0;
         let mut total_time = Duration::ZERO;
 
         for (name, result, duration) in &self.results {
@@ -137,15 +134,11 @@ impl TestRunner {
             match result {
                 ScenarioResult::Pass => passed += 1,
                 ScenarioResult::Fail => failed += 1,
-                ScenarioResult::Skip => skipped += 1,
             }
         }
 
         println!("\n----------------------------------------");
-        println!(
-            "Total: {} passed, {} failed, {} skipped",
-            passed, failed, skipped
-        );
+        println!("Total: {} passed, {} failed", passed, failed);
         println!("Time:  {:.2}s", total_time.as_secs_f64());
         println!("========================================\n");
     }

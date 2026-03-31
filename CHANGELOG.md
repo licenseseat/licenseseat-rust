@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- High-level Tauri JS helpers for consolidated state snapshots, state subscriptions, stable event constants, and grouped entitlement checks
+- New plugin `get_state` command that exposes status, validation, entitlements, plan key, fingerprint, and online/offline flags in one response
+- Expanded generated permission coverage for the full Tauri command surface, including offline/manual workflow and release APIs
+
+### Changed
+- The JS bindings now ship a production-oriented integration path centered on `getState()` and `subscribeState()`
+- The npm package now builds during `prepare`/`prepack` and is validated in CI with explicit build and pack checks
+- Root and plugin README examples now use the higher-level state/event helpers instead of raw event strings and ad hoc status polling
+
+### Fixed
+- The Tauri plugin build script now matches the actual command surface instead of a stale subset
+- Generated JS `dist` artifacts, types, and examples are now checked in CI so source/package drift is caught before release
+
 ## [0.5.1] - 2026-03-31
 
 This release brings the Rust SDK and the Tauri plugin up to parity with the current C++ reference implementation, expands the public API for offline/manual workflows, and hardens the production defaults for mixed-SDK deployments.

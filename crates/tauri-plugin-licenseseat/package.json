@@ -17,8 +17,10 @@
     "guest-js"
   ],
   "scripts": {
-    "build": "tsc",
-    "prepublishOnly": "npm run build"
+    "build": "tsc -p tsconfig.json",
+    "pack:check": "npm pack --dry-run",
+    "prepare": "npm run build",
+    "prepack": "npm run build"
   },
   "keywords": [
     "tauri",

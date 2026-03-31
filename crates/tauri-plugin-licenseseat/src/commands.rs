@@ -2,13 +2,15 @@
 
 use crate::error::Result;
 use licenseseat::{
-    ActivationNested, ClientStatus, DownloadToken, EntitlementStatus, EventData, License,
-    LicenseStatus, MachineFile, MachineFilePayload, MachineFileVerificationResult,
-    OfflineEntitlement, OfflineTokenPayload, OfflineTokenResponse as CoreOfflineTokenResponse,
-    OfflineTokenSignature, Release, ReleaseList, RestoreResult, ValidationResult,
+    ActivationNested, ClientStatus, DownloadToken, EntitlementStatus, EventData, HealthResponse,
+    HeartbeatResponse, License, LicenseStatus, MachineFile, MachineFilePayload,
+    MachineFileVerificationResult, OfflineEntitlement, OfflineTokenPayload,
+    OfflineTokenResponse as CoreOfflineTokenResponse, OfflineTokenSignature, Release, ReleaseList,
+    RestoreResult, SigningKeyResponse, ValidationResult,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tauri::State;
 
 /// Activation options passed from the frontend.
@@ -604,6 +606,356 @@ impl From<RestoreResult> for RestoreResponse {
     }
 }
 
+/// Aggregated runtime state returned to the frontend.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateResponse {
+    pub status: StatusResponse,
+    pub client_status: String,
+    pub is_online: bool,
+    pub fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<LicenseResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ValidationResultResponse>,
+    pub entitlements: Vec<EntitlementRecordResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license_mode: Option<String>,
+    pub is_activated: bool,
+    pub is_valid: bool,
+    pub is_offline: bool,
+}
+
+fn map_state_response(sdk: &licenseseat::LicenseSeat) -> StateResponse {
+    let status = sdk.status();
+    let client_status = sdk.get_client_status();
+    let license = sdk.current_license();
+    let validation = license
+        .as_ref()
+        .and_then(|cached| cached.validation.clone());
+    let entitlements = validation
+        .as_ref()
+        .map(|result| {
+            result
+                .license
+                .active_entitlements
+                .clone()
+                .into_iter()
+                .map(Into::into)
+                .collect()
+        })
+        .unwrap_or_default();
+    let plan_key = validation
+        .as_ref()
+        .map(|result| result.license.plan_key.clone());
+    let license_mode = validation
+        .as_ref()
+        .map(|result| result.license.mode.clone());
+    let is_activated = license.is_some();
+    let is_valid = matches!(
+        client_status,
+        ClientStatus::Active | ClientStatus::OfflineValid
+    );
+    let is_offline = matches!(
+        client_status,
+        ClientStatus::OfflineValid | ClientStatus::OfflineInvalid
+    );
+
+    StateResponse {
+        status: status.into(),
+        client_status: client_status.to_string(),
+        is_online: sdk.is_online(),
+        fingerprint: sdk.fingerprint().to_string(),
+        license: license.map(Into::into),
+        validation: validation.map(Into::into),
+        entitlements,
+        plan_key,
+        license_mode,
+        is_activated,
+        is_valid,
+        is_offline,
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeartbeatResponseRecord {
+    pub object: String,
+    pub received_at: String,
+    pub license: ValidationLicenseResponse,
+}
+
+impl From<HeartbeatResponse> for HeartbeatResponseRecord {
+    fn from(response: HeartbeatResponse) -> Self {
+        Self {
+            object: response.object,
+            received_at: response.received_at.to_rfc3339(),
+            license: map_validation_license_response(response.license),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthResponseRecord {
+    pub object: String,
+    pub status: String,
+    pub api_version: String,
+    pub timestamp: String,
+}
+
+impl From<HealthResponse> for HealthResponseRecord {
+    fn from(response: HealthResponse) -> Self {
+        Self {
+            object: response.object,
+            status: response.status,
+            api_version: response.api_version,
+            timestamp: response.timestamp.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SigningKeyResponseRecord {
+    pub object: String,
+    pub key_id: String,
+    pub algorithm: String,
+    pub public_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    pub status: String,
+}
+
+impl From<SigningKeyResponse> for SigningKeyResponseRecord {
+    fn from(response: SigningKeyResponse) -> Self {
+        Self {
+            object: response.object,
+            key_id: response.key_id,
+            algorithm: response.algorithm,
+            public_key: response.public_key,
+            created_at: response.created_at.map(|value| value.to_rfc3339()),
+            status: response.status,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminConfigResponse {
+    pub api_base_url: String,
+    pub api_key: String,
+    pub product_slug: String,
+    pub storage_prefix: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_identifier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_key_id: Option<String>,
+    pub auto_validate_interval_seconds: u64,
+    pub heartbeat_interval_seconds: u64,
+    pub network_recheck_interval_seconds: u64,
+    pub request_timeout_seconds: u64,
+    pub verify_ssl: bool,
+    pub offline_fallback_mode: String,
+    pub offline_token_refresh_interval_seconds: u64,
+    pub enable_legacy_offline_tokens: bool,
+    pub max_offline_days: u32,
+    pub telemetry_enabled: bool,
+    pub debug: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_build: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminCachePathsResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offline_token_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_timestamp_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_key_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminRuntimeResponse {
+    pub is_auto_validating: bool,
+    pub is_heartbeat_running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_auto_validation_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_timestamp: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat: Option<HeartbeatResponseRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_health: Option<HealthResponseRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_health_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminSnapshotResponse {
+    pub captured_at: String,
+    pub config: AdminConfigResponse,
+    pub cache_paths: AdminCachePathsResponse,
+    pub state: StateResponse,
+    pub runtime: AdminRuntimeResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offline_token: Option<OfflineTokenResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_file: Option<MachineFileResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_file_verification: Option<MachineFileVerificationResultResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<SigningKeyResponseRecord>,
+}
+
+fn cache_dir_for_config(config: &licenseseat::Config) -> Option<PathBuf> {
+    config
+        .storage_path
+        .clone()
+        .or_else(|| dirs::cache_dir().map(|dir| dir.join("licenseseat")))
+}
+
+fn cache_path_for_key(config: &licenseseat::Config, key: &str) -> Option<String> {
+    cache_dir_for_config(config)
+        .map(|dir| dir.join(format!("{}{}.json", config.storage_prefix, key)))
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn build_admin_config_response(config: &licenseseat::Config) -> AdminConfigResponse {
+    let offline_fallback_mode = match config.offline_fallback_mode {
+        licenseseat::OfflineFallbackMode::Always => "always",
+        licenseseat::OfflineFallbackMode::NetworkOnly => "networkOnly",
+    };
+
+    AdminConfigResponse {
+        api_base_url: config.api_base_url.clone(),
+        api_key: config.api_key.clone(),
+        product_slug: config.product_slug.clone(),
+        storage_prefix: config.storage_prefix.clone(),
+        storage_path: config
+            .storage_path
+            .as_ref()
+            .map(|value| value.to_string_lossy().into_owned()),
+        device_identifier: config.device_identifier.clone(),
+        signing_public_key: config.signing_public_key.clone(),
+        signing_key_id: config.signing_key_id.clone(),
+        auto_validate_interval_seconds: config.auto_validate_interval.as_secs(),
+        heartbeat_interval_seconds: config.heartbeat_interval.as_secs(),
+        network_recheck_interval_seconds: config.network_recheck_interval.as_secs(),
+        request_timeout_seconds: config.request_timeout.as_secs(),
+        verify_ssl: config.verify_ssl,
+        offline_fallback_mode: offline_fallback_mode.into(),
+        offline_token_refresh_interval_seconds: config.offline_token_refresh_interval.as_secs(),
+        enable_legacy_offline_tokens: config.enable_legacy_offline_tokens,
+        max_offline_days: config.max_offline_days,
+        telemetry_enabled: config.telemetry_enabled,
+        debug: config.debug,
+        app_version: config.app_version.clone(),
+        app_build: config.app_build.clone(),
+    }
+}
+
+fn build_admin_cache_paths_response(
+    config: &licenseseat::Config,
+    signing_key_id: Option<&str>,
+) -> AdminCachePathsResponse {
+    AdminCachePathsResponse {
+        cache_dir: cache_dir_for_config(config).map(|value| value.to_string_lossy().into_owned()),
+        license_path: cache_path_for_key(config, "license"),
+        machine_file_path: cache_path_for_key(config, "machine_file"),
+        offline_token_path: cache_path_for_key(config, "offline_token"),
+        last_seen_timestamp_path: cache_path_for_key(config, "last_seen_ts"),
+        signing_key_path: signing_key_id.and_then(|value| {
+            if value.is_empty() {
+                None
+            } else {
+                cache_path_for_key(config, &format!("signing_key_{value}"))
+            }
+        }),
+    }
+}
+
+fn map_admin_snapshot_response(
+    sdk: &licenseseat::LicenseSeat,
+    config: &licenseseat::Config,
+) -> AdminSnapshotResponse {
+    let machine_file = sdk.current_machine_file();
+    let signing_key_id = sdk
+        .current_machine_file_key_id()
+        .or_else(|| config.signing_key_id.clone());
+    let machine_file_verification = machine_file.as_ref().map(|value| {
+        sdk.inspect_machine_file(value, None, None, None)
+            .map(Into::into)
+            .unwrap_or_else(|error| MachineFileVerificationResultResponse {
+                valid: false,
+                code: None,
+                message: Some(error.to_string()),
+                payload: None,
+            })
+    });
+    let signing_key_id = machine_file_verification
+        .as_ref()
+        .and_then(|value| value.payload.as_ref().map(|payload| payload.key_id.clone()))
+        .or_else(|| signing_key_id.clone())
+        .or_else(|| config.signing_key_id.clone());
+    let signing_key = signing_key_id
+        .as_deref()
+        .and_then(|value| {
+            if value.is_empty() {
+                None
+            } else {
+                sdk.cached_signing_key(value)
+            }
+        })
+        .map(Into::into);
+
+    AdminSnapshotResponse {
+        captured_at: chrono::Utc::now().to_rfc3339(),
+        config: build_admin_config_response(config),
+        cache_paths: build_admin_cache_paths_response(config, signing_key_id.as_deref()),
+        state: map_state_response(sdk),
+        runtime: AdminRuntimeResponse {
+            is_auto_validating: sdk.is_auto_validating(),
+            is_heartbeat_running: sdk.is_heartbeat_running(),
+            next_auto_validation_at: sdk
+                .next_auto_validation_at()
+                .map(|value| value.to_rfc3339()),
+            last_seen_timestamp: sdk.last_seen_timestamp(),
+            last_heartbeat: sdk.last_heartbeat_response().map(Into::into),
+            last_heartbeat_error: sdk.last_heartbeat_error(),
+            last_health: sdk.last_health_response().map(Into::into),
+            last_health_error: sdk.last_health_error(),
+        },
+        signing_key_id,
+        offline_token: sdk.current_offline_token().map(Into::into),
+        machine_file: machine_file.map(Into::into),
+        machine_file_verification,
+        signing_key,
+    }
+}
+
 /// Release-list options passed from the frontend.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -819,14 +1171,7 @@ pub fn get_status(sdk: State<'_, licenseseat::LicenseSeat>) -> StatusResponse {
 /// Get the stable client status string.
 #[tauri::command]
 pub fn get_client_status(sdk: State<'_, licenseseat::LicenseSeat>) -> String {
-    match sdk.get_client_status() {
-        ClientStatus::Active => "active".into(),
-        ClientStatus::OfflineValid => "offline_valid".into(),
-        ClientStatus::OfflineInvalid => "offline_invalid".into(),
-        ClientStatus::Inactive => "inactive".into(),
-        ClientStatus::Invalid => "invalid".into(),
-        ClientStatus::Pending => "pending".into(),
-    }
+    sdk.get_client_status().to_string()
 }
 
 /// Whether the SDK currently believes the API is reachable.
@@ -890,6 +1235,20 @@ pub fn has_entitlement(sdk: State<'_, licenseseat::LicenseSeat>, entitlement_key
 #[tauri::command]
 pub fn get_license(sdk: State<'_, licenseseat::LicenseSeat>) -> Option<LicenseResponse> {
     sdk.current_license().map(Into::into)
+}
+
+/// Get a consolidated view of the current plugin state.
+#[tauri::command]
+pub fn get_state(sdk: State<'_, licenseseat::LicenseSeat>) -> StateResponse {
+    map_state_response(&sdk)
+}
+
+#[tauri::command]
+pub fn get_admin_snapshot(
+    sdk: State<'_, licenseseat::LicenseSeat>,
+    config: State<'_, licenseseat::Config>,
+) -> AdminSnapshotResponse {
+    map_admin_snapshot_response(&sdk, &config)
 }
 
 /// Get the latest release for a product.
@@ -1010,6 +1369,13 @@ pub async fn fetch_signing_key(
     Ok(sdk.fetch_signing_key(&key_id).await?)
 }
 
+/// Refresh offline assets for the current license.
+#[tauri::command]
+pub async fn sync_offline_assets(sdk: State<'_, licenseseat::LicenseSeat>) -> Result<()> {
+    sdk.sync_offline_assets().await?;
+    Ok(())
+}
+
 /// Verify a machine file locally.
 #[tauri::command]
 pub fn verify_machine_file(
@@ -1055,14 +1421,85 @@ pub(crate) fn event_payload_to_json(data: Option<EventData>) -> serde_json::Valu
 
 #[cfg(test)]
 mod tests {
-    use super::{MachineFileResponse, OfflineTokenResponse, event_payload_to_json};
+    use super::{
+        MachineFileResponse, OfflineTokenResponse, event_payload_to_json,
+        map_admin_snapshot_response, map_state_response,
+    };
+    use chrono::Utc;
     use licenseseat::{
-        EventData, MachineFile, OfflineEntitlement, OfflineTokenPayload,
-        OfflineTokenResponse as CoreOfflineTokenResponse, OfflineTokenSignature, Product,
-        ValidationResult, ValidationWarning,
+        ActivationNested, Config, Entitlement, EventData, License, LicenseResponse, MachineFile,
+        OfflineEntitlement, OfflineTokenPayload, OfflineTokenResponse as CoreOfflineTokenResponse,
+        OfflineTokenSignature, Product, SigningKeyResponse, ValidationResult, ValidationWarning,
     };
     use serde_json::json;
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn unique_storage_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        ))
+    }
+
+    fn write_cache_value<T: serde::Serialize>(
+        storage_path: &Path,
+        prefix: &str,
+        key: &str,
+        value: &T,
+    ) {
+        fs::create_dir_all(storage_path).expect("storage path should be created");
+        let json = serde_json::to_string_pretty(value).expect("cache value should serialize");
+        let path = storage_path.join(format!("{prefix}{key}.json"));
+        fs::write(path, json).expect("cache file should be written");
+    }
+
+    fn sample_validation_result() -> ValidationResult {
+        ValidationResult {
+            object: "validation_result".into(),
+            valid: true,
+            code: None,
+            message: None,
+            warnings: None,
+            license: LicenseResponse {
+                object: "license".into(),
+                key: "TEST-KEY".into(),
+                status: "active".into(),
+                starts_at: None,
+                expires_at: None,
+                mode: "hardware_locked".into(),
+                plan_key: "pro".into(),
+                seat_limit: Some(1),
+                active_seats: 1,
+                active_entitlements: vec![Entitlement {
+                    key: "pro".into(),
+                    expires_at: None,
+                    metadata: None,
+                }],
+                metadata: None,
+                product: Product {
+                    slug: "demo".into(),
+                    name: "Demo".into(),
+                },
+            },
+            activation: Some(ActivationNested {
+                object: "activation".into(),
+                id: "act_123".into(),
+                device_id: "device-123".into(),
+                device_name: Some("Demo Device".into()),
+                license_key: "TEST-KEY".into(),
+                activated_at: Utc::now(),
+                deactivated_at: None,
+                ip_address: None,
+                metadata: None,
+            }),
+            offline: false,
+        }
+    }
 
     #[test]
     fn test_offline_token_round_trip_preserves_shape() {
@@ -1155,5 +1592,197 @@ mod tests {
         assert_eq!(payload["valid"], json!(false));
         assert_eq!(payload["license"]["planKey"], json!("pro"));
         assert_eq!(payload["message"], json!("License is invalid"));
+    }
+
+    #[test]
+    fn test_state_response_for_fresh_sdk_is_inactive() {
+        let storage_path = unique_storage_path("licenseseat-plugin-state-test");
+        let sdk = licenseseat::LicenseSeat::new(
+            Config::new("pk_test_123", "demo-product")
+                .with_storage_path(storage_path)
+                .with_debug(false),
+        );
+
+        let state = map_state_response(&sdk);
+
+        assert_eq!(state.client_status, "inactive");
+        assert_eq!(state.status.status, "inactive");
+        assert!(!state.is_activated);
+        assert!(!state.is_valid);
+        assert!(!state.is_offline);
+        assert!(state.license.is_none());
+        assert!(state.validation.is_none());
+        assert!(state.entitlements.is_empty());
+        assert!(state.plan_key.is_none());
+        assert!(state.license_mode.is_none());
+        assert!(!state.fingerprint.is_empty());
+    }
+
+    #[test]
+    fn test_state_response_for_cached_license_exposes_entitlements() {
+        let storage_path = unique_storage_path("licenseseat-plugin-state-populated-test");
+        let config = Config::new("pk_test_123", "demo-product")
+            .with_storage_path(storage_path.clone())
+            .with_debug(false);
+        let license = License {
+            license_key: "TEST-KEY".into(),
+            device_id: "device-123".into(),
+            activation_id: "act_123".into(),
+            activated_at: Utc::now(),
+            last_validated: Utc::now(),
+            validation: Some(sample_validation_result()),
+        };
+        write_cache_value(&storage_path, &config.storage_prefix, "license", &license);
+
+        let sdk = licenseseat::LicenseSeat::new(config);
+        let state = map_state_response(&sdk);
+
+        assert_eq!(state.client_status, "active");
+        assert!(state.is_activated);
+        assert!(state.is_valid);
+        assert_eq!(state.plan_key.as_deref(), Some("pro"));
+        assert_eq!(state.license_mode.as_deref(), Some("hardware_locked"));
+        assert_eq!(state.entitlements.len(), 1);
+        assert_eq!(state.entitlements[0].key, "pro");
+        assert_eq!(
+            state.license.as_ref().map(|value| value.device_id.as_str()),
+            Some("device-123")
+        );
+    }
+
+    #[test]
+    fn test_admin_snapshot_for_fresh_sdk_exposes_config_and_runtime() {
+        let storage_path = unique_storage_path("licenseseat-plugin-admin-test");
+        let config = Config::new("pk_test_123", "demo-product")
+            .with_storage_path(storage_path.clone())
+            .with_debug(true);
+        let sdk = licenseseat::LicenseSeat::new(config.clone());
+
+        let snapshot = map_admin_snapshot_response(&sdk, &config);
+
+        assert_eq!(snapshot.config.api_key, "pk_test_123");
+        assert_eq!(snapshot.config.product_slug, "demo-product");
+        assert_eq!(
+            snapshot.cache_paths.cache_dir,
+            Some(storage_path.to_string_lossy().into_owned())
+        );
+        assert_eq!(snapshot.state.client_status, "inactive");
+        assert!(!snapshot.runtime.is_auto_validating);
+        assert!(!snapshot.runtime.is_heartbeat_running);
+        assert!(snapshot.offline_token.is_none());
+        assert!(snapshot.machine_file.is_none());
+        assert!(snapshot.machine_file_verification.is_none());
+        assert!(snapshot.signing_key.is_none());
+    }
+
+    #[test]
+    fn test_admin_snapshot_reports_cached_offline_artifacts() {
+        let storage_path = unique_storage_path("licenseseat-plugin-admin-populated-test");
+        let mut config = Config::new("pk_test_123", "demo-product")
+            .with_storage_path(storage_path.clone())
+            .with_debug(true);
+        config.signing_key_id = Some("kid_123".into());
+
+        let license = License {
+            license_key: "TEST-KEY".into(),
+            device_id: "device-123".into(),
+            activation_id: "act_123".into(),
+            activated_at: Utc::now(),
+            last_validated: Utc::now(),
+            validation: Some(sample_validation_result()),
+        };
+        let offline_token = CoreOfflineTokenResponse {
+            object: "offline_token".into(),
+            token: OfflineTokenPayload {
+                schema_version: 1,
+                license_key: "TEST-KEY".into(),
+                product_slug: "demo-product".into(),
+                plan_key: "pro".into(),
+                mode: "hardware_locked".into(),
+                seat_limit: Some(1),
+                device_id: Some("device-123".into()),
+                iat: 1_700_000_000,
+                exp: 1_700_086_400,
+                nbf: 1_700_000_000,
+                license_expires_at: None,
+                kid: "kid_123".into(),
+                entitlements: vec![OfflineEntitlement {
+                    key: "pro".into(),
+                    expires_at: None,
+                }],
+                metadata: None,
+            },
+            signature: OfflineTokenSignature {
+                algorithm: "Ed25519".into(),
+                key_id: "kid_123".into(),
+                value: "signature".into(),
+            },
+            canonical: "{\"license_key\":\"TEST-KEY\"}".into(),
+        };
+        let machine_file = MachineFile {
+            certificate: "-----BEGIN MACHINE FILE-----\ninvalid\n-----END MACHINE FILE-----".into(),
+            algorithm: "aes-256-gcm+ed25519".into(),
+            ttl: 2_592_000,
+            issued_at: None,
+            expires_at: None,
+            license_key: "TEST-KEY".into(),
+            fingerprint: "device-123".into(),
+        };
+        let signing_key = SigningKeyResponse {
+            object: "signing_key".into(),
+            key_id: "kid_123".into(),
+            algorithm: "Ed25519".into(),
+            public_key: "public-key".into(),
+            created_at: None,
+            status: "active".into(),
+        };
+
+        write_cache_value(&storage_path, &config.storage_prefix, "license", &license);
+        write_cache_value(
+            &storage_path,
+            &config.storage_prefix,
+            "offline_token",
+            &offline_token,
+        );
+        write_cache_value(
+            &storage_path,
+            &config.storage_prefix,
+            "machine_file",
+            &machine_file,
+        );
+        write_cache_value(
+            &storage_path,
+            &config.storage_prefix,
+            "signing_key_kid_123",
+            &signing_key,
+        );
+
+        let sdk = licenseseat::LicenseSeat::new(config.clone());
+        let snapshot = map_admin_snapshot_response(&sdk, &config);
+
+        assert_eq!(
+            snapshot
+                .offline_token
+                .as_ref()
+                .map(|value| value.token.license_key.as_str()),
+            Some("TEST-KEY")
+        );
+        assert_eq!(
+            snapshot
+                .machine_file
+                .as_ref()
+                .map(|value| value.license_key.as_str()),
+            Some("TEST-KEY")
+        );
+        assert!(snapshot.machine_file_verification.is_some());
+        assert_eq!(snapshot.signing_key_id.as_deref(), Some("kid_123"));
+        assert_eq!(
+            snapshot
+                .signing_key
+                .as_ref()
+                .map(|value| value.key_id.as_str()),
+            Some("kid_123")
+        );
+        assert!(snapshot.cache_paths.signing_key_path.is_some());
     }
 }

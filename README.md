@@ -37,6 +37,7 @@ Official Rust SDK and Tauri plugin for [LicenseSeat](https://licenseseat.com) �
 - **Device Telemetry** — Auto-collected device metadata (OS, platform, app version)
 - **Network Resilience** — Automatic retry with exponential backoff
 - **Tauri Integration** — First-class Tauri v2 plugin with TypeScript bindings
+- **High-level State Helpers** — Consolidated state snapshots and subscription helpers for app UIs
 - **Secure by Default** — TLS with rustls, no unsafe code
 
 ## Packages
@@ -103,16 +104,25 @@ Use your `pk_*` publishable API key here. Do not embed `sk_*` secret keys in cli
 **5. Use in your frontend:**
 
 ```typescript
-import { activate, hasEntitlement, deactivate } from '@licenseseat/tauri-plugin';
+import {
+  activate,
+  deactivate,
+  getState,
+  subscribeState,
+} from '@licenseseat/tauri-plugin';
 
 // Activate a license
 const license = await activate('USER-LICENSE-KEY');
 console.log(`Fingerprint: ${license.deviceId}`);
 
-// Check entitlements
-if (await hasEntitlement('pro-features')) {
-  enableProFeatures();
-}
+// Read the current state
+const state = await getState();
+console.log(state.clientStatus, state.planKey);
+
+// Keep UI state in sync
+const unlisten = await subscribeState(({ state }) => {
+  console.log('Updated status:', state.clientStatus);
+});
 
 // Deactivate when uninstalling
 await deactivate();

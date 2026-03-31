@@ -12,11 +12,11 @@ use chrono::Utc;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 #[cfg(feature = "offline")]
 use crate::device::collect_fingerprint_components;
@@ -68,6 +68,11 @@ struct LicenseSeatInner {
     auto_validation_generation: AtomicU64,
     heartbeat_running: AtomicBool,
     heartbeat_generation: AtomicU64,
+    last_heartbeat: Mutex<Option<HeartbeatResponse>>,
+    last_heartbeat_error: Mutex<Option<String>>,
+    last_health: Mutex<Option<HealthResponse>>,
+    last_health_error: Mutex<Option<String>>,
+    next_auto_validation_at: Mutex<Option<chrono::DateTime<Utc>>>,
 }
 
 impl LicenseSeat {
@@ -96,6 +101,11 @@ impl LicenseSeat {
             auto_validation_generation: AtomicU64::new(0),
             heartbeat_running: AtomicBool::new(false),
             heartbeat_generation: AtomicU64::new(0),
+            last_heartbeat: Mutex::new(None),
+            last_heartbeat_error: Mutex::new(None),
+            last_health: Mutex::new(None),
+            last_health_error: Mutex::new(None),
+            next_auto_validation_at: Mutex::new(None),
         });
 
         let sdk = Self { inner };
@@ -149,6 +159,7 @@ impl LicenseSeat {
         )
         .map(ToString::to_string)
         .unwrap_or_else(|| self.inner.fingerprint.clone());
+        debug!("Starting activation request");
 
         self.emit(Event::new(EventKind::ActivationStart));
 
@@ -162,10 +173,7 @@ impl LicenseSeat {
             body["metadata"] = serde_json::json!(metadata);
         }
 
-        let path = format!(
-            "/products/{}/licenses/{}/activate",
-            product_slug, license_key
-        );
+        let path = build_license_action_path(product_slug, license_key, "activate");
 
         match self.post::<ActivationResponse>(&path, Some(body)).await {
             Ok(activation) => {
@@ -198,7 +206,7 @@ impl LicenseSeat {
                     });
                 }
 
-                info!("License activated: {}", license_key);
+                debug!("License activated successfully");
                 Ok(license)
             }
             Err(e) => {
@@ -233,10 +241,7 @@ impl LicenseSeat {
 
         self.emit(Event::new(EventKind::ValidationStart));
 
-        let path = format!(
-            "/products/{}/licenses/{}/validate",
-            product_slug, license_key
-        );
+        let path = build_license_action_path(product_slug, license_key, "validate");
         let body = Some(fingerprint_alias_payload(&device_id, false));
 
         match self.post::<ValidationResult>(&path, body).await {
@@ -265,7 +270,7 @@ impl LicenseSeat {
                         EventKind::ValidationSuccess,
                         result.clone(),
                     ));
-                    info!("License validated successfully");
+                    debug!("License validated successfully");
                 } else {
                     self.emit(Event::with_validation(
                         EventKind::ValidationFailed,
@@ -348,10 +353,7 @@ impl LicenseSeat {
 
         self.emit(Event::new(EventKind::DeactivationStart));
 
-        let path = format!(
-            "/products/{}/licenses/{}/deactivate",
-            product_slug, license_key
-        );
+        let path = build_license_action_path(product_slug, license_key, "deactivate");
         let body = fingerprint_alias_payload(&resolved_fingerprint, true);
 
         match self.post::<DeactivationResponse>(&path, Some(body)).await {
@@ -360,7 +362,7 @@ impl LicenseSeat {
                     self.inner.cache.clear();
                 }
                 self.emit(Event::new(EventKind::DeactivationSuccess));
-                info!("License deactivated");
+                debug!("License deactivated");
                 Ok(())
             }
             Err(e) => {
@@ -427,20 +429,20 @@ impl LicenseSeat {
         }
         let resolved_fingerprint = self.resolve_request_fingerprint(fingerprint);
 
-        let path = format!(
-            "/products/{}/licenses/{}/heartbeat",
-            product_slug, license_key
-        );
+        let path = build_license_action_path(product_slug, license_key, "heartbeat");
         let body = fingerprint_alias_payload(&resolved_fingerprint, true);
 
         match self.post::<HeartbeatResponse>(&path, Some(body)).await {
             Ok(response) => {
                 self.set_online(true);
+                self.set_last_heartbeat(Some(response.clone()));
+                self.set_last_heartbeat_error(None);
                 self.emit(Event::new(EventKind::HeartbeatSuccess));
                 debug!("Heartbeat sent successfully");
                 Ok(response)
             }
             Err(e) => {
+                self.set_last_heartbeat_error(Some(e.to_string()));
                 if e.is_network_error() {
                     self.set_online(false);
                     self.start_support_tasks();
@@ -592,6 +594,66 @@ impl LicenseSeat {
         self.inner.cache.get_license()
     }
 
+    /// Get the cached offline token, if one has been stored.
+    pub fn current_offline_token(&self) -> Option<OfflineTokenResponse> {
+        self.inner.cache.get_offline_token()
+    }
+
+    /// Get the cached machine file, if one has been stored.
+    pub fn current_machine_file(&self) -> Option<MachineFile> {
+        self.inner.cache.get_machine_file()
+    }
+
+    /// Get the signing-key id embedded in the cached machine-file certificate, if present.
+    #[cfg(feature = "offline")]
+    pub fn current_machine_file_key_id(&self) -> Option<String> {
+        self.current_machine_file()
+            .as_ref()
+            .and_then(|machine_file| self.machine_file_key_id(machine_file))
+    }
+
+    /// Extract the signing-key id embedded in a machine-file certificate.
+    #[cfg(feature = "offline")]
+    pub fn machine_file_key_id(&self, machine_file: &MachineFile) -> Option<String> {
+        extract_machine_file_key_id(&machine_file.certificate)
+            .or_else(|| self.inner.config.signing_key_id.clone())
+    }
+
+    /// Get a cached signing key by key id.
+    pub fn cached_signing_key(&self, key_id: &str) -> Option<SigningKeyResponse> {
+        self.inner.cache.get_signing_key(key_id)
+    }
+
+    /// Get the last seen timestamp recorded for clock-tampering protection.
+    pub fn last_seen_timestamp(&self) -> Option<i64> {
+        self.inner.cache.get_last_seen_timestamp()
+    }
+
+    /// Get the most recent successful heartbeat response observed in this process.
+    pub fn last_heartbeat_response(&self) -> Option<HeartbeatResponse> {
+        self.lock_snapshot(&self.inner.last_heartbeat)
+    }
+
+    /// Get the most recent heartbeat error observed in this process.
+    pub fn last_heartbeat_error(&self) -> Option<String> {
+        self.lock_snapshot(&self.inner.last_heartbeat_error)
+    }
+
+    /// Get the most recent successful health response observed in this process.
+    pub fn last_health_response(&self) -> Option<HealthResponse> {
+        self.lock_snapshot(&self.inner.last_health)
+    }
+
+    /// Get the most recent health-check error observed in this process.
+    pub fn last_health_error(&self) -> Option<String> {
+        self.lock_snapshot(&self.inner.last_health_error)
+    }
+
+    /// Get the next scheduled auto-validation time observed in this process.
+    pub fn next_auto_validation_at(&self) -> Option<chrono::DateTime<Utc>> {
+        self.lock_snapshot(&self.inner.next_auto_validation_at)
+    }
+
     /// Restore the cached session.
     pub async fn restore_license(&self) -> RestoreResult {
         let Some(license) = self.inner.cache.get_license() else {
@@ -674,12 +736,15 @@ impl LicenseSeat {
 
     /// Check API health.
     pub async fn health_check(&self) -> Result<HealthResponse> {
-        match self.get("/health").await {
+        match self.get::<HealthResponse>("/health").await {
             Ok(response) => {
                 self.set_online(true);
+                self.set_last_health(Some(response.clone()));
+                self.set_last_health_error(None);
                 Ok(response)
             }
             Err(error) => {
+                self.set_last_health_error(Some(error.to_string()));
                 if error.is_network_error() {
                     self.set_online(false);
                     self.start_support_tasks();
@@ -709,7 +774,7 @@ impl LicenseSeat {
         }
 
         let path = build_release_path(
-            &format!("/products/{}/releases/latest", product_slug),
+            &build_path(&["products", product_slug, "releases", "latest"]),
             &ReleaseListOptions {
                 channel: channel.map(ToString::to_string),
                 platform: platform.map(ToString::to_string),
@@ -751,7 +816,10 @@ impl LicenseSeat {
             return Err(Error::Configuration("product_slug is required".into()));
         }
 
-        let path = build_release_path(&format!("/products/{}/releases", product_slug), &options);
+        let path = build_release_path(
+            &build_path(&["products", product_slug, "releases"]),
+            &options,
+        );
         let body: serde_json::Value = self.get(&path).await?;
         parse_release_list(&body)
     }
@@ -778,10 +846,13 @@ impl LicenseSeat {
             return Err(Error::Configuration("product_slug is required".into()));
         }
 
-        let path = format!(
-            "/products/{}/releases/{}/download_token",
-            product_slug, version
-        );
+        let path = build_path(&[
+            "products",
+            product_slug,
+            "releases",
+            version,
+            "download_token",
+        ]);
         let body = build_download_token_request(license_key, platform);
         self.post(&path, Some(body)).await
     }
@@ -792,7 +863,7 @@ impl LicenseSeat {
         self.stop_background_tasks();
         self.inner.cache.clear();
         self.emit(Event::new(EventKind::SdkReset));
-        info!("SDK state reset");
+        debug!("SDK state reset");
     }
 
     /// Subscribe to SDK events.
@@ -924,6 +995,7 @@ impl LicenseSeat {
             .fetch_add(1, Ordering::SeqCst);
 
         if was_running {
+            self.set_next_auto_validation_at(None);
             self.emit(Event::new(EventKind::AutoValidationStopped));
         }
     }
@@ -1042,7 +1114,7 @@ impl LicenseSeat {
             .fetch_add(1, Ordering::SeqCst)
             + 1;
 
-        info!("Starting support background tasks");
+        debug!("Starting support background tasks");
         let sdk = self.clone();
 
         std::thread::Builder::new()
@@ -1092,13 +1164,13 @@ impl LicenseSeat {
                     }
                 });
 
-                info!("Background tasks thread exiting");
+                debug!("Background tasks thread exiting");
             })
             .expect("Failed to spawn background thread");
     }
 
     fn stop_support_tasks(&self) {
-        info!("Stopping support background tasks");
+        debug!("Stopping support background tasks");
         self.inner
             .background_tasks_running
             .store(false, Ordering::SeqCst);
@@ -1192,10 +1264,7 @@ impl LicenseSeat {
 
         self.emit(Event::new(EventKind::OfflineTokenFetching));
 
-        let path = format!(
-            "/products/{}/licenses/{}/offline_token",
-            product_slug, license_key
-        );
+        let path = build_license_action_path(product_slug, license_key, "offline_token");
         let body = build_offline_token_request(&fingerprint, ttl_days);
         match self.post::<OfflineTokenResponse>(&path, Some(body)).await {
             Ok(token) => {
@@ -1264,10 +1333,7 @@ impl LicenseSeat {
             } else {
                 fingerprint_components
             };
-        let path = format!(
-            "/products/{}/licenses/{}/machine-file",
-            product_slug, license_key
-        );
+        let path = build_license_action_path(product_slug, license_key, "machine-file");
         let body = build_machine_file_request(
             &fingerprint,
             ttl_days,
@@ -1386,12 +1452,13 @@ impl LicenseSeat {
 
     /// Verify a machine file locally.
     #[cfg(feature = "offline")]
-    pub fn verify_machine_file(
+    fn verify_machine_file_inner(
         &self,
         machine_file: &MachineFile,
         public_key_b64: Option<&str>,
         license_key: Option<&str>,
         fingerprint: Option<&str>,
+        emit_events: bool,
     ) -> Result<MachineFileVerificationResult> {
         let resolved_license_key = license_key
             .filter(|value| !value.is_empty())
@@ -1425,7 +1492,9 @@ impl LicenseSeat {
             &public_key,
         ) {
             Ok(payload) => {
-                self.emit(Event::new(EventKind::MachineFileVerified));
+                if emit_events {
+                    self.emit(Event::new(EventKind::MachineFileVerified));
+                }
                 Ok(MachineFileVerificationResult {
                     valid: true,
                     code: None,
@@ -1435,10 +1504,12 @@ impl LicenseSeat {
             }
             Err(error) => {
                 let code = error_code_string_from_error(&error);
-                self.emit(Event::with_error(
-                    EventKind::MachineFileVerificationFailed,
-                    error.to_string(),
-                ));
+                if emit_events {
+                    self.emit(Event::with_error(
+                        EventKind::MachineFileVerificationFailed,
+                        error.to_string(),
+                    ));
+                }
                 Ok(MachineFileVerificationResult {
                     valid: false,
                     code: Some(code),
@@ -1447,6 +1518,34 @@ impl LicenseSeat {
                 })
             }
         }
+    }
+
+    /// Verify a machine file locally and emit the standard SDK verification events.
+    pub fn verify_machine_file(
+        &self,
+        machine_file: &MachineFile,
+        public_key_b64: Option<&str>,
+        license_key: Option<&str>,
+        fingerprint: Option<&str>,
+    ) -> Result<MachineFileVerificationResult> {
+        self.verify_machine_file_inner(machine_file, public_key_b64, license_key, fingerprint, true)
+    }
+
+    /// Verify a machine file locally without emitting SDK events.
+    pub fn inspect_machine_file(
+        &self,
+        machine_file: &MachineFile,
+        public_key_b64: Option<&str>,
+        license_key: Option<&str>,
+        fingerprint: Option<&str>,
+    ) -> Result<MachineFileVerificationResult> {
+        self.verify_machine_file_inner(
+            machine_file,
+            public_key_b64,
+            license_key,
+            fingerprint,
+            false,
+        )
     }
 
     /// Sync offline assets (machine files first, legacy tokens only if enabled).
@@ -1458,7 +1557,7 @@ impl LicenseSeat {
             .get_license()
             .ok_or(Error::NoActiveLicense)?;
 
-        info!("Syncing offline assets");
+        debug!("Syncing offline assets");
 
         let machine_file_result = self
             .checkout_machine_file(&license.license_key, Some(&license.device_id), Some(30))
@@ -1523,7 +1622,7 @@ impl LicenseSeat {
 
     #[cfg(feature = "offline")]
     async fn validate_offline(&self) -> Result<ValidationResult> {
-        info!("Attempting offline validation");
+        debug!("Attempting offline validation");
         self.emit(Event::new(EventKind::OfflineValidationStart));
         let mut last_invalid: Option<ValidationResult> = None;
 
@@ -1699,12 +1798,49 @@ impl LicenseSeat {
 
     fn emit_auto_validation_cycle(&self, interval: Duration) {
         if let Ok(delta) = chrono::Duration::from_std(interval) {
+            let next_run_at = Utc::now() + delta;
+            self.set_next_auto_validation_at(Some(next_run_at));
             self.emit(Event::with_next_run_at(
                 EventKind::AutoValidationCycle,
-                Utc::now() + delta,
+                next_run_at,
             ));
         } else {
+            self.set_next_auto_validation_at(None);
             self.emit(Event::new(EventKind::AutoValidationCycle));
+        }
+    }
+
+    fn lock_snapshot<T: Clone>(&self, mutex: &Mutex<Option<T>>) -> Option<T> {
+        mutex.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    fn set_last_heartbeat(&self, response: Option<HeartbeatResponse>) {
+        if let Ok(mut guard) = self.inner.last_heartbeat.lock() {
+            *guard = response;
+        }
+    }
+
+    fn set_last_heartbeat_error(&self, error: Option<String>) {
+        if let Ok(mut guard) = self.inner.last_heartbeat_error.lock() {
+            *guard = error;
+        }
+    }
+
+    fn set_last_health(&self, response: Option<HealthResponse>) {
+        if let Ok(mut guard) = self.inner.last_health.lock() {
+            *guard = response;
+        }
+    }
+
+    fn set_last_health_error(&self, error: Option<String>) {
+        if let Ok(mut guard) = self.inner.last_health_error.lock() {
+            *guard = error;
+        }
+    }
+
+    fn set_next_auto_validation_at(&self, next_auto_validation_at: Option<chrono::DateTime<Utc>>) {
+        if let Ok(mut guard) = self.inner.next_auto_validation_at.lock() {
+            *guard = next_auto_validation_at;
         }
     }
 
@@ -1726,7 +1862,7 @@ impl LicenseSeat {
         path: &str,
         body: Option<B>,
     ) -> Result<T> {
-        let url = format!("{}{}", self.inner.config.api_base_url, path);
+        let url = build_request_url(&self.inner.config.api_base_url, path)?;
 
         // Prepare body once (with telemetry if enabled)
         let json_body: Option<serde_json::Value> = if let Some(b) = body {
@@ -1758,7 +1894,8 @@ impl LicenseSeat {
             }
 
             // Build fresh request for each attempt
-            let mut request = self.inner.http.request(method.clone(), &url);
+            debug!("Building request for {path} (attempt {attempt})");
+            let mut request = self.inner.http.request(method.clone(), url.clone());
             if let Some(ref body) = json_body {
                 request = request.json(body);
             }
@@ -1766,14 +1903,14 @@ impl LicenseSeat {
             match request.send().await {
                 Ok(response) => {
                     let status = response.status().as_u16();
+                    debug!("Received response for {path} with status {status}");
 
                     if response.status().is_success() {
                         return response.json().await.map_err(Error::from);
                     }
 
-                    // Parse error response
-                    let error_body: serde_json::Value = response.json().await.unwrap_or_default();
-                    let (code, message, details) = parse_error_response(&error_body);
+                    let error_body = response.text().await.unwrap_or_default();
+                    let (code, message, details) = parse_error_response_text(&error_body);
 
                     let error = Error::api(status, code, message, details);
 
@@ -1785,7 +1922,11 @@ impl LicenseSeat {
                     last_error = Some(error);
                 }
                 Err(e) => {
-                    last_error = Some(Error::Network(e));
+                    let error = Error::Network(e);
+                    if matches!(&error, Error::Network(source) if source.is_builder()) {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
                 }
             }
         }
@@ -1894,6 +2035,25 @@ fn build_http_client(config: &Config) -> reqwest::Client {
         .expect("Failed to build HTTP client")
 }
 
+fn parse_error_response_text(
+    body: &str,
+) -> (
+    Option<String>,
+    String,
+    Option<HashMap<String, serde_json::Value>>,
+) {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return (None, "Unknown error".into(), None);
+    }
+
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return parse_error_response(&json);
+    }
+
+    (None, trimmed.to_string(), None)
+}
+
 fn parse_error_response(
     body: &serde_json::Value,
 ) -> (
@@ -1996,6 +2156,34 @@ fn build_download_token_request(license_key: &str, platform: Option<&str>) -> se
         body["platform"] = serde_json::json!(platform);
     }
     body
+}
+
+fn build_request_url(base_url: &str, path: &str) -> Result<url::Url> {
+    let normalized_base = base_url.trim_end_matches('/');
+    let normalized_path = path.trim_start_matches('/');
+    let combined = if normalized_path.is_empty() {
+        normalized_base.to_string()
+    } else {
+        format!("{normalized_base}/{normalized_path}")
+    };
+
+    url::Url::parse(&combined).map_err(Error::from)
+}
+
+fn build_license_action_path(product_slug: &str, license_key: &str, action: &str) -> String {
+    build_path(&["products", product_slug, "licenses", license_key, action])
+}
+
+fn build_path(segments: &[&str]) -> String {
+    let mut url = url::Url::parse("https://licenseseat.invalid").unwrap();
+    {
+        let mut path_segments = url.path_segments_mut().unwrap();
+        path_segments.clear();
+        for segment in segments {
+            path_segments.push(segment);
+        }
+    }
+    url.path().to_string()
 }
 
 fn build_release_path(base_path: &str, options: &ReleaseListOptions) -> String {
