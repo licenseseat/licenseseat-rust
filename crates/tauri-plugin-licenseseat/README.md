@@ -33,16 +33,17 @@ Official Tauri v2 plugin for [LicenseSeat](https://licenseseat.com) — simple, 
 
 - **Full License Lifecycle** — Activate, validate, deactivate from your frontend
 - **TypeScript Bindings** — Fully typed API with autocomplete
+- **High-level State Helpers** — Get a consolidated state snapshot and subscribe to state changes
 - **Entitlement Checking** — Feature gating made simple
 - **Event System** — React to license changes in real-time
-- **Offline Support** — Ed25519 cryptographic validation (optional)
-- **Zero Config** — Just add your API key and product slug
+- **Offline Support** — Machine-file-first Ed25519 + AES-256-GCM offline validation
+- **Zero Config** — Just add your publishable API key and product slug
 - **Tauri v2** — Built for the latest Tauri architecture
 
 ## Requirements
 
 - Tauri v2.0.0 or later
-- Rust 1.70+
+- Rust 1.85+
 - Node.js 18+ (for the JS bindings)
 
 ## Installation
@@ -86,12 +87,14 @@ fn main() {
 
 ### 2. Add Configuration
 
+Use your `pk_*` publishable API key in Tauri apps. Do not embed `sk_*` secret keys here.
+
 ```json
 // tauri.conf.json
 {
   "plugins": {
     "licenseseat": {
-      "apiKey": "your-api-key",
+      "apiKey": "pk_live_xxx",
       "productSlug": "your-product"
     }
   }
@@ -121,19 +124,20 @@ The `licenseseat:default` permission grants access to all licensing commands. Fo
 ```typescript
 import {
   activate,
-  validate,
   deactivate,
-  getStatus,
-  hasEntitlement,
-  checkEntitlement,
-  heartbeat
+  getState,
+  restoreAndGetState,
+  subscribeState,
+  hasAnyEntitlement,
+  LICENSESEAT_EVENTS,
+  listenEvent,
 } from '@licenseseat/tauri-plugin';
 
 // Activate a license (first launch or new key)
 async function activateLicense(key: string) {
   try {
     const license = await activate(key);
-    console.log(`Activated! Device ID: ${license.deviceId}`);
+    console.log(`Activated! Fingerprint: ${license.deviceId}`);
     return license;
   } catch (error) {
     console.error('Activation failed:', error);
@@ -141,46 +145,40 @@ async function activateLicense(key: string) {
   }
 }
 
-// Validate the current license (subsequent launches)
-async function validateLicense() {
-  const result = await validate();
+// Restore and read the current state (app startup)
+async function bootstrapLicense() {
+  const state = await restoreAndGetState();
 
-  if (result.valid) {
-    console.log('License is valid!');
-    console.log('Plan:', result.license.planKey);
-    return true;
-  } else {
-    console.log('Invalid:', result.code, result.message);
-    return false;
-  }
+  console.log('Client status:', state.clientStatus);
+  console.log('Online:', state.isOnline);
+  console.log('Fingerprint:', state.fingerprint);
+  console.log('Plan:', state.planKey);
+
+  return state;
 }
 
 // Check entitlements for feature gating
 async function checkFeatures() {
-  if (await hasEntitlement('pro-features')) {
+  if (await hasAnyEntitlement(['pro-features', 'cloud-sync'])) {
     enableProFeatures();
-  }
-
-  if (await hasEntitlement('cloud-sync')) {
-    enableCloudSync();
   }
 }
 
-// Get current license status
-async function showStatus() {
-  const status = await getStatus();
+// Subscribe to future state changes
+const unlisten = await subscribeState(({ state, eventName }) => {
+  console.log('State changed via:', eventName);
+  console.log('New client status:', state.clientStatus);
+}, { emitCurrent: true });
 
-  switch (status.status) {
-    case 'active':
-      showActiveBadge();
-      break;
-    case 'expired':
-      showRenewalPrompt();
-      break;
-    case 'not_activated':
-      showActivationPrompt();
-      break;
-  }
+// Listen to a specific raw event when you need it
+await listenEvent(LICENSESEAT_EVENTS.LICENSE_REVOKED, () => {
+  showRenewalPrompt();
+});
+
+// Or fetch a one-off snapshot
+async function showStatus() {
+  const state = await getState();
+  console.log(state.status.status);
 }
 
 // Deactivate (release the seat)
@@ -195,13 +193,12 @@ async function deactivateLicense() {
 Access the SDK directly from Rust for advanced use cases:
 
 ```rust
-use tauri::Manager;
-use tauri_plugin_licenseseat::LicenseSeatExt;
+use tauri::State;
 
 #[tauri::command]
-async fn custom_validation(app: tauri::AppHandle) -> Result<bool, String> {
-    let sdk = app.licenseseat();
-
+async fn custom_validation(
+    sdk: State<'_, licenseseat::LicenseSeat>,
+) -> Result<bool, String> {
     match sdk.validate().await {
         Ok(result) => Ok(result.valid),
         Err(e) => Err(e.to_string()),
@@ -216,38 +213,82 @@ async fn custom_validation(app: tauri::AppHandle) -> Result<bool, String> {
 | Function | Description | Returns |
 |----------|-------------|---------|
 | `activate(key)` | Activate a license key | `Promise<License>` |
+| `validateKey(key)` | Validate an explicit license key | `Promise<ValidationResult>` |
 | `validate()` | Validate current license | `Promise<ValidationResult>` |
 | `deactivate()` | Deactivate and release seat | `Promise<void>` |
+| `deactivateKey(key, fingerprint?)` | Deactivate an explicit license/fingerprint pair | `Promise<void>` |
 | `getStatus()` | Get current license status | `Promise<LicenseStatus>` |
+| `getClientStatus()` | Get the stable client-status string | `Promise<LicenseStatus['status']>` |
+| `isOnline()` | Check whether the SDK currently believes the API is reachable | `Promise<boolean>` |
+| `getFingerprint()` | Get the current SDK fingerprint | `Promise<string>` |
+| `restoreLicense()` | Restore a cached license session | `Promise<RestoreResult>` |
+| `getState()` | Get a consolidated state snapshot | `Promise<LicenseSeatState>` |
+| `getAdminSnapshot()` | Get a detailed admin/debug snapshot | `Promise<LicenseSeatAdminSnapshot>` |
+| `restoreAndGetState()` | Restore a cached session and return the refreshed state | `Promise<LicenseSeatState>` |
+| `activateAndGetState(key, options?)` | Activate, attempt validation, and return the refreshed state | `Promise<LicenseSeatState>` |
+| `bootstrapState(options?)` | Restore, optionally validate, and return the latest state | `Promise<LicenseSeatState>` |
+| `health()` | Check API reachability | `Promise<boolean>` |
 | `hasEntitlement(key)` | Check if entitlement is active | `Promise<boolean>` |
+| `hasAnyEntitlement(keys)` | Check whether any provided entitlement is active | `Promise<boolean>` |
+| `hasAllEntitlements(keys)` | Check whether all provided entitlements are active | `Promise<boolean>` |
 | `checkEntitlement(key)` | Get detailed entitlement status | `Promise<EntitlementStatus>` |
-| `heartbeat()` | Send heartbeat ping | `Promise<HeartbeatResponse>` |
-| `getEntitlements()` | List all entitlements | `Promise<Entitlement[]>` |
+| `getEntitlements()` | List active entitlements from the cached validation result | `Promise<Entitlement[]>` |
+| `getActiveEntitlementKeys()` | List active entitlement keys from the current state snapshot | `Promise<string[]>` |
+| `getPlanKey()` | Get the active plan key from the validation snapshot | `Promise<string \| null>` |
+| `getLicenseMode()` | Get the active license mode from the validation snapshot | `Promise<string \| null>` |
+| `listenEvent(name, handler)` | Listen for a specific stable plugin event | `Promise<UnlistenFn>` |
+| `subscribeState(listener, options?)` | Subscribe to state-changing lifecycle events | `Promise<UnlistenFn>` |
+| `heartbeat()` | Send heartbeat ping | `Promise<void>` |
+| `heartbeatKey(key, fingerprint?)` | Send a heartbeat for an explicit license/fingerprint pair | `Promise<void>` |
+| `getLatestRelease(...)` | Get the latest published release | `Promise<Release>` |
+| `listReleases(...)` | List releases with pagination metadata | `Promise<ReleaseList>` |
+| `generateDownloadToken(...)` | Generate a release download token | `Promise<DownloadToken>` |
+| `generateOfflineToken(key, fingerprint?, ttlDays?)` | Generate a legacy offline token | `Promise<OfflineToken>` |
+| `verifyOfflineToken(token, publicKeyB64?)` | Verify a legacy offline token locally | `Promise<boolean>` |
+| `checkoutMachineFile(...)` | Checkout a machine file for offline validation | `Promise<MachineFile>` |
+| `fetchSigningKey(keyId)` | Fetch and cache a signing key | `Promise<string>` |
+| `syncOfflineAssets()` | Refresh the offline machine-file/signing-key/token set | `Promise<void>` |
+| `verifyMachineFile(file, options?)` | Verify a machine file locally | `Promise<MachineFileVerificationResult>` |
+| `normalizeError(error)` | Normalize unknown invoke/plugin errors into `LicenseSeatError` | `LicenseSeatPluginError` |
 
 ### Types
 
 ```typescript
 interface License {
-  key: string;
-  status: 'active' | 'expired' | 'suspended' | 'revoked';
-  planKey: string;
-  seatLimit: number;
-  expiresAt?: string;
+  licenseKey: string;
   deviceId: string;
-  activationId?: string;
+  activationId: string;
+  activatedAt: string;
 }
 
 interface ValidationResult {
+  object: string;
   valid: boolean;
   code?: string;
   message?: string;
-  warnings?: string[];
-  license: License;
+  license: {
+    key: string;
+    status: string;
+    planKey: string;
+    activeEntitlements: Array<{
+      key: string;
+      expiresAt?: string;
+    }>;
+  };
 }
 
 interface LicenseStatus {
-  status: 'active' | 'expired' | 'suspended' | 'not_activated';
-  license?: License;
+  status: 'active' | 'inactive' | 'invalid' | 'pending' | 'offline_valid' | 'offline_invalid';
+  message?: string;
+  license?: string;
+  device?: string;
+  activatedAt?: string;
+  lastValidated?: string;
+}
+
+interface EntitlementStatus {
+  active: boolean;
+  reason?: 'nolicense' | 'notfound' | 'expired';
   expiresAt?: string;
 }
 
@@ -255,16 +296,6 @@ interface Entitlement {
   key: string;
   expiresAt?: string;
   metadata?: Record<string, unknown>;
-}
-
-interface EntitlementStatus {
-  active: boolean;
-  reason: 'active' | 'expired' | 'not_found' | 'no_license';
-  expiresAt?: string;
-}
-
-interface HeartbeatResponse {
-  receivedAt: string;
 }
 ```
 
@@ -277,12 +308,19 @@ interface HeartbeatResponse {
 {
   "plugins": {
     "licenseseat": {
-      "apiKey": "your-api-key",
+      "apiKey": "pk_live_xxx",
       "productSlug": "your-product",
       "apiBaseUrl": "https://licenseseat.com/api/v1",
+      "storagePrefix": "licenseseat_",
+      "deviceIdentifier": "stable-fingerprint",
+      "signingPublicKey": null,
+      "signingKeyId": null,
       "autoValidateInterval": 3600,
       "heartbeatInterval": 300,
+      "networkRecheckInterval": 30,
       "offlineFallbackMode": "network_only",
+      "offlineTokenRefreshInterval": 259200,
+      "enableLegacyOfflineTokens": false,
       "maxOfflineDays": 0,
       "telemetryEnabled": true,
       "debug": false
@@ -295,12 +333,19 @@ interface HeartbeatResponse {
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `apiKey` | `string` | — | Your LicenseSeat API key (required) |
+| `apiKey` | `string` | — | Your publishable LicenseSeat API key (`pk_*`, required). Keep `sk_*` server-side only. |
 | `productSlug` | `string` | — | Your product slug (required) |
 | `apiBaseUrl` | `string` | `https://licenseseat.com/api/v1` | API base URL |
+| `storagePrefix` | `string` | `"licenseseat_"` | Cache namespace prefix |
+| `deviceIdentifier` | `string` | auto-generated | Override the canonical fingerprint |
+| `signingPublicKey` | `string` | `null` | Optional pinned public key for offline verification |
+| `signingKeyId` | `string` | `null` | Optional key ID for `signingPublicKey` |
 | `autoValidateInterval` | `number` | `3600` | Background validation interval (seconds) |
 | `heartbeatInterval` | `number` | `300` | Heartbeat interval (seconds) |
-| `offlineFallbackMode` | `string` | `"network_only"` | `"network_only"`, `"allow_offline"`, or `"offline_first"` |
+| `networkRecheckInterval` | `number` | `30` | Network recheck interval while offline (seconds) |
+| `offlineFallbackMode` | `string` | `"network_only"` | `"network_only"` or `"always"`; `"allow_offline"` / `"offline_first"` remain accepted legacy aliases |
+| `offlineTokenRefreshInterval` | `number` | `259200` | Offline artifact refresh interval (seconds) |
+| `enableLegacyOfflineTokens` | `boolean` | `false` | Allow legacy offline-token fallback after machine-file sync fails |
 | `maxOfflineDays` | `number` | `0` | Grace period for offline mode (days) |
 | `telemetryEnabled` | `boolean` | `true` | Send device telemetry |
 | `debug` | `boolean` | `false` | Enable debug logging |
@@ -343,10 +388,10 @@ if (status.active) {
     case 'expired':
       showUpgradePrompt('Your Pro features have expired');
       break;
-    case 'not_found':
+    case 'notfound':
       showUpgradePrompt('Upgrade to Pro for this feature');
       break;
-    case 'no_license':
+    case 'nolicense':
       showActivationPrompt();
       break;
   }
@@ -365,28 +410,26 @@ for (const ent of entitlements) {
 
 ## Event Handling
 
-Listen to license events from Rust using Tauri's event system:
+Use the exported event constants and state subscription helpers:
 
 ```typescript
-import { listen } from '@tauri-apps/api/event';
+import {
+  LICENSESEAT_EVENTS,
+  listenEvent,
+  subscribeState,
+} from '@licenseseat/tauri-plugin';
 
-// Listen for license events
-await listen('licenseseat://validation-success', (event) => {
+await listenEvent(LICENSESEAT_EVENTS.VALIDATION_SUCCESS, (event) => {
   console.log('License validated!', event.payload);
-  refreshUI();
 });
 
-await listen('licenseseat://validation-failed', (event) => {
-  console.log('Validation failed:', event.payload);
-  showLicenseError();
-});
+const unlisten = await subscribeState(({ state, eventName }) => {
+  console.log('State changed via', eventName);
+  refreshUI(state);
+}, { emitCurrent: true });
 
-await listen('licenseseat://heartbeat-success', () => {
-  updateConnectionStatus(true);
-});
-
-await listen('licenseseat://heartbeat-error', () => {
-  updateConnectionStatus(false);
+await listenEvent(LICENSESEAT_EVENTS.LICENSE_REVOKED, () => {
+  showRenewalPrompt();
 });
 ```
 
@@ -396,11 +439,15 @@ await listen('licenseseat://heartbeat-error', () => {
 |-------|---------|-------------|
 | `licenseseat://activation-success` | `License` | License activated |
 | `licenseseat://activation-error` | `string` | Activation failed |
-| `licenseseat://validation-success` | `ValidationResult` | Validation succeeded |
-| `licenseseat://validation-failed` | `string` | Validation failed |
-| `licenseseat://deactivation-success` | — | License deactivated |
-| `licenseseat://heartbeat-success` | — | Heartbeat acknowledged |
-| `licenseseat://heartbeat-error` | `string` | Heartbeat failed |
+| `LICENSESEAT_EVENTS.VALIDATION_SUCCESS` | `ValidationResult` | Validation succeeded |
+| `LICENSESEAT_EVENTS.VALIDATION_FAILED` | `ValidationResult` | Validation failed |
+| `LICENSESEAT_EVENTS.LICENSE_LOADED` | `License` | Cached license loaded on startup |
+| `LICENSESEAT_EVENTS.LICENSE_REVOKED` | `License \| string` | License was revoked |
+| `LICENSESEAT_EVENTS.DEACTIVATION_SUCCESS` | — | License deactivated |
+| `LICENSESEAT_EVENTS.HEARTBEAT_SUCCESS` | — | Heartbeat acknowledged |
+| `LICENSESEAT_EVENTS.HEARTBEAT_ERROR` | `string` | Heartbeat failed |
+
+Use `subscribeState()` when your UI only needs the latest state snapshot. Use `listenEvent()` when you care about a specific lifecycle event.
 
 ## Offline Support
 
@@ -410,7 +457,7 @@ Enable offline validation for air-gapped or unreliable network environments:
 {
   "plugins": {
     "licenseseat": {
-      "offlineFallbackMode": "allow_offline",
+      "offlineFallbackMode": "always",
       "maxOfflineDays": 7
     }
   }
@@ -422,53 +469,58 @@ Enable offline validation for air-gapped or unreliable network environments:
 | Mode | Description |
 |------|-------------|
 | `network_only` | Always require network (default) |
-| `allow_offline` | Fall back to cached token when offline |
-| `offline_first` | Prefer offline, sync when online |
+| `always` | Fall back to cached machine files, then legacy offline tokens if explicitly enabled |
 
 ## React Integration
 
 ```tsx
 import { useState, useEffect } from 'react';
-import { getStatus, hasEntitlement, activate } from '@licenseseat/tauri-plugin';
+import {
+  activate,
+  getState,
+  subscribeState,
+  type LicenseSeatState,
+} from '@licenseseat/tauri-plugin';
 
 function useLicense() {
-  const [status, setStatus] = useState<LicenseStatus | null>(null);
+  const [state, setState] = useState<LicenseSeatState | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    getStatus()
-      .then(setStatus)
+    let cleanup: (() => Promise<void>) | undefined;
+
+    getState()
+      .then(setState)
       .finally(() => setLoading(false));
+
+    subscribeState(({ state }) => {
+      setState(state);
+    }).then((unlisten) => {
+      cleanup = unlisten;
+    });
+
+    return () => {
+      void cleanup?.();
+    };
   }, []);
 
-  return { status, loading };
-}
-
-function useEntitlement(key: string) {
-  const [active, setActive] = useState(false);
-
-  useEffect(() => {
-    hasEntitlement(key).then(setActive);
-  }, [key]);
-
-  return active;
+  return { state, loading };
 }
 
 // Usage
 function App() {
-  const { status, loading } = useLicense();
-  const hasProFeatures = useEntitlement('pro-features');
+  const { state, loading } = useLicense();
 
   if (loading) return <Loading />;
 
-  if (status?.status !== 'active') {
+  if (!state?.isValid) {
     return <ActivationScreen />;
   }
 
   return (
     <div>
       <h1>Welcome!</h1>
-      {hasProFeatures && <ProFeatures />}
+      {state.entitlements.some((entitlement) => entitlement.key === 'pro-features') && <ProFeatures />}
     </div>
   );
 }
@@ -478,22 +530,32 @@ function App() {
 
 ```vue
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
-import { getStatus, hasEntitlement } from '@licenseseat/tauri-plugin';
+import { ref, onMounted, onUnmounted } from 'vue';
+import {
+  getState,
+  subscribeState,
+  type LicenseSeatState,
+} from '@licenseseat/tauri-plugin';
 
-const status = ref<LicenseStatus | null>(null);
-const hasProFeatures = ref(false);
+const state = ref<LicenseSeatState | null>(null);
+let unlisten: (() => Promise<void>) | undefined;
 
 onMounted(async () => {
-  status.value = await getStatus();
-  hasProFeatures.value = await hasEntitlement('pro-features');
+  state.value = await getState();
+  unlisten = await subscribeState(({ state: nextState }) => {
+    state.value = nextState;
+  });
+});
+
+onUnmounted(() => {
+  void unlisten?.();
 });
 </script>
 
 <template>
-  <div v-if="status?.status === 'active'">
+  <div v-if="state?.isValid">
     <h1>Welcome!</h1>
-    <ProFeatures v-if="hasProFeatures" />
+    <ProFeatures v-if="state.entitlements.some((entitlement) => entitlement.key === 'pro-features')" />
   </div>
   <ActivationScreen v-else />
 </template>
@@ -504,20 +566,36 @@ onMounted(async () => {
 ```svelte
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getStatus, hasEntitlement } from '@licenseseat/tauri-plugin';
+  import {
+    getState,
+    subscribeState,
+    type LicenseSeatState,
+  } from '@licenseseat/tauri-plugin';
 
-  let status: LicenseStatus | null = null;
-  let hasProFeatures = false;
+  let state: LicenseSeatState | null = null;
 
-  onMount(async () => {
-    status = await getStatus();
-    hasProFeatures = await hasEntitlement('pro-features');
+  onMount(() => {
+    let unlisten: (() => Promise<void>) | undefined;
+
+    void getState().then((nextState) => {
+      state = nextState;
+    });
+
+    void subscribeState(({ state: nextState }) => {
+      state = nextState;
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    });
+
+    return () => {
+      void unlisten?.();
+    };
   });
 </script>
 
-{#if status?.status === 'active'}
+{#if state?.isValid}
   <h1>Welcome!</h1>
-  {#if hasProFeatures}
+  {#if state.entitlements.some((entitlement) => entitlement.key === 'pro-features')}
     <ProFeatures />
   {/if}
 {:else}
@@ -555,7 +633,7 @@ try {
 
 ### API Key Protection
 
-Your API key is stored in `tauri.conf.json` and compiled into your app binary. It is not exposed to the JavaScript frontend.
+Use a `pk_*` publishable API key in your Tauri app. This key is intended for client applications, may be stored in `tauri.conf.json`, and is compiled into your app binary. It is not exposed to the JavaScript frontend. Do not embed `sk_*` secret keys in the plugin configuration.
 
 ### Permissions
 
@@ -563,12 +641,14 @@ The plugin uses Tauri's permission system. Available permissions:
 
 | Permission | Description |
 |------------|-------------|
-| `licenseseat:default` | All commands (recommended) |
+| `licenseseat:default` | All plugin commands, including offline/admin helpers (recommended) |
 | `licenseseat:allow-activate` | Only activation |
 | `licenseseat:allow-validate` | Only validation |
 | `licenseseat:allow-deactivate` | Only deactivation |
-| `licenseseat:allow-status` | Only status checks |
-| `licenseseat:allow-entitlements` | Only entitlement checks |
+| `licenseseat:allow-get-state` | Consolidated state snapshots |
+| `licenseseat:allow-sync-offline-assets` | Refresh offline assets for the active license |
+
+All command-specific permission identifiers are generated under `permissions/autogenerated/commands/`.
 
 ### Device Fingerprinting
 
@@ -604,7 +684,7 @@ npm add @licenseseat/tauri-plugin
 
 ### Network Errors
 
-1. Check your API key is correct
+1. Check your publishable API key (`pk_*`) is correct
 2. Verify network connectivity
 3. Enable debug mode for detailed logs:
    ```json
@@ -614,7 +694,7 @@ npm add @licenseseat/tauri-plugin
 ### Offline Validation Not Working
 
 1. Ensure the `offline` feature is enabled (it's built-in for the Tauri plugin)
-2. Check that `offlineFallbackMode` is set to `"allow_offline"` or `"offline_first"`
+2. Check that `offlineFallbackMode` is set to `"always"` (or a legacy alias such as `"allow_offline"`)
 3. Verify `maxOfflineDays` is greater than 0
 
 ### Debug Logging

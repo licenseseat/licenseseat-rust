@@ -441,6 +441,64 @@ async fn test_heartbeat_emits_error_event() {
     assert!(error_count.load(Ordering::SeqCst) >= 1);
 }
 
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn test_support_tasks_do_not_duplicate_after_restart() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/machine-file"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "data": {
+                "type": "machine-files",
+                "attributes": {
+                    "certificate": "not-a-real-machine-file",
+                    "algorithm": "aes-256-gcm+ed25519",
+                    "ttl": 2592000,
+                    "issued": "2025-01-01T00:00:00Z",
+                    "expiry": "2025-02-01T00:00:00Z"
+                },
+                "relationships": {
+                    "license": { "data": { "type": "licenses", "id": "TEST-KEY" } },
+                    "machine": { "data": { "type": "machines", "id": "device-123" } }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    config.network_recheck_interval = Duration::ZERO;
+    config.offline_token_refresh_interval = Duration::from_millis(120);
+
+    let sdk = LicenseSeat::new(config);
+    sdk.activate("TEST-KEY").await.unwrap();
+
+    // Let the one-shot activation sync finish, then restart support tasks while
+    // the old refresh loop is still sleeping.
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    sdk.stop_background_tasks();
+    sdk.start_background_tasks();
+
+    tokio::time::sleep(Duration::from_millis(170)).await;
+
+    let requests = server.received_requests().await.unwrap();
+    let machine_file_requests = requests
+        .iter()
+        .filter(|request| request.url.path().contains("/machine-file"))
+        .count();
+
+    // One request comes from activation-time sync_offline_assets(). After the
+    // restart there should only be one refresh-loop request, not two.
+    assert_eq!(machine_file_requests, 2);
+}
+
 // ============================================================================
 // Multiple Validation Cycles Tests
 // ============================================================================

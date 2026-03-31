@@ -319,6 +319,18 @@
           "markdownDescription": "Denies the check_entitlement command without any pre-configured scope."
         },
         {
+          "description": "Enables the checkout_machine_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-checkout-machine-file",
+          "markdownDescription": "Enables the checkout_machine_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the checkout_machine_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-checkout-machine-file",
+          "markdownDescription": "Denies the checkout_machine_file command without any pre-configured scope."
+        },
+        {
           "description": "Enables the deactivate command without any pre-configured scope.",
           "type": "string",
           "const": "allow-deactivate",
@@ -331,6 +343,114 @@
           "markdownDescription": "Denies the deactivate command without any pre-configured scope."
         },
         {
+          "description": "Enables the deactivate_key command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-deactivate-key",
+          "markdownDescription": "Enables the deactivate_key command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the deactivate_key command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-deactivate-key",
+          "markdownDescription": "Denies the deactivate_key command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the fetch_signing_key command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-fetch-signing-key",
+          "markdownDescription": "Enables the fetch_signing_key command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the fetch_signing_key command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-fetch-signing-key",
+          "markdownDescription": "Denies the fetch_signing_key command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the generate_download_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-generate-download-token",
+          "markdownDescription": "Enables the generate_download_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the generate_download_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-generate-download-token",
+          "markdownDescription": "Denies the generate_download_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the generate_offline_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-generate-offline-token",
+          "markdownDescription": "Enables the generate_offline_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the generate_offline_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-generate-offline-token",
+          "markdownDescription": "Denies the generate_offline_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_admin_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-admin-snapshot",
+          "markdownDescription": "Enables the get_admin_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_admin_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-admin-snapshot",
+          "markdownDescription": "Denies the get_admin_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_client_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-client-status",
+          "markdownDescription": "Enables the get_client_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_client_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-client-status",
+          "markdownDescription": "Denies the get_client_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_entitlements command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-entitlements",
+          "markdownDescription": "Enables the get_entitlements command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_entitlements command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-entitlements",
+          "markdownDescription": "Denies the get_entitlements command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_fingerprint command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-fingerprint",
+          "markdownDescription": "Enables the get_fingerprint command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_fingerprint command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-fingerprint",
+          "markdownDescription": "Denies the get_fingerprint command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_latest_release command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-latest-release",
+          "markdownDescription": "Enables the get_latest_release command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_latest_release command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-latest-release",
+          "markdownDescription": "Denies the get_latest_release command without any pre-configured scope."
+        },
+        {
           "description": "Enables the get_license command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-license",
@@ -341,6 +461,18 @@
           "type": "string",
           "const": "deny-get-license",
           "markdownDescription": "Denies the get_license command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-state",
+          "markdownDescription": "Enables the get_state command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-state",
+          "markdownDescription": "Denies the get_state command without any pre-configured scope."
         },
         {
           "description": "Enables the get_status command without any pre-configured scope.",
@@ -367,6 +499,18 @@
           "markdownDescription": "Denies the has_entitlement command without any pre-configured scope."
         },
         {
+          "description": "Enables the health command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-health",
+          "markdownDescription": "Enables the health command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the health command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-health",
+          "markdownDescription": "Denies the health command without any pre-configured scope."
+        },
+        {
           "description": "Enables the heartbeat command without any pre-configured scope.",
           "type": "string",
           "const": "allow-heartbeat",
@@ -377,6 +521,42 @@
           "type": "string",
           "const": "deny-heartbeat",
           "markdownDescription": "Denies the heartbeat command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the heartbeat_key command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-heartbeat-key",
+          "markdownDescription": "Enables the heartbeat_key command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the heartbeat_key command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-heartbeat-key",
+          "markdownDescription": "Denies the heartbeat_key command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the is_online command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-is-online",
+          "markdownDescription": "Enables the is_online command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the is_online command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-is-online",
+          "markdownDescription": "Denies the is_online command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_releases command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-releases",
+          "markdownDescription": "Enables the list_releases command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_releases command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-releases",
+          "markdownDescription": "Denies the list_releases command without any pre-configured scope."
         },
         {
           "description": "Enables the reset command without any pre-configured scope.",
@@ -391,6 +571,30 @@
           "markdownDescription": "Denies the reset command without any pre-configured scope."
         },
         {
+          "description": "Enables the restore_license command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-restore-license",
+          "markdownDescription": "Enables the restore_license command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the restore_license command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-restore-license",
+          "markdownDescription": "Denies the restore_license command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the sync_offline_assets command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-sync-offline-assets",
+          "markdownDescription": "Enables the sync_offline_assets command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the sync_offline_assets command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-sync-offline-assets",
+          "markdownDescription": "Denies the sync_offline_assets command without any pre-configured scope."
+        },
+        {
           "description": "Enables the validate command without any pre-configured scope.",
           "type": "string",
           "const": "allow-validate",
@@ -403,10 +607,46 @@
           "markdownDescription": "Denies the validate command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for LicenseSeat plugin\n#### This default permission set includes:\n\n- `allow-activate`\n- `allow-validate`\n- `allow-deactivate`\n- `allow-heartbeat`\n- `allow-get-status`\n- `allow-check-entitlement`\n- `allow-has-entitlement`\n- `allow-get-license`\n- `allow-reset`",
+          "description": "Enables the validate_key command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-validate-key",
+          "markdownDescription": "Enables the validate_key command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the validate_key command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-validate-key",
+          "markdownDescription": "Denies the validate_key command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the verify_machine_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-verify-machine-file",
+          "markdownDescription": "Enables the verify_machine_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the verify_machine_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-verify-machine-file",
+          "markdownDescription": "Denies the verify_machine_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the verify_offline_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-verify-offline-token",
+          "markdownDescription": "Enables the verify_offline_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the verify_offline_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-verify-offline-token",
+          "markdownDescription": "Denies the verify_offline_token command without any pre-configured scope."
+        },
+        {
+          "description": "Default permissions for LicenseSeat plugin\n#### This default permission set includes:\n\n- `allow-activate`\n- `allow-validate-key`\n- `allow-validate`\n- `allow-deactivate`\n- `allow-deactivate-key`\n- `allow-heartbeat`\n- `allow-heartbeat-key`\n- `allow-get-status`\n- `allow-get-client-status`\n- `allow-is-online`\n- `allow-get-fingerprint`\n- `allow-restore-license`\n- `allow-health`\n- `allow-check-entitlement`\n- `allow-get-entitlements`\n- `allow-has-entitlement`\n- `allow-get-license`\n- `allow-get-state`\n- `allow-get-admin-snapshot`\n- `allow-get-latest-release`\n- `allow-list-releases`\n- `allow-generate-download-token`\n- `allow-generate-offline-token`\n- `allow-verify-offline-token`\n- `allow-checkout-machine-file`\n- `allow-fetch-signing-key`\n- `allow-sync-offline-assets`\n- `allow-verify-machine-file`\n- `allow-reset`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for LicenseSeat plugin\n#### This default permission set includes:\n\n- `allow-activate`\n- `allow-validate`\n- `allow-deactivate`\n- `allow-heartbeat`\n- `allow-get-status`\n- `allow-check-entitlement`\n- `allow-has-entitlement`\n- `allow-get-license`\n- `allow-reset`"
+          "markdownDescription": "Default permissions for LicenseSeat plugin\n#### This default permission set includes:\n\n- `allow-activate`\n- `allow-validate-key`\n- `allow-validate`\n- `allow-deactivate`\n- `allow-deactivate-key`\n- `allow-heartbeat`\n- `allow-heartbeat-key`\n- `allow-get-status`\n- `allow-get-client-status`\n- `allow-is-online`\n- `allow-get-fingerprint`\n- `allow-restore-license`\n- `allow-health`\n- `allow-check-entitlement`\n- `allow-get-entitlements`\n- `allow-has-entitlement`\n- `allow-get-license`\n- `allow-get-state`\n- `allow-get-admin-snapshot`\n- `allow-get-latest-release`\n- `allow-list-releases`\n- `allow-generate-download-token`\n- `allow-generate-offline-token`\n- `allow-verify-offline-token`\n- `allow-checkout-machine-file`\n- `allow-fetch-signing-key`\n- `allow-sync-offline-assets`\n- `allow-verify-machine-file`\n- `allow-reset`"
         }
       ]
     }

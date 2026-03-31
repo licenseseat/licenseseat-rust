@@ -1,7 +1,7 @@
 //! Device telemetry collection for analytics.
 //!
-//! Collects non-personally identifiable device information for
-//! dashboard analytics (DAU/MAU, version adoption, platform distribution).
+//! Collects non-personally identifiable device information for dashboard
+//! analytics (DAU/MAU, version adoption, platform distribution).
 
 use serde::Serialize;
 use std::env;
@@ -291,33 +291,10 @@ fn timezone() -> Option<String> {
 }
 
 /// Generate a stable device identifier.
+///
+/// This remains as a compatibility wrapper around the canonical fingerprint
+/// generator now housed in `device.rs`.
+#[allow(dead_code)]
 pub fn generate_device_id() -> String {
-    // Try to get machine UUID first
-    if let Ok(id) = machine_uid::get() {
-        return format!("rust_{}", &id[..16.min(id.len())]);
-    }
-
-    // Fallback: generate from hostname + username
-    let hostname = hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let username = env::var("USER")
-        .or_else(|_| env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    // Simple hash
-    let combined = format!("{}:{}", hostname, username);
-    let hash = simple_hash(&combined);
-    format!("rust_{:016x}", hash)
-}
-
-/// Simple string hashing (not cryptographic, just for device ID).
-fn simple_hash(s: &str) -> u64 {
-    let mut hash: u64 = 5381;
-    for byte in s.bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
-    }
-    hash
+    crate::device::generate_device_id()
 }

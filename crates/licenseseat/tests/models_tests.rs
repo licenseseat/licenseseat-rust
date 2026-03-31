@@ -269,7 +269,7 @@ fn test_entitlement_status_no_license() {
 
 #[test]
 fn test_entitlement_reason_variants() {
-    let reasons = vec![
+    let reasons = [
         EntitlementReason::NotFound,
         EntitlementReason::Expired,
         EntitlementReason::NoLicense,
@@ -294,6 +294,7 @@ fn test_activation_options_default() {
     let opts = ActivationOptions::default();
 
     assert!(opts.device_id.is_none());
+    assert!(opts.device_fingerprint.is_none());
     assert!(opts.device_name.is_none());
     assert!(opts.metadata.is_none());
 }
@@ -303,6 +304,7 @@ fn test_activation_options_with_device_name() {
     let opts = ActivationOptions::with_device_name("My MacBook Pro");
 
     assert!(opts.device_id.is_none());
+    assert!(opts.device_fingerprint.is_none());
     assert_eq!(opts.device_name.as_deref(), Some("My MacBook Pro"));
     assert!(opts.metadata.is_none());
 }
@@ -315,7 +317,9 @@ fn test_activation_options_full() {
     metadata.insert("env".into(), serde_json::json!("production"));
 
     let opts = ActivationOptions {
+        fingerprint: None,
         device_id: Some("custom-device-id".into()),
+        device_fingerprint: None,
         device_name: Some("Production Server".into()),
         metadata: Some(metadata),
     };
@@ -357,7 +361,7 @@ fn test_config_new() {
 
 #[test]
 fn test_offline_fallback_mode_variants() {
-    let modes = vec![
+    let modes = [
         OfflineFallbackMode::NetworkOnly,
         OfflineFallbackMode::Always,
     ];

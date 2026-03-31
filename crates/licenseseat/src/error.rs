@@ -150,10 +150,22 @@ pub mod codes {
     pub const SEAT_LIMIT_EXCEEDED: &str = "seat_limit_exceeded";
     /// Device ID doesn't match the activation.
     pub const DEVICE_MISMATCH: &str = "device_mismatch";
+    /// Device fingerprint is not activated for this license.
+    pub const DEVICE_NOT_ACTIVATED: &str = "DEVICE_NOT_ACTIVATED";
     /// License is not valid for this product.
     pub const PRODUCT_MISMATCH: &str = "product_mismatch";
+    /// Release was not found.
+    pub const RELEASE_NOT_FOUND: &str = "release_not_found";
     /// Activation was already deactivated.
     pub const ALREADY_DEACTIVATED: &str = "already_deactivated";
     /// Invalid API key.
     pub const INVALID_API_KEY: &str = "invalid_api_key";
+    /// Machine-file decryption failed.
+    pub const DECRYPTION_FAILED: &str = "DECRYPTION_FAILED";
+    /// Machine file or offline token expired.
+    pub const TOKEN_EXPIRED: &str = "TOKEN_EXPIRED";
+    /// Machine file or offline token is not yet valid.
+    pub const TOKEN_NOT_YET_VALID: &str = "TOKEN_NOT_YET_VALID";
+    /// Machine file or offline token fingerprint mismatch.
+    pub const FINGERPRINT_MISMATCH: &str = "FINGERPRINT_MISMATCH";
 }

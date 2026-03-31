@@ -35,6 +35,10 @@ pub enum EventKind {
     ValidationOfflineSuccess,
     /// Offline validation failed.
     ValidationOfflineFailed,
+    /// Validation failed because authentication/configuration is invalid.
+    ValidationAuthFailed,
+    /// Periodic auto-validation failed.
+    ValidationAutoFailed,
 
     // Deactivation lifecycle
     /// Deactivation started.
@@ -57,10 +61,32 @@ pub enum EventKind {
     LicenseRevoked,
 
     // Offline token
+    /// Offline token fetch started.
+    OfflineTokenFetching,
+    /// Offline token fetched from the server.
+    OfflineTokenFetched,
+    /// Offline token fetch failed.
+    OfflineTokenFetchError,
+    /// Offline token ready in the local cache.
+    OfflineTokenReady,
     /// Offline token verified successfully.
     OfflineTokenVerified,
     /// Offline token verification failed.
     OfflineTokenVerificationFailed,
+
+    // Machine file
+    /// Machine-file fetch started.
+    MachineFileFetching,
+    /// Machine file fetched from the server.
+    MachineFileFetched,
+    /// Machine-file fetch failed.
+    MachineFileFetchError,
+    /// Machine file ready in the local cache.
+    MachineFileReady,
+    /// Machine file verified successfully.
+    MachineFileVerified,
+    /// Machine-file verification failed.
+    MachineFileVerificationFailed,
 
     // Offline validation
     /// Offline validation started.
@@ -87,6 +113,8 @@ pub enum EventKind {
     // SDK state
     /// SDK state was reset.
     SdkReset,
+    /// SDK runtime/internal error.
+    SdkError,
 }
 
 /// Data associated with an event.
@@ -133,6 +161,14 @@ impl Event {
             data: Some(EventData::Error(error.into())),
         }
     }
+
+    /// Create a new event with a scheduled next-run timestamp.
+    pub fn with_next_run_at(kind: EventKind, next_run_at: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            kind,
+            data: Some(EventData::NextRunAt(next_run_at)),
+        }
+    }
 }
 
 impl std::fmt::Display for EventKind {
@@ -147,6 +183,8 @@ impl std::fmt::Display for EventKind {
             Self::ValidationError => "validation:error",
             Self::ValidationOfflineSuccess => "validation:offline-success",
             Self::ValidationOfflineFailed => "validation:offline-failed",
+            Self::ValidationAuthFailed => "validation:auth-failed",
+            Self::ValidationAutoFailed => "validation:auto-failed",
             Self::DeactivationStart => "deactivation:start",
             Self::DeactivationSuccess => "deactivation:success",
             Self::DeactivationError => "deactivation:error",
@@ -154,8 +192,18 @@ impl std::fmt::Display for EventKind {
             Self::HeartbeatError => "heartbeat:error",
             Self::LicenseLoaded => "license:loaded",
             Self::LicenseRevoked => "license:revoked",
+            Self::OfflineTokenFetching => "offlineToken:fetching",
+            Self::OfflineTokenFetched => "offlineToken:fetched",
+            Self::OfflineTokenFetchError => "offlineToken:fetchError",
+            Self::OfflineTokenReady => "offlineToken:ready",
             Self::OfflineTokenVerified => "offlineToken:verified",
             Self::OfflineTokenVerificationFailed => "offlineToken:verificationFailed",
+            Self::MachineFileFetching => "machineFile:fetching",
+            Self::MachineFileFetched => "machineFile:fetched",
+            Self::MachineFileFetchError => "machineFile:fetchError",
+            Self::MachineFileReady => "machineFile:ready",
+            Self::MachineFileVerified => "machineFile:verified",
+            Self::MachineFileVerificationFailed => "machineFile:verificationFailed",
             Self::OfflineValidationStart => "offlineValidation:start",
             Self::OfflineValidationSuccess => "offlineValidation:success",
             Self::OfflineValidationFailed => "offlineValidation:failed",
@@ -165,6 +213,7 @@ impl std::fmt::Display for EventKind {
             Self::NetworkOnline => "network:online",
             Self::NetworkOffline => "network:offline",
             Self::SdkReset => "sdk:reset",
+            Self::SdkError => "sdk:error",
         };
         write!(f, "{}", s)
     }

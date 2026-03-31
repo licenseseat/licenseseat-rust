@@ -1,6 +1,6 @@
 {
   "name": "@licenseseat/tauri-plugin",
-  "version": "0.2.0",
+  "version": "0.5.1",
   "description": "Tauri plugin for LicenseSeat software licensing",
   "type": "module",
   "main": "./dist/index.js",
@@ -17,8 +17,10 @@
     "guest-js"
   ],
   "scripts": {
-    "build": "tsc",
-    "prepublishOnly": "npm run build"
+    "build": "tsc -p tsconfig.json",
+    "pack:check": "npm pack --dry-run",
+    "prepare": "npm run build",
+    "prepack": "npm run build"
   },
   "keywords": [
     "tauri",
