@@ -77,12 +77,14 @@ fn main() {
 
 **3. Add your configuration:**
 
+Use your `pk_*` publishable API key here. Do not embed `sk_*` secret keys in client apps.
+
 ```json
 // tauri.conf.json
 {
   "plugins": {
     "licenseseat": {
-      "apiKey": "your-api-key",
+      "apiKey": "pk_live_xxx",
       "productSlug": "your-product"
     }
   }
@@ -127,7 +129,7 @@ use licenseseat::{LicenseSeat, Config};
 
 #[tokio::main]
 async fn main() -> licenseseat::Result<()> {
-    let sdk = LicenseSeat::new(Config::new("api-key", "product-slug"));
+    let sdk = LicenseSeat::new(Config::new("pk_live_xxx", "product-slug"));
 
     // Activate a license
     let license = sdk.activate("USER-LICENSE-KEY").await?;
@@ -211,7 +213,7 @@ explicit compatibility fallback.
 use licenseseat::{Config, OfflineFallbackMode};
 
 let config = Config {
-    api_key: "your-api-key".into(),
+    api_key: "pk_live_xxx".into(),
     product_slug: "your-product".into(),
     offline_fallback_mode: OfflineFallbackMode::Always,
     max_offline_days: 7,  // Grace period
@@ -286,7 +288,7 @@ tokio::spawn(async move {
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `api_key` | `String` | — | Your LicenseSeat API key (required) |
+| `api_key` | `String` | — | Your publishable LicenseSeat API key (`pk_*`, required). Keep `sk_*` server-side only. |
 | `product_slug` | `String` | — | Your product slug (required) |
 | `api_base_url` | `String` | `https://licenseseat.com/api/v1` | API base URL |
 | `auto_validate_interval` | `Duration` | 1 hour | Background validation interval |
@@ -307,7 +309,7 @@ The SDK includes runnable examples:
 
 ```bash
 # Simple heartbeat demo (mimics real app lifecycle)
-LICENSESEAT_API_KEY=your_key \
+LICENSESEAT_API_KEY=pk_live_xxx \
 LICENSESEAT_PRODUCT_SLUG=your_product \
 LICENSESEAT_LICENSE_KEY=your_license \
 cargo run --example dev_heartbeat

@@ -50,13 +50,16 @@ cargo add licenseseat --no-default-features --features "native-tls,offline"
 
 ## Quick Start
 
+Use a `pk_*` publishable API key in client applications.
+Keep `sk_*` secret keys server-side only.
+
 ```rust
 use licenseseat::{LicenseSeat, Config};
 
 #[tokio::main]
 async fn main() -> licenseseat::Result<()> {
     // 1. Create SDK instance
-    let sdk = LicenseSeat::new(Config::new("your-api-key", "your-product"));
+    let sdk = LicenseSeat::new(Config::new("pk_live_xxx", "your-product"));
 
     // 2. Activate a license (typically on first launch)
     let license = sdk.activate("USER-LICENSE-KEY").await?;
@@ -89,7 +92,7 @@ Activation binds a license key to this device and consumes a seat:
 ```rust
 use licenseseat::{LicenseSeat, Config, ActivationOptions};
 
-let sdk = LicenseSeat::new(Config::new("api-key", "product"));
+let sdk = LicenseSeat::new(Config::new("pk_live_xxx", "product"));
 
 // Simple activation
 let license = sdk.activate("USER-LICENSE-KEY").await?;
@@ -227,7 +230,7 @@ The Rust SDK now matches the C++ SDK's machine-file-first offline flow.
 use licenseseat::{Config, OfflineFallbackMode};
 
 let config = Config {
-    api_key: "your-api-key".into(),
+    api_key: "pk_live_xxx".into(),
     product_slug: "your-product".into(),
 
     // Fall back to locally cached offline artifacts when the network is unavailable.
@@ -279,7 +282,7 @@ Heartbeats enable real-time seat tracking for concurrent user limits:
 use std::time::Duration;
 
 let config = Config {
-    api_key: "your-api-key".into(),
+    api_key: "pk_live_xxx".into(),
     product_slug: "your-product".into(),
     heartbeat_interval: Duration::from_secs(300), // 5 minutes
     ..Default::default()
@@ -384,7 +387,7 @@ use std::time::Duration;
 
 let config = Config {
     // Required
-    api_key: "your-api-key".into(),
+    api_key: "pk_live_xxx".into(),
     product_slug: "your-product".into(),
 
     // API endpoint (default: production)
@@ -415,7 +418,7 @@ let sdk = LicenseSeat::new(config);
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `api_key` | `String` | — | Your LicenseSeat API key (required) |
+| `api_key` | `String` | — | Your publishable LicenseSeat API key (`pk_*`, required). Keep `sk_*` server-side only. |
 | `product_slug` | `String` | — | Your product slug (required) |
 | `api_base_url` | `String` | `https://licenseseat.com/api/v1` | API base URL |
 | `auto_validate_interval` | `Duration` | 1 hour | Background validation interval |

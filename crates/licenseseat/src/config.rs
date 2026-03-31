@@ -5,6 +5,9 @@ use std::time::Duration;
 
 /// SDK configuration options.
 ///
+/// Use a `pk_*` publishable API key in desktop and client applications.
+/// Keep `sk_*` secret keys server-side only.
+///
 /// # Example
 ///
 /// ```rust
@@ -12,7 +15,7 @@ use std::time::Duration;
 /// use std::time::Duration;
 ///
 /// let config = Config {
-///     api_key: "sk_live_xxx".into(),
+///     api_key: "pk_live_xxx".into(),
 ///     product_slug: "my-app".into(),
 ///     auto_validate_interval: Duration::from_secs(1800), // 30 minutes
 ///     offline_fallback_mode: OfflineFallbackMode::NetworkOnly,
@@ -27,7 +30,10 @@ pub struct Config {
     /// Default: `https://licenseseat.com/api/v1`
     pub api_base_url: String,
 
-    /// Your LicenseSeat API key (required for most operations).
+    /// Your publishable LicenseSeat API key (`pk_*`, required for most operations).
+    ///
+    /// This key is safe to embed in desktop and client applications.
+    /// Keep `sk_*` secret keys server-side only.
     pub api_key: String,
 
     /// Product slug - identifies your product (required).
@@ -158,6 +164,8 @@ impl Default for Config {
 
 impl Config {
     /// Create a new configuration with required fields.
+    ///
+    /// `api_key` should be your publishable `pk_*` API key for client apps.
     pub fn new(api_key: impl Into<String>, product_slug: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),

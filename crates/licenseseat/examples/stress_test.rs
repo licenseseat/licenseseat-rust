@@ -16,10 +16,12 @@
 //! Scenario 12: Full lifecycle (activate -> validate -> heartbeat -> deactivate)
 //!
 //! Usage:
-//!   LICENSESEAT_API_KEY=your_api_key \
+//!   LICENSESEAT_API_KEY=pk_live_xxx \
 //!   LICENSESEAT_PRODUCT_SLUG=your_product \
 //!   LICENSESEAT_LICENSE_KEY=your_license_key \
 //!   cargo run --example stress_test
+//!
+//! Use a `pk_*` publishable API key for client-side examples.
 //!
 //! Optional:
 //!   LICENSESEAT_BASE_URL - API base URL

@@ -15,6 +15,9 @@
 //!
 //! ## Quick Start
 //!
+//! Use a `pk_*` publishable API key in client applications.
+//! Keep `sk_*` secret keys server-side only.
+//!
 //! ```rust,no_run
 //! use licenseseat::{LicenseSeat, Config};
 //!
@@ -22,7 +25,7 @@
 //! async fn main() -> Result<(), licenseseat::Error> {
 //!     // Create SDK instance
 //!     let sdk = LicenseSeat::new(Config {
-//!         api_key: "your-api-key".into(),
+//!         api_key: "pk_live_xxx".into(),
 //!         product_slug: "your-product".into(),
 //!         ..Default::default()
 //!     });

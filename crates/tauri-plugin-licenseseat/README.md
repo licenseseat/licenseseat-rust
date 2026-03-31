@@ -36,7 +36,7 @@ Official Tauri v2 plugin for [LicenseSeat](https://licenseseat.com) — simple, 
 - **Entitlement Checking** — Feature gating made simple
 - **Event System** — React to license changes in real-time
 - **Offline Support** — Machine-file-first Ed25519 + AES-256-GCM offline validation
-- **Zero Config** — Just add your API key and product slug
+- **Zero Config** — Just add your publishable API key and product slug
 - **Tauri v2** — Built for the latest Tauri architecture
 
 ## Requirements
@@ -86,12 +86,14 @@ fn main() {
 
 ### 2. Add Configuration
 
+Use your `pk_*` publishable API key in Tauri apps. Do not embed `sk_*` secret keys here.
+
 ```json
 // tauri.conf.json
 {
   "plugins": {
     "licenseseat": {
-      "apiKey": "your-api-key",
+      "apiKey": "pk_live_xxx",
       "productSlug": "your-product"
     }
   }
@@ -304,7 +306,7 @@ interface Entitlement {
 {
   "plugins": {
     "licenseseat": {
-      "apiKey": "your-api-key",
+      "apiKey": "pk_live_xxx",
       "productSlug": "your-product",
       "apiBaseUrl": "https://licenseseat.com/api/v1",
       "storagePrefix": "licenseseat_",
@@ -329,7 +331,7 @@ interface Entitlement {
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `apiKey` | `string` | — | Your LicenseSeat API key (required) |
+| `apiKey` | `string` | — | Your publishable LicenseSeat API key (`pk_*`, required). Keep `sk_*` server-side only. |
 | `productSlug` | `string` | — | Your product slug (required) |
 | `apiBaseUrl` | `string` | `https://licenseseat.com/api/v1` | API base URL |
 | `storagePrefix` | `string` | `"licenseseat_"` | Cache namespace prefix |
@@ -595,7 +597,7 @@ try {
 
 ### API Key Protection
 
-Your API key is stored in `tauri.conf.json` and compiled into your app binary. It is not exposed to the JavaScript frontend.
+Use a `pk_*` publishable API key in your Tauri app. This key is intended for client applications, may be stored in `tauri.conf.json`, and is compiled into your app binary. It is not exposed to the JavaScript frontend. Do not embed `sk_*` secret keys in the plugin configuration.
 
 ### Permissions
 
@@ -644,7 +646,7 @@ npm add @licenseseat/tauri-plugin
 
 ### Network Errors
 
-1. Check your API key is correct
+1. Check your publishable API key (`pk_*`) is correct
 2. Verify network connectivity
 3. Enable debug mode for detailed logs:
    ```json

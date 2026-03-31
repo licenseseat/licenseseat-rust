@@ -4,11 +4,14 @@ use serde::Deserialize;
 
 /// Plugin configuration read from tauri.conf.json.
 ///
+/// Use a `pk_*` publishable API key in Tauri applications.
+/// Keep `sk_*` secret keys server-side only.
+///
 /// ```json
 /// {
 ///   "plugins": {
 ///     "licenseseat": {
-///       "apiKey": "your-api-key",
+///       "apiKey": "pk_live_xxx",
 ///       "productSlug": "your-product",
 ///       "autoValidateInterval": 3600,
 ///       "debug": false
@@ -19,7 +22,10 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginConfig {
-    /// Your LicenseSeat API key (required).
+    /// Your publishable LicenseSeat API key (`pk_*`, required).
+    ///
+    /// This key is safe to compile into a Tauri app binary.
+    /// Keep `sk_*` secret keys server-side only.
     pub api_key: String,
 
     /// Your product slug (required).

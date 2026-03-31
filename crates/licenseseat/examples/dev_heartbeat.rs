@@ -6,10 +6,12 @@
 //! 3. Handles graceful shutdown
 //!
 //! Usage:
-//!   LICENSESEAT_API_KEY=your_api_key \
+//!   LICENSESEAT_API_KEY=pk_live_xxx \
 //!   LICENSESEAT_PRODUCT_SLUG=your_product \
 //!   LICENSESEAT_LICENSE_KEY=your_license_key \
 //!   cargo run --example dev_heartbeat
+//!
+//! Use a `pk_*` publishable API key for client-side examples.
 //!
 //! Optional environment variables:
 //!   LICENSESEAT_BASE_URL - API base URL (default: https://licenseseat.com/api/v1)

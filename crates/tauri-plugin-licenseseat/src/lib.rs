@@ -32,13 +32,16 @@
 //!
 //! ## Configuration
 //!
+//! Use a `pk_*` publishable API key in Tauri applications.
+//! Keep `sk_*` secret keys server-side only.
+//!
 //! Add configuration to `tauri.conf.json`:
 //!
 //! ```json
 //! {
 //!   "plugins": {
 //!     "licenseseat": {
-//!       "apiKey": "your-api-key",
+//!       "apiKey": "pk_live_xxx",
 //!       "productSlug": "your-product"
 //!     }
 //!   }
