@@ -84,6 +84,9 @@ impl LicenseCache {
     /// Update the validation result on the cached license.
     pub fn update_validation(&self, result: &ValidationResult) -> Result<()> {
         if let Some(mut license) = self.get_license() {
+            if result.valid && !result.offline && license.license_key == result.license.key {
+                license.trusted_license = Some(result.license.clone());
+            }
             license.validation = Some(result.clone());
             license.last_validated = chrono::Utc::now();
             self.set_license(&license)?;
@@ -96,10 +99,44 @@ impl LicenseCache {
         self.set("license_snapshot", license)
     }
 
+    /// Persist trusted license metadata onto the cached license record.
+    pub fn set_trusted_license(&self, trusted_license: &LicenseResponse) -> Result<()> {
+        if let Some(mut license) = self.get_license() {
+            if license.license_key == trusted_license.key {
+                license.trusted_license = Some(trusted_license.clone());
+                self.set_license(&license)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Get the last trusted cached license snapshot.
     #[cfg(feature = "offline")]
     pub fn get_license_snapshot(&self) -> Option<LicenseResponse> {
         self.get("license_snapshot")
+    }
+
+    /// Get trusted cached license metadata persisted on the license record itself.
+    #[cfg(feature = "offline")]
+    pub fn get_trusted_license(&self) -> Option<LicenseResponse> {
+        let License {
+            license_key,
+            trusted_license,
+            validation,
+            ..
+        } = self.get_license()?;
+
+        if let Some(trusted_license) = trusted_license {
+            return Some(trusted_license);
+        }
+
+        validation.and_then(|validation| {
+            if validation.valid && !validation.offline && validation.license.key == license_key {
+                Some(validation.license)
+            } else {
+                None
+            }
+        })
     }
 
     // ========================================================================

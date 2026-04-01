@@ -3,7 +3,7 @@
 //! These tests verify caching behavior through the public SDK API.
 //! The internal cache module is tested indirectly via SDK operations.
 
-use licenseseat::{Config, LicenseSeat};
+use licenseseat::{Config, LicenseSeat, TrustedLicenseSource};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +36,13 @@ fn test_config(base_url: &str) -> Config {
         debug: true,
         ..Default::default()
     }
+}
+
+fn cache_path(prefix: &str, key: &str) -> std::path::PathBuf {
+    dirs::cache_dir()
+        .expect("cache dir")
+        .join("licenseseat")
+        .join(format!("{prefix}{key}.json"))
 }
 
 fn activation_response() -> serde_json::Value {
@@ -411,6 +418,72 @@ async fn test_validation_persists_across_instances() {
         assert!(license.validation.is_some());
         assert!(license.validation.unwrap().valid);
     }
+}
+
+#[cfg(feature = "offline")]
+#[test]
+fn test_trusted_license_falls_back_to_legacy_cached_validation_shape() {
+    let prefix = unique_prefix();
+    let license_path = cache_path(&prefix, "license");
+    std::fs::create_dir_all(license_path.parent().expect("cache parent")).unwrap();
+
+    let legacy_license = json!({
+        "license_key": "TEST-KEY",
+        "device_id": "device-123",
+        "activation_id": "act-12345-uuid",
+        "activated_at": "2025-01-01T00:00:00Z",
+        "last_validated": "2025-01-02T00:00:00Z",
+        "validation": {
+            "object": "validation_result",
+            "valid": true,
+            "code": null,
+            "message": null,
+            "warnings": null,
+            "license": {
+                "object": "license",
+                "key": "TEST-KEY",
+                "status": "active",
+                "starts_at": null,
+                "expires_at": null,
+                "mode": "hardware_locked",
+                "plan_key": "pro",
+                "seat_limit": 5,
+                "active_seats": 1,
+                "active_entitlements": [],
+                "metadata": null,
+                "product": {
+                    "slug": "test-product",
+                    "name": "Test App"
+                }
+            },
+            "activation": null,
+            "offline": false
+        }
+    });
+    std::fs::write(
+        &license_path,
+        serde_json::to_string_pretty(&legacy_license).unwrap(),
+    )
+    .unwrap();
+
+    let sdk = LicenseSeat::new(Config {
+        api_key: "test-api-key".into(),
+        product_slug: "test-product".into(),
+        api_base_url: "http://localhost:9".into(),
+        storage_prefix: prefix,
+        auto_validate_interval: Duration::from_secs(0),
+        heartbeat_interval: Duration::from_secs(0),
+        debug: true,
+        ..Default::default()
+    });
+
+    let trusted_license = sdk.current_trusted_license().expect("trusted license");
+    assert_eq!(trusted_license.key, "TEST-KEY");
+    assert_eq!(trusted_license.plan_key, "pro");
+    assert_eq!(
+        sdk.current_trusted_license_source(),
+        Some(TrustedLicenseSource::CachedLicense)
+    );
 }
 
 // ============================================================================

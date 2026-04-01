@@ -261,6 +261,9 @@ pub struct License {
     pub activated_at: DateTime<Utc>,
     /// When the license was last validated online or offline.
     pub last_validated: DateTime<Utc>,
+    /// Last trusted rich license metadata seen from an online response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_license: Option<LicenseResponse>,
     /// Current validation state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation: Option<ValidationResult>,
@@ -313,6 +316,16 @@ impl LicenseStatus {
     pub fn is_active(&self) -> bool {
         matches!(self, Self::Active { .. } | Self::OfflineValid { .. })
     }
+}
+
+/// Source of trusted rich license metadata used for offline recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedLicenseSource {
+    /// Rich metadata came from the dedicated snapshot file.
+    SnapshotFile,
+    /// Rich metadata came from the cached license record itself.
+    CachedLicense,
 }
 
 /// Summary status for the overall SDK/client state.

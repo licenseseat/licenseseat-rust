@@ -4,6 +4,16 @@
 
 - No unreleased changes yet.
 
+## [0.5.3] - 2026-04-01
+
+For a detailed technical note covering the root cause, final implementation shape, regression coverage, and release verification, see [`docs/releases/0.5.3.md`](docs/releases/0.5.3.md) and [`docs/releases/offline-validation-metadata-preservation.md`](docs/releases/offline-validation-metadata-preservation.md).
+
+- Hardened offline machine-file restore so trusted plan, entitlement, and product metadata survive even when the machine-file payload is stripped and the separate `license_snapshot` file is missing.
+- Trusted rich license metadata is now persisted on the cached `license.json` record itself, with offline recovery preferring embedded machine-file license data first, snapshot-file metadata second, cached trusted metadata third, and blank fallback only last.
+- Offline restore now self-heals the dedicated snapshot file when trusted cached metadata exists, reducing the chance that a missing snapshot file can cause future downgrade behavior on the same machine.
+- Added release-blocking regression coverage for the production failure mode: stripped machine file, deleted snapshot file, app restart, then offline restore after activation, validation, and heartbeat paths.
+- Clarified the Tauri admin/debug surface so it now exposes `trustedLicense`, `trustedLicenseSource`, and the snapshot-file path separately.
+
 ## [0.5.2] - 2026-04-01
 
 For a detailed technical note covering the root cause, implementation shape, regression coverage, and release verification, see [`docs/releases/0.5.2.md`](docs/releases/0.5.2.md) and [`docs/releases/offline-validation-metadata-preservation.md`](docs/releases/offline-validation-metadata-preservation.md).

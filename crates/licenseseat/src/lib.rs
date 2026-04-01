@@ -80,7 +80,7 @@ pub use models::{
     LicenseResponse, LicenseStatus, LicenseStatusDetails, MachineFile, MachineFilePayload,
     MachineFileVerificationResult, OfflineEntitlement, OfflineTokenPayload, OfflineTokenResponse,
     OfflineTokenSignature, Product, Release, ReleaseList, RestoreResult, SigningKeyResponse,
-    ValidationResult, ValidationWarning,
+    TrustedLicenseSource, ValidationResult, ValidationWarning,
 };
 
 /// SDK version

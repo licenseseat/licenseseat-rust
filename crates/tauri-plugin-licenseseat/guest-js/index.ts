@@ -319,6 +319,7 @@ export interface LicenseSeatAdminConfig {
 export interface LicenseSeatAdminCachePaths {
   cacheDir?: string;
   licensePath?: string;
+  licenseSnapshotPath?: string;
   machineFilePath?: string;
   offlineTokenPath?: string;
   lastSeenTimestampPath?: string;
@@ -343,6 +344,8 @@ export interface LicenseSeatAdminSnapshot {
   state: LicenseSeatState;
   runtime: LicenseSeatAdminRuntime;
   signingKeyId?: string;
+  trustedLicense?: ValidationResult['license'];
+  trustedLicenseSource?: 'snapshot_file' | 'cached_license';
   offlineToken?: OfflineToken;
   machineFile?: MachineFile;
   machineFileVerification?: MachineFileVerificationResult;

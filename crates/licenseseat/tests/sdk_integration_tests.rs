@@ -58,6 +58,13 @@ fn test_config(base_url: &str) -> Config {
     }
 }
 
+fn cache_path_for(prefix: &str, key: &str) -> std::path::PathBuf {
+    dirs::cache_dir()
+        .expect("cache dir")
+        .join("licenseseat")
+        .join(format!("{prefix}{key}.json"))
+}
+
 fn entitlement_json(key: &str) -> serde_json::Value {
     json!({
         "key": key,
@@ -273,7 +280,7 @@ fn build_machine_file_fixture_with_options(
             "grace_period": 3600,
             "lic": license_key,
             "kid": "key-2026",
-            "sdk_version": "0.5.2"
+            "sdk_version": "0.5.3"
         },
         "data": {
             "type": "machines",
@@ -962,6 +969,10 @@ async fn test_heartbeat_refreshes_snapshot_for_offline_restore() {
     assert_eq!(heartbeat.license.plan_key, "pro");
     assert_eq!(heartbeat.license.mode, "named_user");
     assert_eq!(heartbeat.license.active_entitlements.len(), 2);
+    let snapshot_path = cache_path_for(&online_config.storage_prefix, "license_snapshot");
+    assert!(snapshot_path.exists());
+    std::fs::remove_file(&snapshot_path).unwrap();
+    assert!(!snapshot_path.exists());
 
     let machine_file = sdk
         .checkout_machine_file(license_key, Some(fingerprint), Some(30))
@@ -997,6 +1008,7 @@ async fn test_heartbeat_refreshes_snapshot_for_offline_restore() {
         "pro-features"
     );
     assert_eq!(validation.license.active_entitlements[1].key, "team-sync");
+    assert!(snapshot_path.exists());
 }
 
 #[tokio::test]
@@ -1587,7 +1599,8 @@ async fn test_verify_machine_file_and_restore_offline() {
 
 #[cfg(feature = "offline")]
 #[tokio::test]
-async fn test_restore_offline_preserves_activation_snapshot_without_online_validation() {
+async fn test_restore_offline_preserves_activation_metadata_without_online_validation_even_when_snapshot_file_is_missing()
+ {
     let server = MockServer::start().await;
     let license_key = "TEST-LICENSE-KEY";
     let fingerprint = "stable-fingerprint-activation-only";
@@ -1629,6 +1642,10 @@ async fn test_restore_offline_preserves_activation_snapshot_without_online_valid
     let sdk = LicenseSeat::new(online_config.clone());
     sdk.activate(license_key).await.unwrap();
     assert!(matches!(sdk.status(), LicenseStatus::Pending { .. }));
+    let snapshot_path = cache_path_for(&online_config.storage_prefix, "license_snapshot");
+    assert!(snapshot_path.exists());
+    std::fs::remove_file(&snapshot_path).unwrap();
+    assert!(!snapshot_path.exists());
     let machine_file = sdk
         .checkout_machine_file(license_key, Some(fingerprint), Some(30))
         .await
@@ -1663,11 +1680,13 @@ async fn test_restore_offline_preserves_activation_snapshot_without_online_valid
         validation.license.active_entitlements[0].key,
         "pro-features"
     );
+    assert!(snapshot_path.exists());
 }
 
 #[cfg(feature = "offline")]
 #[tokio::test]
-async fn test_restore_offline_preserves_cached_license_metadata_without_embedded_license() {
+async fn test_restore_offline_preserves_cached_license_metadata_without_embedded_license_even_when_snapshot_file_is_missing()
+ {
     let server = MockServer::start().await;
     let license_key = "TEST-LICENSE-KEY";
     let fingerprint = "stable-fingerprint-123";
@@ -1711,6 +1730,10 @@ async fn test_restore_offline_preserves_cached_license_metadata_without_embedded
     assert_eq!(online_validation.license.plan_key, "pro");
     assert_eq!(online_validation.license.product.slug, "test-product");
     assert_eq!(online_validation.license.active_entitlements.len(), 2);
+    let snapshot_path = cache_path_for(&online_config.storage_prefix, "license_snapshot");
+    assert!(snapshot_path.exists());
+    std::fs::remove_file(&snapshot_path).unwrap();
+    assert!(!snapshot_path.exists());
 
     let machine_file = sdk
         .checkout_machine_file(license_key, Some(fingerprint), Some(30))
@@ -1746,6 +1769,7 @@ async fn test_restore_offline_preserves_cached_license_metadata_without_embedded
         "pro-features"
     );
     assert_eq!(validation.license.active_entitlements[1].key, "api-access");
+    assert!(snapshot_path.exists());
 }
 
 #[cfg(feature = "offline")]
