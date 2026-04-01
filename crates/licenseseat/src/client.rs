@@ -177,6 +177,8 @@ impl LicenseSeat {
 
         match self.post::<ActivationResponse>(&path, Some(body)).await {
             Ok(activation) => {
+                self.inner.cache.set_license_snapshot(&activation.license)?;
+
                 let license = License {
                     license_key: license_key.to_string(),
                     device_id: activation.device_id,
@@ -247,6 +249,9 @@ impl LicenseSeat {
         match self.post::<ValidationResult>(&path, body).await {
             Ok(mut result) => {
                 result.offline = false;
+                if result.valid {
+                    self.inner.cache.set_license_snapshot(&result.license)?;
+                }
                 self.inner.cache.update_validation(&result)?;
                 self.inner
                     .cache
@@ -434,6 +439,7 @@ impl LicenseSeat {
 
         match self.post::<HeartbeatResponse>(&path, Some(body)).await {
             Ok(response) => {
+                self.inner.cache.set_license_snapshot(&response.license)?;
                 self.set_online(true);
                 self.set_last_heartbeat(Some(response.clone()));
                 self.set_last_heartbeat_error(None);
@@ -595,11 +601,13 @@ impl LicenseSeat {
     }
 
     /// Get the cached offline token, if one has been stored.
+    #[cfg(feature = "offline")]
     pub fn current_offline_token(&self) -> Option<OfflineTokenResponse> {
         self.inner.cache.get_offline_token()
     }
 
     /// Get the cached machine file, if one has been stored.
+    #[cfg(feature = "offline")]
     pub fn current_machine_file(&self) -> Option<MachineFile> {
         self.inner.cache.get_machine_file()
     }
@@ -620,6 +628,7 @@ impl LicenseSeat {
     }
 
     /// Get a cached signing key by key id.
+    #[cfg(feature = "offline")]
     pub fn cached_signing_key(&self, key_id: &str) -> Option<SigningKeyResponse> {
         self.inner.cache.get_signing_key(key_id)
     }
@@ -1521,6 +1530,7 @@ impl LicenseSeat {
     }
 
     /// Verify a machine file locally and emit the standard SDK verification events.
+    #[cfg(feature = "offline")]
     pub fn verify_machine_file(
         &self,
         machine_file: &MachineFile,
@@ -1532,6 +1542,7 @@ impl LicenseSeat {
     }
 
     /// Verify a machine file locally without emitting SDK events.
+    #[cfg(feature = "offline")]
     pub fn inspect_machine_file(
         &self,
         machine_file: &MachineFile,
@@ -1632,6 +1643,16 @@ impl LicenseSeat {
                     let mut result = crate::offline::machine_file_to_validation_result(
                         verify_result.payload.as_ref().unwrap(),
                     );
+                    if verify_result
+                        .payload
+                        .as_ref()
+                        .is_some_and(|payload| payload.license.is_none())
+                    {
+                        enrich_machine_file_validation_from_snapshot(
+                            &mut result,
+                            self.inner.cache.get_license_snapshot().as_ref(),
+                        );
+                    }
                     self.finalize_offline_validation(&mut result)?;
                     self.emit(Event::with_validation(
                         EventKind::OfflineValidationSuccess,
@@ -2378,6 +2399,27 @@ fn offline_invalid_result(code: Option<String>, message: Option<String>) -> Vali
     }
 }
 
+#[cfg(feature = "offline")]
+fn enrich_machine_file_validation_from_snapshot(
+    result: &mut ValidationResult,
+    snapshot: Option<&LicenseResponse>,
+) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+
+    if snapshot.key != result.license.key {
+        return;
+    }
+
+    let fallback_expires_at = result.license.expires_at;
+    let mut license = snapshot.clone();
+    if fallback_expires_at.is_some() {
+        license.expires_at = fallback_expires_at;
+    }
+    result.license = license;
+}
+
 fn default_validation_status() -> ValidationResult {
     ValidationResult {
         object: "validation_result".into(),
@@ -2431,6 +2473,7 @@ fn is_revocation_code(code: Option<&str>) -> bool {
     )
 }
 
+#[cfg(feature = "offline")]
 fn parse_rfc3339(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()

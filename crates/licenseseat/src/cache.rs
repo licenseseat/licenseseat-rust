@@ -5,7 +5,7 @@
 //! tauri-plugin-store for better cross-platform support.
 
 use crate::error::{Error, Result};
-use crate::models::{License, ValidationResult};
+use crate::models::{License, LicenseResponse, ValidationResult};
 use std::path::PathBuf;
 
 /// Cache for persisting license data.
@@ -91,26 +91,41 @@ impl LicenseCache {
         Ok(())
     }
 
+    /// Store the last trusted license snapshot returned by the server.
+    pub fn set_license_snapshot(&self, license: &LicenseResponse) -> Result<()> {
+        self.set("license_snapshot", license)
+    }
+
+    /// Get the last trusted cached license snapshot.
+    #[cfg(feature = "offline")]
+    pub fn get_license_snapshot(&self) -> Option<LicenseResponse> {
+        self.get("license_snapshot")
+    }
+
     // ========================================================================
     // Offline token methods
     // ========================================================================
 
     /// Store the offline token.
+    #[cfg(feature = "offline")]
     pub fn set_offline_token(&self, token: &crate::models::OfflineTokenResponse) -> Result<()> {
         self.set("offline_token", token)
     }
 
     /// Get the cached offline token.
+    #[cfg(feature = "offline")]
     pub fn get_offline_token(&self) -> Option<crate::models::OfflineTokenResponse> {
         self.get("offline_token")
     }
 
     /// Store the machine file.
+    #[cfg(feature = "offline")]
     pub fn set_machine_file(&self, machine_file: &crate::models::MachineFile) -> Result<()> {
         self.set("machine_file", machine_file)
     }
 
     /// Get the cached machine file.
+    #[cfg(feature = "offline")]
     pub fn get_machine_file(&self) -> Option<crate::models::MachineFile> {
         self.get("machine_file")
     }
@@ -120,6 +135,7 @@ impl LicenseCache {
     // ========================================================================
 
     /// Store a signing key.
+    #[cfg(feature = "offline")]
     pub fn set_signing_key(
         &self,
         key_id: &str,
@@ -129,6 +145,7 @@ impl LicenseCache {
     }
 
     /// Get a cached signing key.
+    #[cfg(feature = "offline")]
     pub fn get_signing_key(&self, key_id: &str) -> Option<crate::models::SigningKeyResponse> {
         self.get(&format!("signing_key_{}", key_id))
     }

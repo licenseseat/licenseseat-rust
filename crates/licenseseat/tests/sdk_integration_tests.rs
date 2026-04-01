@@ -58,7 +58,65 @@ fn test_config(base_url: &str) -> Config {
     }
 }
 
+fn entitlement_json(key: &str) -> serde_json::Value {
+    json!({
+        "key": key,
+        "expires_at": null,
+        "metadata": null
+    })
+}
+
+fn license_json(
+    license_key: &str,
+    status: &str,
+    plan_key: &str,
+    mode: &str,
+    entitlements: &[&str],
+    product_name: &str,
+) -> serde_json::Value {
+    json!({
+        "type": "licenses",
+        "object": "license",
+        "key": license_key,
+        "status": status,
+        "starts_at": null,
+        "expires_at": null,
+        "mode": mode,
+        "plan_key": plan_key,
+        "seat_limit": 5,
+        "active_seats": 1,
+        "active_entitlements": entitlements
+            .iter()
+            .map(|key| entitlement_json(key))
+            .collect::<Vec<_>>(),
+        "metadata": null,
+        "product": {
+            "slug": "test-product",
+            "name": product_name
+        }
+    })
+}
+
 fn activation_response(license_key: &str, device_id: &str) -> serde_json::Value {
+    activation_response_with_license(
+        license_key,
+        device_id,
+        license_json(
+            license_key,
+            "active",
+            "pro",
+            "hardware_locked",
+            &[],
+            "Test App",
+        ),
+    )
+}
+
+fn activation_response_with_license(
+    license_key: &str,
+    device_id: &str,
+    license: serde_json::Value,
+) -> serde_json::Value {
     json!({
         "object": "activation",
         "id": "act-12345-uuid",
@@ -69,23 +127,7 @@ fn activation_response(license_key: &str, device_id: &str) -> serde_json::Value 
         "deactivated_at": null,
         "ip_address": "127.0.0.1",
         "metadata": null,
-        "license": {
-            "object": "license",
-            "key": license_key,
-            "status": "active",
-            "starts_at": null,
-            "expires_at": null,
-            "mode": "hardware_locked",
-            "plan_key": "pro",
-            "seat_limit": 5,
-            "active_seats": 1,
-            "active_entitlements": [],
-            "metadata": null,
-            "product": {
-                "slug": "test-product",
-                "name": "Test App"
-            }
-        }
+        "license": license
     })
 }
 
@@ -95,23 +137,7 @@ fn validation_response(valid: bool, license_key: &str) -> serde_json::Value {
         "object": "validation_result",
         "valid": valid,
         "warnings": null,
-        "license": {
-            "object": "license",
-            "key": license_key,
-            "status": status,
-            "starts_at": null,
-            "expires_at": null,
-            "mode": "hardware_locked",
-            "plan_key": "pro",
-            "seat_limit": 5,
-            "active_seats": 1,
-            "active_entitlements": [],
-            "metadata": null,
-            "product": {
-                "slug": "test-product",
-                "name": "Test App"
-            }
-        },
+        "license": license_json(license_key, status, "pro", "hardware_locked", &[], "Test App"),
         "activation": null
     });
     if valid {
@@ -131,34 +157,14 @@ fn validation_with_entitlements(license_key: &str) -> serde_json::Value {
         "code": null,
         "message": null,
         "warnings": null,
-        "license": {
-            "object": "license",
-            "key": license_key,
-            "status": "active",
-            "starts_at": null,
-            "expires_at": null,
-            "mode": "hardware_locked",
-            "plan_key": "pro",
-            "seat_limit": 5,
-            "active_seats": 1,
-            "active_entitlements": [
-                {
-                    "key": "pro-features",
-                    "expires_at": null,
-                    "metadata": null
-                },
-                {
-                    "key": "api-access",
-                    "expires_at": null,
-                    "metadata": null
-                }
-            ],
-            "metadata": null,
-            "product": {
-                "slug": "test-product",
-                "name": "Test App"
-            }
-        },
+        "license": license_json(
+            license_key,
+            "active",
+            "pro",
+            "hardware_locked",
+            &["pro-features", "api-access"],
+            "Test App"
+        ),
         "activation": null
     })
 }
@@ -172,26 +178,21 @@ fn deactivation_response() -> serde_json::Value {
 }
 
 fn heartbeat_response(license_key: &str) -> serde_json::Value {
+    heartbeat_response_with_license(license_json(
+        license_key,
+        "active",
+        "pro",
+        "hardware_locked",
+        &[],
+        "Test App",
+    ))
+}
+
+fn heartbeat_response_with_license(license: serde_json::Value) -> serde_json::Value {
     json!({
         "object": "heartbeat",
         "received_at": Utc::now().to_rfc3339(),
-        "license": {
-            "object": "license",
-            "key": license_key,
-            "status": "active",
-            "starts_at": null,
-            "expires_at": null,
-            "mode": "hardware_locked",
-            "plan_key": "pro",
-            "seat_limit": 5,
-            "active_seats": 1,
-            "active_entitlements": [],
-            "metadata": null,
-            "product": {
-                "slug": "test-product",
-                "name": "Test App"
-            }
-        }
+        "license": license
     })
 }
 
@@ -244,13 +245,21 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
 }
 
 #[cfg(feature = "offline")]
-fn build_machine_file_fixture(license_key: &str, fingerprint: &str) -> (serde_json::Value, String) {
+fn build_machine_file_fixture_with_options(
+    license_key: &str,
+    fingerprint: &str,
+    embedded_license: Option<serde_json::Value>,
+) -> (serde_json::Value, String) {
     let signing_key = SigningKey::try_from(
         hex_to_bytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60").as_slice(),
     )
     .unwrap();
     let public_key_b64 =
         base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().as_bytes());
+
+    let included = embedded_license
+        .map(|license| json!([license]))
+        .unwrap_or_else(|| json!([]));
 
     let payload = json!({
         "meta": {
@@ -264,7 +273,7 @@ fn build_machine_file_fixture(license_key: &str, fingerprint: &str) -> (serde_js
             "grace_period": 3600,
             "lic": license_key,
             "kid": "key-2026",
-            "sdk_version": "0.5.1"
+            "sdk_version": "0.5.2"
         },
         "data": {
             "type": "machines",
@@ -283,32 +292,7 @@ fn build_machine_file_fixture(license_key: &str, fingerprint: &str) -> (serde_js
                 }
             }
         },
-        "included": [
-            {
-                "type": "licenses",
-                "object": "license",
-                "key": license_key,
-                "status": "active",
-                "starts_at": null,
-                "expires_at": null,
-                "mode": "hardware_locked",
-                "plan_key": "pro",
-                "seat_limit": 5,
-                "active_seats": 1,
-                "active_entitlements": [
-                    {
-                        "key": "pro-features",
-                        "expires_at": null,
-                        "metadata": null
-                    }
-                ],
-                "metadata": null,
-                "product": {
-                    "slug": "test-product",
-                    "name": "Test Product"
-                }
-            }
-        ]
+        "included": included
     });
 
     let payload_bytes = serde_json::to_vec(&payload).unwrap();
@@ -363,6 +347,39 @@ fn build_machine_file_fixture(license_key: &str, fingerprint: &str) -> (serde_js
         }),
         public_key_b64,
     )
+}
+
+#[cfg(feature = "offline")]
+fn build_machine_file_fixture(license_key: &str, fingerprint: &str) -> (serde_json::Value, String) {
+    build_machine_file_fixture_with_options(
+        license_key,
+        fingerprint,
+        Some(license_json(
+            license_key,
+            "active",
+            "pro",
+            "hardware_locked",
+            &["pro-features"],
+            "Test Product",
+        )),
+    )
+}
+
+#[cfg(feature = "offline")]
+fn build_machine_file_fixture_without_license(
+    license_key: &str,
+    fingerprint: &str,
+) -> (serde_json::Value, String) {
+    build_machine_file_fixture_with_options(license_key, fingerprint, None)
+}
+
+#[cfg(feature = "offline")]
+fn build_machine_file_fixture_with_embedded_license(
+    license_key: &str,
+    fingerprint: &str,
+    embedded_license: serde_json::Value,
+) -> (serde_json::Value, String) {
+    build_machine_file_fixture_with_options(license_key, fingerprint, Some(embedded_license))
 }
 
 // ============================================================================
@@ -878,6 +895,108 @@ async fn test_heartbeat_success() {
 
     let result = sdk.heartbeat().await;
     assert!(result.is_ok());
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn test_heartbeat_refreshes_snapshot_for_offline_restore() {
+    let server = MockServer::start().await;
+    let license_key = "TEST-LICENSE-KEY";
+    let fingerprint = "stable-fingerprint-heartbeat-snapshot";
+    let activation_license = license_json(
+        license_key,
+        "active",
+        "starter",
+        "hardware_locked",
+        &[],
+        "Activation Product",
+    );
+    let heartbeat_license = license_json(
+        license_key,
+        "active",
+        "pro",
+        "named_user",
+        &["pro-features", "team-sync"],
+        "Heartbeat Product",
+    );
+    let (machine_file_response, public_key_b64) =
+        build_machine_file_fixture_without_license(license_key, fingerprint);
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response_with_license(
+                license_key,
+                fingerprint,
+                activation_license,
+            )),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/heartbeat"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(heartbeat_response_with_license(heartbeat_license)),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/products/test-product/licenses/TEST-LICENSE-KEY/machine-file",
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
+        .mount(&server)
+        .await;
+
+    let mut online_config = test_config(&server.uri());
+    online_config.device_identifier = Some(fingerprint.into());
+    online_config.signing_public_key = Some(public_key_b64);
+
+    let sdk = LicenseSeat::new(online_config.clone());
+    sdk.activate(license_key).await.unwrap();
+    assert!(matches!(sdk.status(), LicenseStatus::Pending { .. }));
+    let heartbeat = sdk.heartbeat().await.unwrap();
+    assert_eq!(heartbeat.license.plan_key, "pro");
+    assert_eq!(heartbeat.license.mode, "named_user");
+    assert_eq!(heartbeat.license.active_entitlements.len(), 2);
+
+    let machine_file = sdk
+        .checkout_machine_file(license_key, Some(fingerprint), Some(30))
+        .await
+        .unwrap();
+    let verification = sdk
+        .verify_machine_file(
+            &machine_file,
+            online_config.signing_public_key.as_deref(),
+            Some(license_key),
+            Some(fingerprint),
+        )
+        .unwrap();
+    assert!(verification.valid);
+    assert!(verification.payload.as_ref().unwrap().license.is_none());
+
+    let mut offline_config = online_config.clone();
+    offline_config.api_base_url = "http://127.0.0.1:9".into();
+    let restored_sdk = LicenseSeat::new(offline_config);
+    let restore = restored_sdk.restore_license().await;
+
+    assert!(restore.restored);
+    assert!(matches!(restore.status, LicenseStatus::OfflineValid { .. }));
+    let validation = restore.validation.as_ref().unwrap();
+    assert!(validation.valid);
+    assert!(validation.offline);
+    assert_eq!(validation.license.plan_key, "pro");
+    assert_eq!(validation.license.mode, "named_user");
+    assert_eq!(validation.license.product.name, "Heartbeat Product");
+    assert_eq!(validation.license.active_entitlements.len(), 2);
+    assert_eq!(
+        validation.license.active_entitlements[0].key,
+        "pro-features"
+    );
+    assert_eq!(validation.license.active_entitlements[1].key, "team-sync");
 }
 
 #[tokio::test]
@@ -1464,6 +1583,270 @@ async fn test_verify_machine_file_and_restore_offline() {
     assert!(matches!(restore.status, LicenseStatus::OfflineValid { .. }));
     assert!(restore.validation.as_ref().unwrap().valid);
     assert!(restore.validation.as_ref().unwrap().offline);
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn test_restore_offline_preserves_activation_snapshot_without_online_validation() {
+    let server = MockServer::start().await;
+    let license_key = "TEST-LICENSE-KEY";
+    let fingerprint = "stable-fingerprint-activation-only";
+    let activation_license = license_json(
+        license_key,
+        "active",
+        "pro",
+        "named_user",
+        &["pro-features"],
+        "Test App",
+    );
+    let (machine_file_response, public_key_b64) =
+        build_machine_file_fixture_without_license(license_key, fingerprint);
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response_with_license(
+                license_key,
+                fingerprint,
+                activation_license,
+            )),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/products/test-product/licenses/TEST-LICENSE-KEY/machine-file",
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
+        .mount(&server)
+        .await;
+
+    let mut online_config = test_config(&server.uri());
+    online_config.device_identifier = Some(fingerprint.into());
+    online_config.signing_public_key = Some(public_key_b64);
+
+    let sdk = LicenseSeat::new(online_config.clone());
+    sdk.activate(license_key).await.unwrap();
+    assert!(matches!(sdk.status(), LicenseStatus::Pending { .. }));
+    let machine_file = sdk
+        .checkout_machine_file(license_key, Some(fingerprint), Some(30))
+        .await
+        .unwrap();
+    let verification = sdk
+        .verify_machine_file(
+            &machine_file,
+            online_config.signing_public_key.as_deref(),
+            Some(license_key),
+            Some(fingerprint),
+        )
+        .unwrap();
+    assert!(verification.valid);
+    assert!(verification.payload.as_ref().unwrap().license.is_none());
+
+    let mut offline_config = online_config.clone();
+    offline_config.api_base_url = "http://127.0.0.1:9".into();
+    let restored_sdk = LicenseSeat::new(offline_config);
+    let restore = restored_sdk.restore_license().await;
+
+    assert!(restore.restored);
+    assert!(matches!(restore.status, LicenseStatus::OfflineValid { .. }));
+    let validation = restore.validation.as_ref().unwrap();
+    assert!(validation.valid);
+    assert!(validation.offline);
+    assert_eq!(validation.license.plan_key, "pro");
+    assert_eq!(validation.license.mode, "named_user");
+    assert_eq!(validation.license.product.slug, "test-product");
+    assert_eq!(validation.license.product.name, "Test App");
+    assert_eq!(validation.license.active_entitlements.len(), 1);
+    assert_eq!(
+        validation.license.active_entitlements[0].key,
+        "pro-features"
+    );
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn test_restore_offline_preserves_cached_license_metadata_without_embedded_license() {
+    let server = MockServer::start().await;
+    let license_key = "TEST-LICENSE-KEY";
+    let fingerprint = "stable-fingerprint-123";
+    let (machine_file_response, public_key_b64) =
+        build_machine_file_fixture_without_license(license_key, fingerprint);
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response(license_key, fingerprint)),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/products/test-product/licenses/TEST-LICENSE-KEY/validate",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(validation_with_entitlements(license_key)),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/products/test-product/licenses/TEST-LICENSE-KEY/machine-file",
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
+        .mount(&server)
+        .await;
+
+    let mut online_config = test_config(&server.uri());
+    online_config.device_identifier = Some(fingerprint.into());
+    online_config.signing_public_key = Some(public_key_b64);
+
+    let sdk = LicenseSeat::new(online_config.clone());
+    sdk.activate(license_key).await.unwrap();
+
+    let online_validation = sdk.validate().await.unwrap();
+    assert_eq!(online_validation.license.plan_key, "pro");
+    assert_eq!(online_validation.license.product.slug, "test-product");
+    assert_eq!(online_validation.license.active_entitlements.len(), 2);
+
+    let machine_file = sdk
+        .checkout_machine_file(license_key, Some(fingerprint), Some(30))
+        .await
+        .unwrap();
+    let verification = sdk
+        .verify_machine_file(
+            &machine_file,
+            online_config.signing_public_key.as_deref(),
+            Some(license_key),
+            Some(fingerprint),
+        )
+        .unwrap();
+    assert!(verification.valid);
+    assert!(verification.payload.as_ref().unwrap().license.is_none());
+
+    let mut offline_config = online_config.clone();
+    offline_config.api_base_url = "http://127.0.0.1:9".into();
+    let restored_sdk = LicenseSeat::new(offline_config);
+    let restore = restored_sdk.restore_license().await;
+
+    assert!(restore.restored);
+    assert!(matches!(restore.status, LicenseStatus::OfflineValid { .. }));
+    let validation = restore.validation.as_ref().unwrap();
+    assert!(validation.valid);
+    assert!(validation.offline);
+    assert_eq!(validation.license.plan_key, "pro");
+    assert_eq!(validation.license.product.slug, "test-product");
+    assert_eq!(validation.license.product.name, "Test App");
+    assert_eq!(validation.license.active_entitlements.len(), 2);
+    assert_eq!(
+        validation.license.active_entitlements[0].key,
+        "pro-features"
+    );
+    assert_eq!(validation.license.active_entitlements[1].key, "api-access");
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn test_restore_offline_prefers_embedded_machine_file_license_over_cached_snapshot() {
+    let server = MockServer::start().await;
+    let license_key = "TEST-LICENSE-KEY";
+    let fingerprint = "stable-fingerprint-embedded-license";
+    let embedded_license = license_json(
+        license_key,
+        "active",
+        "starter",
+        "floating",
+        &["starter-features"],
+        "Embedded Product",
+    );
+    let (machine_file_response, public_key_b64) = build_machine_file_fixture_with_embedded_license(
+        license_key,
+        fingerprint,
+        embedded_license,
+    );
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response(license_key, fingerprint)),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/products/test-product/licenses/TEST-LICENSE-KEY/validate",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(validation_with_entitlements(license_key)),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/products/test-product/licenses/TEST-LICENSE-KEY/machine-file",
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
+        .mount(&server)
+        .await;
+
+    let mut online_config = test_config(&server.uri());
+    online_config.device_identifier = Some(fingerprint.into());
+    online_config.signing_public_key = Some(public_key_b64);
+
+    let sdk = LicenseSeat::new(online_config.clone());
+    sdk.activate(license_key).await.unwrap();
+    let online_validation = sdk.validate().await.unwrap();
+    assert_eq!(online_validation.license.plan_key, "pro");
+    assert_eq!(online_validation.license.mode, "hardware_locked");
+    assert_eq!(online_validation.license.active_entitlements.len(), 2);
+    let machine_file = sdk
+        .checkout_machine_file(license_key, Some(fingerprint), Some(30))
+        .await
+        .unwrap();
+    let verification = sdk
+        .verify_machine_file(
+            &machine_file,
+            online_config.signing_public_key.as_deref(),
+            Some(license_key),
+            Some(fingerprint),
+        )
+        .unwrap();
+    assert!(verification.valid);
+    assert_eq!(
+        verification
+            .payload
+            .as_ref()
+            .unwrap()
+            .license
+            .as_ref()
+            .unwrap()
+            .plan_key,
+        "starter"
+    );
+
+    let mut offline_config = online_config.clone();
+    offline_config.api_base_url = "http://127.0.0.1:9".into();
+    let restored_sdk = LicenseSeat::new(offline_config);
+    let restore = restored_sdk.restore_license().await;
+
+    assert!(restore.restored);
+    assert!(matches!(restore.status, LicenseStatus::OfflineValid { .. }));
+    let validation = restore.validation.as_ref().unwrap();
+    assert!(validation.valid);
+    assert!(validation.offline);
+    assert_eq!(validation.license.plan_key, "starter");
+    assert_eq!(validation.license.mode, "floating");
+    assert_eq!(validation.license.product.name, "Embedded Product");
+    assert_eq!(validation.license.active_entitlements.len(), 1);
+    assert_eq!(
+        validation.license.active_entitlements[0].key,
+        "starter-features"
+    );
 }
 
 // ============================================================================

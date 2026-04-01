@@ -4,6 +4,15 @@
 
 - No unreleased changes yet.
 
+## [0.5.2] - 2026-04-01
+
+For a detailed technical note covering the root cause, implementation shape, regression coverage, and release verification, see [`docs/releases/0.5.2.md`](docs/releases/0.5.2.md) and [`docs/releases/offline-validation-metadata-preservation.md`](docs/releases/offline-validation-metadata-preservation.md).
+
+- Fixed offline machine-file restore so cached plan, entitlement, and product metadata are preserved instead of being downgraded to empty fallback values when the machine-file payload lacks an embedded license object.
+- Activation, validation, and heartbeat now refresh a trusted cached license snapshot, so offline restore can preserve plan, product, and entitlement metadata without changing the SDK's pending-before-validation status semantics.
+- Added dedicated regression coverage for offline restore with a valid machine file but no embedded license object, including activation-only, validated, and heartbeat-refreshed snapshot paths.
+- Added a technical note documenting the issue and fix in [`docs/releases/offline-validation-metadata-preservation.md`](docs/releases/offline-validation-metadata-preservation.md).
+
 ## [0.5.1] - 2026-03-31
 
 This release brings the Rust SDK and the Tauri plugin up to parity with the current C++ reference implementation, expands the public API for offline/manual workflows, and hardens the production defaults for mixed-SDK deployments.
