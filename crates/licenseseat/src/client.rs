@@ -185,6 +185,7 @@ impl LicenseSeat {
                     activation_id: activation.id,
                     activated_at: activation.activated_at,
                     last_validated: Utc::now(),
+                    trusted_license: Some(activation.license.clone()),
                     validation: None,
                 };
 
@@ -440,6 +441,7 @@ impl LicenseSeat {
         match self.post::<HeartbeatResponse>(&path, Some(body)).await {
             Ok(response) => {
                 self.inner.cache.set_license_snapshot(&response.license)?;
+                self.inner.cache.set_trusted_license(&response.license)?;
                 self.set_online(true);
                 self.set_last_heartbeat(Some(response.clone()));
                 self.set_last_heartbeat_error(None);
@@ -598,6 +600,20 @@ impl LicenseSeat {
     /// Get the current cached license.
     pub fn current_license(&self) -> Option<License> {
         self.inner.cache.get_license()
+    }
+
+    /// Get the last trusted rich license metadata cached for offline recovery.
+    #[cfg(feature = "offline")]
+    pub fn current_trusted_license(&self) -> Option<LicenseResponse> {
+        self.current_trusted_license_record()
+            .map(|(license, _)| license)
+    }
+
+    /// Get the source of the current trusted rich license metadata, if any.
+    #[cfg(feature = "offline")]
+    pub fn current_trusted_license_source(&self) -> Option<TrustedLicenseSource> {
+        self.current_trusted_license_record()
+            .map(|(_, source)| source)
     }
 
     /// Get the cached offline token, if one has been stored.
@@ -1648,10 +1664,24 @@ impl LicenseSeat {
                         .as_ref()
                         .is_some_and(|payload| payload.license.is_none())
                     {
-                        enrich_machine_file_validation_from_snapshot(
+                        let cached_trusted_license = self.inner.cache.get_trusted_license();
+                        if self.inner.cache.get_license_snapshot().is_none() {
+                            if let Some(trusted_license) = cached_trusted_license.as_ref() {
+                                self.inner.cache.set_license_snapshot(trusted_license)?;
+                            }
+                        }
+
+                        let enriched = enrich_machine_file_validation_from_trusted_sources(
                             &mut result,
                             self.inner.cache.get_license_snapshot().as_ref(),
+                            cached_trusted_license.as_ref(),
                         );
+                        if !enriched {
+                            warn!(
+                                "Verified machine file for {} omitted embedded license data and no trusted metadata fallback was available",
+                                result.license.key
+                            );
+                        }
                     }
                     self.finalize_offline_validation(&mut result)?;
                     self.emit(Event::with_validation(
@@ -1833,6 +1863,18 @@ impl LicenseSeat {
 
     fn lock_snapshot<T: Clone>(&self, mutex: &Mutex<Option<T>>) -> Option<T> {
         mutex.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    #[cfg(feature = "offline")]
+    fn current_trusted_license_record(&self) -> Option<(LicenseResponse, TrustedLicenseSource)> {
+        if let Some(license) = self.inner.cache.get_license_snapshot() {
+            return Some((license, TrustedLicenseSource::SnapshotFile));
+        }
+
+        self.inner
+            .cache
+            .get_trusted_license()
+            .map(|license| (license, TrustedLicenseSource::CachedLicense))
     }
 
     fn set_last_heartbeat(&self, response: Option<HeartbeatResponse>) {
@@ -2400,24 +2442,33 @@ fn offline_invalid_result(code: Option<String>, message: Option<String>) -> Vali
 }
 
 #[cfg(feature = "offline")]
-fn enrich_machine_file_validation_from_snapshot(
+fn enrich_machine_file_validation_from_trusted_sources(
     result: &mut ValidationResult,
     snapshot: Option<&LicenseResponse>,
-) {
-    let Some(snapshot) = snapshot else {
-        return;
+    cached_trusted_license: Option<&LicenseResponse>,
+) -> bool {
+    let trusted_license = snapshot
+        .filter(|candidate| candidate.key == result.license.key)
+        .or_else(|| cached_trusted_license.filter(|candidate| candidate.key == result.license.key));
+
+    let Some(trusted_license) = trusted_license else {
+        return false;
     };
 
-    if snapshot.key != result.license.key {
-        return;
-    }
-
+    let fallback_metadata = result.license.metadata.clone();
     let fallback_expires_at = result.license.expires_at;
-    let mut license = snapshot.clone();
+    let mut license = trusted_license.clone();
     if fallback_expires_at.is_some() {
         license.expires_at = fallback_expires_at;
     }
+    if let Some(fallback_metadata) = fallback_metadata {
+        let metadata = license.metadata.get_or_insert_with(HashMap::new);
+        for (key, value) in fallback_metadata {
+            metadata.entry(key).or_insert(value);
+        }
+    }
     result.license = license;
+    true
 }
 
 fn default_validation_status() -> ValidationResult {

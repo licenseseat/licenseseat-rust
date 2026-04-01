@@ -29,21 +29,9 @@ This was especially visible in desktop apps that map plan and entitlement state 
 
 ## Root Cause
 
-There were two related issues.
+There were two phases to the problem.
 
-### 1. The SDK did not retain a trusted license snapshot early enough, or refresh it on all online license-bearing responses
-
-On activation, the SDK cached a `License` object with:
-
-- activation id
-- device id
-- activated timestamp
-
-but it did not separately retain the server-returned embedded license snapshot for later offline enrichment.
-
-That meant offline restore had no trusted plan or entitlement metadata to fall back to unless a separate online validation had already run. It also meant long-running apps could miss fresher online metadata if heartbeat was the most recent successful online response.
-
-### 2. Offline machine-file fallback could overwrite richer cached state
+### 1. The original metadata-loss bug
 
 During offline validation:
 
@@ -57,9 +45,23 @@ If the machine-file payload did not include an embedded license object, the conv
 - empty `active_entitlements`
 - empty product metadata
 
-That degraded validation result was then written back to the cached license state, replacing the richer online-derived metadata.
+That degraded validation result was then written back to the cached license state, replacing richer online-derived metadata.
 
 So the machine file itself was still valid, but the persisted cached validation became materially less informative.
+
+### 2. The remaining hardening gap discovered after `0.5.2`
+
+`0.5.2` introduced a dedicated trusted `license_snapshot` cache file and used it to enrich stripped
+machine-file results.
+
+That was the right direction, but it still left a single-point dependency:
+
+- if the machine file was stripped
+- and the dedicated `license_snapshot` file was missing
+- offline restore could still fall back to the blank synthesized license
+
+In other words, the SDK had the right idea but not yet the full invariant. Tier preservation still
+depended too heavily on one sidecar cache file.
 
 ## Why It Happened In Practice
 
@@ -73,21 +75,29 @@ In that case, the SDK had enough information to prove validity, but not enough i
 
 ## SDK Fix
 
-The SDK was changed in two places.
+The final SDK fix now guarantees trusted metadata durability in two layers.
 
-### 1. Cache and refresh a trusted license snapshot from online license-bearing responses
+### 1. Trusted rich license metadata is persisted on the cached license record itself
+
+Successful online license-bearing responses now update:
+
+- the dedicated `license_snapshot` cache file
+- the cached `license.json` record via `trusted_license`
 
 Practical effect:
 
-- the SDK keeps the activation response's embedded license snapshot for later offline enrichment
-- the SDK refreshes that trusted snapshot again on successful validation and heartbeat responses
+- trusted plan and entitlement metadata survives even if the sidecar snapshot file disappears
 - activation still remains `Pending` until validation runs
-- offline restore can preserve plan and entitlement metadata even if the first offline recovery happens before a separate online validation round
-- long-running apps can carry forward fresher license metadata into offline restore even when heartbeat is the most recent online round-trip
+- validation and heartbeat can continue refreshing the trusted metadata source without changing public status semantics
 
-### 2. Preserve richer cached metadata during offline validation
+### 2. Offline restore now uses an explicit trusted-source order
 
-Offline validation now preserves the last trusted cached license snapshot when a verified machine-file payload omits the embedded license object.
+For stripped machine-file payloads, offline restore now prefers:
+
+1. embedded machine-file license
+2. snapshot-file metadata
+3. trusted cached metadata on `license.json`
+4. blank fallback only as a true last resort
 
 The restore path preserves or restores fields such as:
 
@@ -97,21 +107,29 @@ The restore path preserves or restores fields such as:
 - `product.name`
 - seat metadata
 - license mode
-- timestamps and metadata when present in the trusted snapshot
+- timestamps and metadata when present in the trusted source
 
 Practical effect:
 
 - a valid paid license remains a valid paid license when the server is down
 - offline restore no longer downgrades the tier view to a lower plan solely because the machine file omitted embedded license data
-- embedded machine-file license data still wins when it is present; the cache is only used to hydrate stripped fallback results
+- embedded machine-file license data still wins when it is present
+
+### 3. The SDK now self-heals the snapshot file
+
+If trusted cached metadata exists on `license.json` but the dedicated `license_snapshot` file is
+missing, the SDK recreates the snapshot file before continuing offline validation.
+
+That does not invent metadata that was never seen online. It only restores durability for metadata
+the SDK already trusts.
 
 ## Regression Coverage Added
 
-A dedicated SDK integration test now covers the exact degraded path:
+Dedicated SDK integration coverage now covers the exact degraded production path:
 
-1. activate online
-2. optionally validate online and cache richer entitlements
-3. fetch a machine file without an embedded license object
+1. activate or validate or heartbeat online
+2. fetch a machine file without an embedded license object
+3. delete the dedicated `license_snapshot` file
 4. go offline
 5. restore from offline state
 6. assert that plan and entitlements are still preserved
@@ -119,9 +137,10 @@ A dedicated SDK integration test now covers the exact degraded path:
 Additional coverage verifies that:
 
 - activation remains `Pending` before validation
-- activation-only snapshots can still hydrate offline restore when the machine file omits its embedded license
-- heartbeat-refreshed snapshots can still hydrate offline restore when they are newer than activation state
-- embedded machine-file license objects are not overwritten by stale cached metadata
+- activation-only metadata can still hydrate offline restore when the machine file omits its embedded license
+- validation-refreshed metadata can still hydrate offline restore when the snapshot file is gone
+- heartbeat-refreshed metadata can still hydrate offline restore when it is newer than activation state
+- embedded machine-file license objects are not overwritten by cached metadata
 
 ## Downstream Impact
 
@@ -144,6 +163,11 @@ After this fix:
 
 The problem was not that offline verification failed.
 
-The problem was that offline verification could succeed while still erasing the cached plan and entitlement metadata that downstream apps rely on.
+The problem was that offline verification could succeed while still erasing the cached plan and entitlement metadata that downstream apps rely on, and the first snapshot-based fix still depended too much on a separate sidecar file.
 
-The fix was to retain a trusted license snapshot separately from validation state and use it only to hydrate stripped machine-file fallback results, without changing the SDK's activate-then-pending semantics.
+The final fix was:
+
+- keep trusted metadata separately from validation semantics
+- persist that trusted metadata on the cached license record itself
+- use embedded machine-file data first, then trusted metadata, and only fall back to blanks last
+- recreate the dedicated snapshot file when trusted cached metadata already exists

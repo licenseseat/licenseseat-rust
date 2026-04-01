@@ -38,7 +38,7 @@ Or manually:
 
 ```toml
 [dependencies]
-licenseseat = "0.5.2"
+licenseseat = "0.5.3"
 ```
 
 Offline support is included in the default build. If you disable default features

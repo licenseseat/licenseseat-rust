@@ -214,6 +214,12 @@ fn map_validation_license_response(
     }
 }
 
+impl From<licenseseat::LicenseResponse> for ValidationLicenseResponse {
+    fn from(license: licenseseat::LicenseResponse) -> Self {
+        map_validation_license_response(license)
+    }
+}
+
 fn map_activation_summary_response(activation: ActivationNested) -> ActivationSummaryResponse {
     ActivationSummaryResponse {
         object: activation.object,
@@ -782,6 +788,8 @@ pub struct AdminCachePathsResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub license_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub license_snapshot_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_file_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offline_token_path: Option<String>,
@@ -820,6 +828,10 @@ pub struct AdminSnapshotResponse {
     pub runtime: AdminRuntimeResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signing_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted_license: Option<ValidationLicenseResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted_license_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offline_token: Option<OfflineTokenResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -884,6 +896,7 @@ fn build_admin_cache_paths_response(
     AdminCachePathsResponse {
         cache_dir: cache_dir_for_config(config).map(|value| value.to_string_lossy().into_owned()),
         license_path: cache_path_for_key(config, "license"),
+        license_snapshot_path: cache_path_for_key(config, "license_snapshot"),
         machine_file_path: cache_path_for_key(config, "machine_file"),
         offline_token_path: cache_path_for_key(config, "offline_token"),
         last_seen_timestamp_path: cache_path_for_key(config, "last_seen_ts"),
@@ -901,6 +914,13 @@ fn map_admin_snapshot_response(
     sdk: &licenseseat::LicenseSeat,
     config: &licenseseat::Config,
 ) -> AdminSnapshotResponse {
+    let trusted_license = sdk.current_trusted_license().map(Into::into);
+    let trusted_license_source = sdk
+        .current_trusted_license_source()
+        .map(|source| match source {
+            licenseseat::TrustedLicenseSource::SnapshotFile => "snapshot_file".to_string(),
+            licenseseat::TrustedLicenseSource::CachedLicense => "cached_license".to_string(),
+        });
     let machine_file = sdk.current_machine_file();
     let signing_key_id = sdk
         .current_machine_file_key_id()
@@ -949,6 +969,8 @@ fn map_admin_snapshot_response(
             last_health_error: sdk.last_health_error(),
         },
         signing_key_id,
+        trusted_license,
+        trusted_license_source,
         offline_token: sdk.current_offline_token().map(Into::into),
         machine_file: machine_file.map(Into::into),
         machine_file_verification,
@@ -1624,13 +1646,15 @@ mod tests {
         let config = Config::new("pk_test_123", "demo-product")
             .with_storage_path(storage_path.clone())
             .with_debug(false);
+        let validation = sample_validation_result();
         let license = License {
             license_key: "TEST-KEY".into(),
             device_id: "device-123".into(),
             activation_id: "act_123".into(),
             activated_at: Utc::now(),
             last_validated: Utc::now(),
-            validation: Some(sample_validation_result()),
+            trusted_license: Some(validation.license.clone()),
+            validation: Some(validation),
         };
         write_cache_value(&storage_path, &config.storage_prefix, "license", &license);
 
@@ -1669,6 +1693,8 @@ mod tests {
         assert_eq!(snapshot.state.client_status, "inactive");
         assert!(!snapshot.runtime.is_auto_validating);
         assert!(!snapshot.runtime.is_heartbeat_running);
+        assert!(snapshot.trusted_license.is_none());
+        assert!(snapshot.trusted_license_source.is_none());
         assert!(snapshot.offline_token.is_none());
         assert!(snapshot.machine_file.is_none());
         assert!(snapshot.machine_file_verification.is_none());
@@ -1683,13 +1709,15 @@ mod tests {
             .with_debug(true);
         config.signing_key_id = Some("kid_123".into());
 
+        let validation = sample_validation_result();
         let license = License {
             license_key: "TEST-KEY".into(),
             device_id: "device-123".into(),
             activation_id: "act_123".into(),
             activated_at: Utc::now(),
             last_validated: Utc::now(),
-            validation: Some(sample_validation_result()),
+            trusted_license: Some(validation.license.clone()),
+            validation: Some(validation.clone()),
         };
         let offline_token = CoreOfflineTokenResponse {
             object: "offline_token".into(),
@@ -1774,6 +1802,17 @@ mod tests {
                 .map(|value| value.license_key.as_str()),
             Some("TEST-KEY")
         );
+        assert_eq!(
+            snapshot
+                .trusted_license
+                .as_ref()
+                .map(|value| value.plan_key.as_str()),
+            Some("pro")
+        );
+        assert_eq!(
+            snapshot.trusted_license_source.as_deref(),
+            Some("cached_license")
+        );
         assert!(snapshot.machine_file_verification.is_some());
         assert_eq!(snapshot.signing_key_id.as_deref(), Some("kid_123"));
         assert_eq!(
@@ -1783,6 +1822,70 @@ mod tests {
                 .map(|value| value.key_id.as_str()),
             Some("kid_123")
         );
+        assert!(snapshot.cache_paths.license_snapshot_path.is_some());
         assert!(snapshot.cache_paths.signing_key_path.is_some());
+    }
+
+    #[test]
+    fn test_admin_snapshot_prefers_snapshot_file_for_trusted_license() {
+        let storage_path = unique_storage_path("licenseseat-plugin-admin-snapshot-source-test");
+        let config = Config::new("pk_test_123", "demo-product")
+            .with_storage_path(storage_path.clone())
+            .with_debug(true);
+
+        let validation = sample_validation_result();
+        let license = License {
+            license_key: "TEST-KEY".into(),
+            device_id: "device-123".into(),
+            activation_id: "act_123".into(),
+            activated_at: Utc::now(),
+            last_validated: Utc::now(),
+            trusted_license: Some(validation.license.clone()),
+            validation: Some(validation),
+        };
+        let snapshot_license = licenseseat::LicenseResponse {
+            object: "license".into(),
+            key: "TEST-KEY".into(),
+            status: "active".into(),
+            starts_at: None,
+            expires_at: None,
+            mode: "named_user".into(),
+            plan_key: "enterprise".into(),
+            seat_limit: Some(5),
+            active_seats: 2,
+            active_entitlements: vec![licenseseat::Entitlement {
+                key: "enterprise".into(),
+                expires_at: None,
+                metadata: None,
+            }],
+            metadata: None,
+            product: licenseseat::Product {
+                slug: "enterprise-demo".into(),
+                name: "Enterprise Demo".into(),
+            },
+        };
+
+        write_cache_value(&storage_path, &config.storage_prefix, "license", &license);
+        write_cache_value(
+            &storage_path,
+            &config.storage_prefix,
+            "license_snapshot",
+            &snapshot_license,
+        );
+
+        let sdk = licenseseat::LicenseSeat::new(config.clone());
+        let snapshot = map_admin_snapshot_response(&sdk, &config);
+
+        assert_eq!(
+            snapshot
+                .trusted_license
+                .as_ref()
+                .map(|value| value.plan_key.as_str()),
+            Some("enterprise")
+        );
+        assert_eq!(
+            snapshot.trusted_license_source.as_deref(),
+            Some("snapshot_file")
+        );
     }
 }

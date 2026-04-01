@@ -16,7 +16,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! tauri-plugin-licenseseat = "0.5.2"
+//! tauri-plugin-licenseseat = "0.5.3"
 //! ```
 //!
 //! Register the plugin in your Tauri app:
