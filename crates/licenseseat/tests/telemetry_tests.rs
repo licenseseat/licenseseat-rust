@@ -25,6 +25,7 @@ fn test_config(base_url: &str, telemetry_enabled: bool) -> Config {
         product_slug: "test-product".into(),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
+        device_identifier: Some("device-123".into()),
         auto_validate_interval: Duration::from_secs(0),
         heartbeat_interval: Duration::from_secs(0),
         debug: true,

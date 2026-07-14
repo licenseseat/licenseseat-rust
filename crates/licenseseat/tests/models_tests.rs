@@ -2,9 +2,11 @@
 
 use chrono::{TimeZone, Utc};
 use licenseseat::{
-    ActivationOptions, Config, Entitlement, EntitlementReason, EntitlementStatus, LicenseStatus,
-    LicenseStatusDetails, OfflineFallbackMode,
+    ActivationOptions, Config, Entitlement, EntitlementReason, EntitlementStatus, LicenseResponse,
+    LicenseStatus, LicenseStatusDetails, MachineFilePayload, OfflineFallbackMode, Product,
+    TrustedLicenseSource,
 };
+use std::collections::HashMap;
 
 // ============================================================================
 // LicenseStatus Tests
@@ -200,6 +202,64 @@ fn test_entitlement_is_active() {
     assert!(entitlement.expires_at.unwrap() > Utc::now());
 }
 
+#[test]
+fn test_machine_file_payload_entitlement_check_enforces_grant_lifetime() {
+    let license = |status: &str, entitlement_expiry| LicenseResponse {
+        object: "license".into(),
+        key: "TEST-KEY".into(),
+        status: status.into(),
+        starts_at: None,
+        expires_at: None,
+        mode: "hardware_locked".into(),
+        plan_key: "pro".into(),
+        seat_limit: Some(1),
+        active_seats: 1,
+        active_entitlements: vec![Entitlement {
+            key: "pro-feature".into(),
+            expires_at: entitlement_expiry,
+            metadata: None,
+        }],
+        metadata: None,
+        product: Product {
+            slug: "test-product".into(),
+            name: "Test Product".into(),
+        },
+    };
+    let payload = |license| MachineFilePayload {
+        schema_version: 2,
+        issued: String::new(),
+        iat: 0,
+        expiry: String::new(),
+        exp: i64::MAX,
+        nbf: 0,
+        ttl: i64::MAX,
+        grace_period: 0,
+        license_key: "TEST-KEY".into(),
+        product_slug: "test-product".into(),
+        license_expires_at: None,
+        key_id: "test-key".into(),
+        sdk_version: None,
+        machine_id: "activation-id".into(),
+        fingerprint: "fingerprint".into(),
+        fingerprint_components: HashMap::new(),
+        device_name: String::new(),
+        platform: String::new(),
+        created_at: None,
+        metadata: HashMap::new(),
+        license: Some(license),
+    };
+
+    assert!(payload(license("active", None)).has_entitlement("pro-feature"));
+    assert!(!payload(license("revoked", None)).has_entitlement("pro-feature"));
+    assert!(
+        !payload(license(
+            "active",
+            Some(Utc::now() - chrono::Duration::seconds(1))
+        ))
+        .has_entitlement("pro-feature")
+    );
+}
+
 // ============================================================================
 // EntitlementStatus Tests
 // ============================================================================
@@ -273,6 +333,7 @@ fn test_entitlement_reason_variants() {
         EntitlementReason::NotFound,
         EntitlementReason::Expired,
         EntitlementReason::NoLicense,
+        EntitlementReason::InvalidLicense,
     ];
 
     // All reasons should be distinct
@@ -374,6 +435,15 @@ fn test_offline_fallback_mode_variants() {
             }
         }
     }
+}
+
+#[test]
+fn historical_trusted_source_discriminants_remain_stable() {
+    assert_eq!(TrustedLicenseSource::SnapshotFile as usize, 0);
+    assert_eq!(TrustedLicenseSource::CachedLicense as usize, 1);
+    assert_eq!(TrustedLicenseSource::OnlineResponse as usize, 2);
+    assert_eq!(TrustedLicenseSource::SignedOfflineArtifact as usize, 3);
+    assert_eq!(TrustedLicenseSource::FailClosedDenial as usize, 4);
 }
 
 #[test]

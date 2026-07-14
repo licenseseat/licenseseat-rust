@@ -2,7 +2,7 @@
 //!
 //! These tests mirror the auto-validation tests from Swift and C# SDKs.
 
-use licenseseat::{Config, EventKind, LicenseSeat};
+use licenseseat::{ActivationOptions, Config, EventKind, LicenseSeat};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,6 +28,7 @@ fn test_config(base_url: &str) -> Config {
         product_slug: "test-product".into(),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
+        device_identifier: Some("device-123".into()),
         auto_validate_interval: Duration::from_secs(0), // Disabled by default
         heartbeat_interval: Duration::from_secs(0),     // Disabled by default
         debug: true,
@@ -118,6 +119,68 @@ fn heartbeat_response() -> serde_json::Value {
     })
 }
 
+#[tokio::test]
+async fn background_heartbeat_reuses_an_activation_fingerprint_override() {
+    let server = MockServer::start().await;
+    let mut activation = activation_response();
+    activation["device_id"] = json!("custom-installation");
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(activation))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/heartbeat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(heartbeat_response()))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::try_new(Config {
+        heartbeat_interval: Duration::from_millis(10),
+        network_recheck_interval: Duration::ZERO,
+        offline_token_refresh_interval: Duration::ZERO,
+        max_retries: 0,
+        ..test_config(&server.uri())
+    })
+    .unwrap();
+    sdk.activate_with_options(
+        "TEST-KEY",
+        ActivationOptions {
+            fingerprint: Some("custom-installation".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let requests = server.received_requests().await.unwrap();
+            if requests
+                .iter()
+                .any(|request| request.url.path().ends_with("/heartbeat"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background heartbeat was not sent");
+    sdk.stop_background_tasks();
+
+    let requests = server.received_requests().await.unwrap();
+    let heartbeat = requests
+        .iter()
+        .find(|request| request.url.path().ends_with("/heartbeat"))
+        .expect("heartbeat request");
+    let body: serde_json::Value = serde_json::from_slice(&heartbeat.body).unwrap();
+    for field in ["fingerprint", "device_id", "device_fingerprint"] {
+        assert_eq!(body[field], "custom-installation");
+    }
+}
+
 // ============================================================================
 // Validation Timing Tests
 // ============================================================================
@@ -176,10 +239,15 @@ async fn test_validation_stores_result() {
 
     let sdk = LicenseSeat::new(test_config(&server.uri()));
 
-    // Before validation, no validation result
+    // Activation immediately establishes a successful online validation.
     sdk.activate("TEST-KEY").await.unwrap();
     let license_before = sdk.current_license().unwrap();
-    assert!(license_before.validation.is_none());
+    assert!(
+        license_before
+            .validation
+            .as_ref()
+            .is_some_and(|result| result.valid)
+    );
 
     // After validation, result is stored
     sdk.validate().await.unwrap();

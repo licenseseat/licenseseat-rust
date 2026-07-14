@@ -1,16 +1,13 @@
 ## Default Permission
 
-Default permissions for LicenseSeat plugin
+Least-privilege LicenseSeat lifecycle, status, and entitlement permissions
 
 #### This default permission set includes the following:
 
 - `allow-activate`
-- `allow-validate-key`
 - `allow-validate`
 - `allow-deactivate`
-- `allow-deactivate-key`
 - `allow-heartbeat`
-- `allow-heartbeat-key`
 - `allow-get-status`
 - `allow-get-client-status`
 - `allow-is-online`
@@ -22,17 +19,6 @@ Default permissions for LicenseSeat plugin
 - `allow-has-entitlement`
 - `allow-get-license`
 - `allow-get-state`
-- `allow-get-admin-snapshot`
-- `allow-get-latest-release`
-- `allow-list-releases`
-- `allow-generate-download-token`
-- `allow-generate-offline-token`
-- `allow-verify-offline-token`
-- `allow-checkout-machine-file`
-- `allow-fetch-signing-key`
-- `allow-sync-offline-assets`
-- `allow-verify-machine-file`
-- `allow-reset`
 
 ## Permission Table
 
@@ -793,6 +779,58 @@ Enables the verify_offline_token command without any pre-configured scope.
 <td>
 
 Denies the verify_offline_token command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`licenseseat:diagnostics`
+
+</td>
+<td>
+
+Health and detailed diagnostic state. The snapshot may contain license state, offline artifacts, and local filesystem paths, but never raw API or signing keys.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`licenseseat:advanced-lifecycle`
+
+</td>
+<td>
+
+Operations that target caller-supplied license/fingerprint pairs or destructively reset local state.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`licenseseat:offline-management`
+
+</td>
+<td>
+
+Raw offline artifact checkout, verification, refresh, and signing-key lookup commands.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`licenseseat:releases`
+
+</td>
+<td>
+
+Release discovery and license-bound download-token commands.
 
 </td>
 </tr>

@@ -1,7 +1,9 @@
 //! Device telemetry collection for analytics.
 //!
-//! Collects non-personally identifiable device information for dashboard
-//! analytics (DAU/MAU, version adoption, platform distribution).
+//! Collects platform, coarse hardware-capacity, locale/timezone, SDK, and
+//! caller-provided app-version information for dashboard analytics. Hosts can
+//! disable this through `Config::telemetry_enabled` and remain responsible for
+//! describing the collection in their own privacy policy.
 
 use serde::Serialize;
 use std::env;

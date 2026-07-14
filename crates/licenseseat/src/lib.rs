@@ -10,7 +10,7 @@
 //! - **Automatic Re-validation** - Background validation with configurable intervals
 //! - **Heartbeat** - Periodic health-check pings for real-time seat tracking
 //! - **Entitlement Management** - Fine-grained feature access control
-//! - **Device Telemetry** - Auto-collected device metadata for analytics
+//! - **Optional Telemetry** - Configurable platform and app-version metadata
 //! - **Network Resilience** - Automatic retry with exponential backoff
 //!
 //! ## Quick Start
@@ -23,12 +23,12 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), licenseseat::Error> {
-//!     // Create SDK instance
-//!     let sdk = LicenseSeat::new(Config {
+//!     // Fail fast if configuration or durable storage is unavailable.
+//!     let sdk = LicenseSeat::try_new(Config {
 //!         api_key: "pk_live_xxx".into(),
 //!         product_slug: "your-product".into(),
 //!         ..Default::default()
-//!     });
+//!     })?;
 //!
 //!     // Activate a license
 //!     let license = sdk.activate("USER-LICENSE-KEY").await?;
@@ -77,10 +77,11 @@ pub use events::{Event, EventData, EventKind};
 pub use models::{
     ActivationNested, ActivationResponse, ClientStatus, DeactivationResponse, DownloadToken,
     Entitlement, EntitlementReason, EntitlementStatus, HealthResponse, HeartbeatResponse, License,
-    LicenseResponse, LicenseStatus, LicenseStatusDetails, MachineFile, MachineFilePayload,
-    MachineFileVerificationResult, OfflineEntitlement, OfflineTokenPayload, OfflineTokenResponse,
-    OfflineTokenSignature, Product, Release, ReleaseList, RestoreResult, SigningKeyResponse,
-    TrustedLicenseSource, ValidationResult, ValidationWarning,
+    LicenseIdentity, LicenseResponse, LicenseStateSnapshot, LicenseStatus, LicenseStatusDetails,
+    MachineFile, MachineFilePayload, MachineFileVerificationResult, OfflineEntitlement,
+    OfflineTokenPayload, OfflineTokenResponse, OfflineTokenSignature, Product, Release,
+    ReleaseList, RestoreResult, SigningKeyResponse, TrustedLicenseSource, ValidationResult,
+    ValidationWarning,
 };
 
 /// SDK version

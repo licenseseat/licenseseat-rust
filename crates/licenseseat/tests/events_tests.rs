@@ -26,6 +26,7 @@ fn test_config(base_url: &str) -> Config {
         product_slug: "test-product".into(),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
+        device_identifier: Some("device-123".into()),
         auto_validate_interval: Duration::from_secs(0),
         heartbeat_interval: Duration::from_secs(0),
         debug: true,
@@ -237,8 +238,7 @@ async fn test_validation_events() {
     drop(handle);
 }
 
-#[tokio::test]
-async fn test_validation_auth_failed_event() {
+async fn validation_auth_failed_event_count(status: u16) -> usize {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -249,10 +249,10 @@ async fn test_validation_auth_failed_event() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/.*/validate"))
-        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+        .respond_with(ResponseTemplate::new(status).set_body_json(json!({
             "error": {
                 "code": "invalid_api_key",
-                "message": "Unauthorized"
+                "message": "Authentication response"
             }
         })))
         .mount(&server)
@@ -278,9 +278,20 @@ async fn test_validation_auth_failed_event() {
     let _ = sdk.validate().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    assert_eq!(auth_failed.load(Ordering::SeqCst), 1);
-
+    let count = auth_failed.load(Ordering::SeqCst);
     drop(handle);
+    count
+}
+
+#[tokio::test]
+async fn test_validation_auth_failed_event() {
+    assert_eq!(validation_auth_failed_event_count(401).await, 1);
+    assert_eq!(validation_auth_failed_event_count(403).await, 1);
+}
+
+#[tokio::test]
+async fn test_not_implemented_is_not_an_auth_failure() {
+    assert_eq!(validation_auth_failed_event_count(501).await, 0);
 }
 
 #[tokio::test]
@@ -475,6 +486,57 @@ fn test_event_kind_display() {
         format!("{}", EventKind::DeactivationSuccess),
         "deactivation:success"
     );
+}
+
+#[test]
+fn historical_event_kind_discriminants_remain_stable() {
+    let historical = [
+        EventKind::ActivationStart,
+        EventKind::ActivationSuccess,
+        EventKind::ActivationError,
+        EventKind::ValidationStart,
+        EventKind::ValidationSuccess,
+        EventKind::ValidationFailed,
+        EventKind::ValidationError,
+        EventKind::ValidationOfflineSuccess,
+        EventKind::ValidationOfflineFailed,
+        EventKind::ValidationAuthFailed,
+        EventKind::ValidationAutoFailed,
+        EventKind::DeactivationStart,
+        EventKind::DeactivationSuccess,
+        EventKind::DeactivationError,
+        EventKind::HeartbeatSuccess,
+        EventKind::HeartbeatError,
+        EventKind::LicenseLoaded,
+        EventKind::LicenseRevoked,
+        EventKind::OfflineTokenFetching,
+        EventKind::OfflineTokenFetched,
+        EventKind::OfflineTokenFetchError,
+        EventKind::OfflineTokenReady,
+        EventKind::OfflineTokenVerified,
+        EventKind::OfflineTokenVerificationFailed,
+        EventKind::MachineFileFetching,
+        EventKind::MachineFileFetched,
+        EventKind::MachineFileFetchError,
+        EventKind::MachineFileReady,
+        EventKind::MachineFileVerified,
+        EventKind::MachineFileVerificationFailed,
+        EventKind::OfflineValidationStart,
+        EventKind::OfflineValidationSuccess,
+        EventKind::OfflineValidationFailed,
+        EventKind::OfflineAssetsRefreshed,
+        EventKind::AutoValidationCycle,
+        EventKind::AutoValidationStopped,
+        EventKind::NetworkOnline,
+        EventKind::NetworkOffline,
+        EventKind::SdkReset,
+        EventKind::SdkError,
+    ];
+
+    for (expected, kind) in historical.into_iter().enumerate() {
+        assert_eq!(kind as usize, expected);
+    }
+    assert_eq!(EventKind::LicenseStateChanged as usize, historical.len());
 }
 
 #[test]

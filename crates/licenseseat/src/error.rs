@@ -7,6 +7,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Error types that can occur when using the LicenseSeat SDK.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Configuration error (missing required fields, invalid values).
     #[error("configuration error: {0}")]
@@ -23,6 +24,18 @@ pub enum Error {
     /// No active license to operate on.
     #[error("no active license - call activate() first")]
     NoActiveLicense,
+
+    /// A response did not match the requested license, product, installation,
+    /// or activation and was rejected before it could mutate cached state.
+    #[error("response identity mismatch: {0}")]
+    ResponseMismatch(String),
+
+    /// A newer state-changing operation superseded an in-flight request.
+    #[error("{operation} was superseded by a newer license-state operation")]
+    OperationSuperseded {
+        /// Human-readable operation name.
+        operation: &'static str,
+    },
 
     /// API error with status code and details.
     #[error("API error ({status}): {message}")]
@@ -44,6 +57,20 @@ pub enum Error {
     /// JSON serialization/deserialization error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// A serialized API request exceeded the SDK's outbound body limit.
+    #[error("API request exceeded the {limit_bytes}-byte safety limit")]
+    RequestTooLarge {
+        /// Maximum accepted request size.
+        limit_bytes: usize,
+    },
+
+    /// An API response exceeded the SDK's bounded in-memory body limit.
+    #[error("API response exceeded the {limit_bytes}-byte safety limit")]
+    ResponseTooLarge {
+        /// Maximum accepted response size.
+        limit_bytes: usize,
+    },
 
     /// Cryptographic verification failed (offline validation).
     #[cfg(feature = "offline")]
