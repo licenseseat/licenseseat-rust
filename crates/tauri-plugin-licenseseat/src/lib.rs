@@ -329,10 +329,11 @@ fn build_plugin<R: Runtime>(config_override: Option<PluginConfig>) -> TauriPlugi
             tauri::async_runtime::spawn(async move {
                 let restore = sdk.restore_license().await;
                 if !restore.restored && restore.error.is_some() {
-                    tracing::warn!(
-                        error = restore.error.as_deref().unwrap_or_default(),
-                        "LicenseSeat cached-session restore failed"
-                    );
+                    // Restore diagnostics may contain server-controlled text
+                    // or a request URL whose path includes the license key.
+                    // Direct SDK callers still receive RestoreResult.error;
+                    // automatic host logs record only the bounded outcome.
+                    tracing::warn!("LicenseSeat cached-session restore failed");
                 }
             });
 

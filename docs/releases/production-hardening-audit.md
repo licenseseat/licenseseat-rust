@@ -252,6 +252,8 @@ Resolution:
 - license-key-bearing paths are not logged;
 - reqwest URLs are stripped from transport errors;
 - API messages are control-normalized and bounded;
+- automatic background-task and Tauri restore logs use credential-safe error
+  classes instead of formatting caller-visible/server-controlled diagnostics;
 - HTML proxy responses become generic summaries;
 - retries are restricted to transport, 408, 429, and 5xx conditions and use capped exponential delay.
 

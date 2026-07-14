@@ -480,7 +480,7 @@ impl LicenseSeat {
 
                 for warning in cache_warnings {
                     self.emit(Event::with_error(EventKind::SdkError, warning.clone()));
-                    warn!("{warning}");
+                    warn!("License activation cache cleanup reported a diagnostic warning");
                 }
 
                 self.start_background_tasks();
@@ -490,7 +490,10 @@ impl LicenseSeat {
                     let sdk = self.clone();
                     tokio::spawn(async move {
                         if let Err(error) = sdk.sync_offline_assets().await {
-                            warn!("Failed to sync offline assets: {error}");
+                            warn!(
+                                "Failed to sync offline assets: {}",
+                                error.redacted_log_summary()
+                            );
                         }
                     });
                 }
@@ -659,7 +662,7 @@ impl LicenseSeat {
                         EventKind::ValidationFailed,
                         result.clone(),
                     ));
-                    warn!("License validation failed: {:?}", result.code);
+                    warn!("License validation was not accepted");
                 }
 
                 Ok(result)
@@ -1745,7 +1748,7 @@ impl LicenseSeat {
                         match sdk.validate_key(&license_key).await {
                             Ok(result) if result.valid => debug!("Auto-validation successful"),
                             Ok(result) => {
-                                warn!("Auto-validation failed: {:?}", result.code);
+                                warn!("Auto-validation was not accepted");
                                 sdk.emit(Event::with_error(
                                     EventKind::ValidationAutoFailed,
                                     result
@@ -1756,7 +1759,7 @@ impl LicenseSeat {
                                 ));
                             }
                             Err(e) => {
-                                warn!("Auto-validation error: {}", e);
+                                warn!("Auto-validation error: {}", e.redacted_log_summary());
                                 sdk.emit(Event::with_error(
                                     EventKind::ValidationAutoFailed,
                                     e.to_string(),
@@ -1906,7 +1909,7 @@ impl LicenseSeat {
                             .heartbeat_key(&license_key, Some(&heartbeat_fingerprint))
                             .await
                         {
-                            warn!("Heartbeat error: {}", e);
+                            warn!("Heartbeat error: {}", e.redacted_log_summary());
                         }
                     }
                 });
@@ -2174,7 +2177,7 @@ impl LicenseSeat {
 
             debug!("Refreshing offline assets");
             if let Err(e) = sdk.sync_offline_assets().await {
-                warn!("Offline asset refresh error: {}", e);
+                warn!("Offline asset refresh error: {}", e.redacted_log_summary());
             }
         }
     }

@@ -88,6 +88,9 @@ and complete local release gate.
   and superseded-operation failures after a lifecycle start/fetch event.
 - Prevented logs and surfaced reqwest errors from exposing license keys embedded
   in request paths.
+- Redacted API/transport diagnostics from automatic validation, heartbeat,
+  offline-refresh, activation-support, and Tauri restore logs; direct callers
+  and typed lifecycle events retain their explicit diagnostic contract.
 - Prevented concurrent frontend state handlers from overlapping or observing
   out-of-order snapshots.
 - Prevented Tauri state responses from mixing fields across concurrent commits,

@@ -157,6 +157,57 @@ impl Error {
             _ => None,
         }
     }
+
+    /// Return a bounded, credential-safe summary suitable for automatic logs.
+    ///
+    /// Full errors remain available to the direct caller. Background tasks
+    /// must not format them automatically because API messages and reqwest
+    /// errors can contain server-controlled data or a request URL whose path
+    /// includes the license key.
+    pub(crate) fn redacted_log_summary(&self) -> String {
+        match self {
+            Self::Api { status, .. } => format!("API request rejected (HTTP {status})"),
+            Self::Network(error) if error.is_timeout() => "network timeout".into(),
+            Self::Network(error) if error.is_connect() => "network connection failure".into(),
+            Self::Network(_) => "network transport failure".into(),
+            Self::Configuration(_) | Self::ApiKeyRequired | Self::ProductSlugRequired => {
+                "invalid SDK configuration".into()
+            }
+            Self::NoActiveLicense => "no active license".into(),
+            Self::ResponseMismatch(_) => "response identity mismatch".into(),
+            Self::OperationSuperseded { .. } => "operation superseded".into(),
+            Self::Json(_) => "invalid JSON response".into(),
+            Self::RequestTooLarge { .. } => "request exceeded safety limit".into(),
+            Self::ResponseTooLarge { .. } => "response exceeded safety limit".into(),
+            #[cfg(feature = "offline")]
+            Self::Crypto(_) => "cryptographic operation failed".into(),
+            Self::OfflineTokenExpired => "offline artifact expired".into(),
+            Self::OfflineVerificationFailed(_) => "offline verification failed".into(),
+            Self::ClockTamperingDetected => "clock rollback detected".into(),
+            Self::GracePeriodExceeded { .. } => "offline grace period exceeded".into(),
+            Self::Cache(_) => "durable cache operation failed".into(),
+            Self::Url(_) => "invalid URL".into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn automatic_log_summary_never_echoes_api_data() {
+        let error = Error::api(
+            422,
+            Some("SECRET-LICENSE-KEY".into()),
+            "server echoed SECRET-LICENSE-KEY",
+            None,
+        );
+        let summary = error.redacted_log_summary();
+
+        assert_eq!(summary, "API request rejected (HTTP 422)");
+        assert!(!summary.contains("SECRET"));
+    }
 }
 
 /// Common API error codes returned by LicenseSeat.
