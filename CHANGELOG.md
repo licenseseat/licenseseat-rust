@@ -30,6 +30,8 @@ and complete local release gate.
   checks, denial tombstones, and clock-rollback coverage.
 - Least-privilege Tauri permission sets for diagnostics, advanced lifecycle,
   offline management, and releases.
+- Typed Tauri `init_with_config` setup and an `emitFrontendEvents` control for
+  high-assurance native facades that must not broadcast generic payloads.
 - Serialized JavaScript state subscriptions with error recovery and
   unsubscribe/drain semantics.
 - Generated Ruby-core compatibility fixtures and adversarial integration tests.

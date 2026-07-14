@@ -138,6 +138,15 @@ pub struct PluginConfig {
     #[serde(default)]
     pub debug: Option<bool>,
 
+    /// Emit raw LicenseSeat lifecycle events to every Tauri renderer.
+    ///
+    /// Default: true for backward compatibility. Set this to false when the
+    /// application exposes a narrow native licensing facade instead of the
+    /// generic renderer API. Native Rust subscribers continue to receive SDK
+    /// events regardless of this setting.
+    #[serde(default)]
+    pub emit_frontend_events: Option<bool>,
+
     /// App version (for telemetry).
     #[serde(default)]
     pub app_version: Option<String>,
@@ -192,6 +201,7 @@ impl std::fmt::Debug for PluginConfig {
             )
             .field("telemetry_enabled", &self.telemetry_enabled)
             .field("debug", &self.debug)
+            .field("emit_frontend_events", &self.emit_frontend_events)
             .field("app_version", &self.app_version)
             .field("app_build", &self.app_build)
             .finish()

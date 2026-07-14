@@ -15,6 +15,8 @@ The work started as a parity and production-readiness pass for a real Tauri appl
 - default installation identity and raw hardware-component behavior did not meet data-minimization expectations;
 - cache durability, privacy, path safety, size limits, and failure semantics were underspecified;
 - generic Tauri permissions were broader than a least-privilege production renderer needs;
+- renderers received globally broadcast generic lifecycle payloads even when
+  they had no generic LicenseSeat command permissions;
 - frontend subscriptions could overlap and deliver stale state out of order;
 - Tauri state responses could combine status, validation, and entitlements from
   different concurrent commits;
@@ -283,6 +285,10 @@ Resolution:
 - timeout, retry, clock-skew, fingerprint-component, and storage settings map exactly to core config;
 - default capability is limited to ordinary lifecycle/state/entitlement commands;
 - diagnostics, advanced lifecycle/reset, raw offline management, and release commands are separate opt-in sets;
+- a high-assurance native facade can disable generic renderer event
+  broadcasting while retaining the complete native Rust event stream;
+- `init_with_config` accepts one typed compile-time configuration instead of
+  forcing an application to maintain a second JSON source of truth;
 - config/admin debug output redacts API keys, signing public key, and installation override;
 - detailed admin state is explicitly diagnostic/non-authoritative.
 
@@ -467,7 +473,8 @@ break. Its remaining findings are intentional and documented:
 - core: the `Config.send_fingerprint_components` and signed
   `MachineFilePayload.product_slug` fields, plus public enums marked
   `#[non_exhaustive]` for safe future evolution;
-- Tauri: new `PluginConfig` fingerprint, retry, and clock-skew controls.
+- Tauri: new `PluginConfig` fingerprint, retry, clock-skew, and renderer-event
+  controls. `init_with_config` is an additive constructor.
 
 The forced review also found accidental numeric discriminant movement caused
 by inserted enum variants. The new variants were moved after the historical

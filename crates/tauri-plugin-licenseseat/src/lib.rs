@@ -160,9 +160,43 @@ fn validate_plugin_config(config: &PluginConfig) -> std::result::Result<(), lice
 /// }
 /// ```
 pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
+    build_plugin(None)
+}
+
+/// Initialize the LicenseSeat plugin from a typed Rust configuration.
+///
+/// This is useful when a release pipeline injects public LicenseSeat trust
+/// configuration at compile time instead of writing it to `tauri.conf.json`.
+/// The supplied value completely replaces the optional JSON plugin
+/// configuration. Release applications should use `env!`/`option_env!` only at
+/// compile time; the plugin deliberately rejects runtime environment
+/// placeholders in release builds.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let config = tauri_plugin_licenseseat::PluginConfig {
+///     api_key: env!("LICENSESEAT_API_KEY").into(),
+///     product_slug: "my-product".into(),
+///     signing_public_key: Some(env!("LICENSESEAT_SIGNING_PUBLIC_KEY").into()),
+///     signing_key_id: Some(env!("LICENSESEAT_SIGNING_KEY_ID").into()),
+///     emit_frontend_events: Some(false),
+///     ..Default::default()
+/// };
+///
+/// tauri::Builder::default()
+///     .plugin(tauri_plugin_licenseseat::init_with_config(config));
+/// ```
+pub fn init_with_config<R: Runtime>(config: PluginConfig) -> TauriPlugin<R, PluginConfig> {
+    build_plugin(Some(config))
+}
+
+fn build_plugin<R: Runtime>(config_override: Option<PluginConfig>) -> TauriPlugin<R, PluginConfig> {
     Builder::<R, PluginConfig>::new("licenseseat")
-        .setup(|app, api| {
-            let config = api.config().clone();
+        .setup(move |app, api| {
+            let config = config_override
+                .clone()
+                .unwrap_or_else(|| api.config().clone());
             validate_plugin_config(&config)?;
             let api_key = resolve_env_placeholder(config.api_key.clone(), "apiKey")?;
             let product_slug =
@@ -262,32 +296,34 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             };
 
             let sdk = licenseseat::LicenseSeat::try_new(sdk_config)?;
-            // Subscribe synchronously before either spawned task can run. This
-            // prevents the automatic restore task from winning scheduler order
-            // and dropping its first lifecycle events before the bridge exists.
-            let mut event_rx = sdk.subscribe();
-            let app_handle = app.clone();
-            tauri::async_runtime::spawn(async move {
-                loop {
-                    match event_rx.recv().await {
-                        Ok(event) => {
-                            let event_name = format!(
-                                "licenseseat://{}",
-                                event.kind.to_string().replace(':', "-")
-                            );
-                            let payload = commands::event_payload_to_json(event.data);
-                            let _ = app_handle.emit(&event_name, payload);
+            if config.emit_frontend_events.unwrap_or(true) {
+                // Subscribe synchronously before the automatic restore task can
+                // run. This prevents restoration from winning scheduler order
+                // and dropping its first renderer lifecycle events.
+                let mut event_rx = sdk.subscribe();
+                let app_handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        match event_rx.recv().await {
+                            Ok(event) => {
+                                let event_name = format!(
+                                    "licenseseat://{}",
+                                    event.kind.to_string().replace(':', "-")
+                                );
+                                let payload = commands::event_payload_to_json(event.data);
+                                let _ = app_handle.emit(&event_name, payload);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(
+                                    skipped,
+                                    "LicenseSeat Tauri event bridge lagged; continuing with current events"
+                                );
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(
-                                skipped,
-                                "LicenseSeat Tauri event bridge lagged; continuing with current events"
-                            );
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
-                }
-            });
+                });
+            }
             app.manage(sdk.clone());
 
             tauri::async_runtime::spawn(async move {
@@ -422,7 +458,8 @@ mod tests {
             "maxRetries": 5,
             "retryDelaySeconds": 2,
             "maxClockSkewSeconds": 60,
-            "sendFingerprintComponents": true
+            "sendFingerprintComponents": true,
+            "emitFrontendEvents": false
         }))
         .unwrap();
         assert_eq!(config.timeout_seconds, Some(15));
@@ -430,6 +467,7 @@ mod tests {
         assert_eq!(config.retry_delay_seconds, Some(2));
         assert_eq!(config.max_clock_skew_seconds, Some(60));
         assert_eq!(config.send_fingerprint_components, Some(true));
+        assert_eq!(config.emit_frontend_events, Some(false));
         assert!(validate_plugin_config(&config).is_ok());
 
         let mut invalid = config;

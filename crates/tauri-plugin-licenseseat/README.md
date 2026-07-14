@@ -42,7 +42,8 @@ fn main() {
       "signingKeyId": "production-key-v1",
       "offlineFallbackMode": "networkOnly",
       "telemetryEnabled": true,
-      "sendFingerprintComponents": false
+      "sendFingerprintComponents": false,
+      "emitFrontendEvents": true
     }
   }
 }
@@ -80,6 +81,7 @@ All durations are seconds.
 | `enableLegacyOfflineTokens` | `false` | Machine files remain preferred |
 | `telemetryEnabled` | `true` | OS/SDK/app/coarse-capacity/locale fields |
 | `debug` | `false` | Sensitive fields stay redacted |
+| `emitFrontendEvents` | `true` | Set `false` for a native-facade integration; native Rust subscribers are unaffected |
 | `appVersion` | Tauri package version | Telemetry |
 | `appBuild` | none | Telemetry |
 
@@ -112,7 +114,25 @@ No renderer command is usable until its Tauri capability grants permission.
 
 Grant sets only to the windows/webviews that require them. Do not combine LicenseSeat capabilities with untrusted remote web content.
 
-The generic frontend surface necessarily sees a user-entered license key and can retrieve license state. For a higher-assurance product, register the plugin/core SDK natively but grant no generic LicenseSeat permissions to the renderer. Expose a small app-specific Rust command facade that returns redacted state and performs entitlement checks again around native value-producing operations.
+The generic frontend surface necessarily sees a user-entered license key and can retrieve license state. For a higher-assurance product, register the plugin/core SDK natively with `emitFrontendEvents: false`, grant no generic LicenseSeat permissions to the renderer, and expose a small app-specific Rust command facade that returns redacted state and performs entitlement checks again around native value-producing operations. Disabling the bridge prevents raw generic lifecycle payloads from being broadcast to renderers; native `LicenseSeat::subscribe()` consumers still receive the full event stream.
+
+Typed compile-time configuration is also available when release trust material is injected by the build pipeline:
+
+```rust,ignore
+let config = tauri_plugin_licenseseat::PluginConfig {
+    api_key: env!("LICENSESEAT_API_KEY").into(),
+    product_slug: "your-product".into(),
+    signing_public_key: Some(env!("LICENSESEAT_SIGNING_PUBLIC_KEY").into()),
+    signing_key_id: Some(env!("LICENSESEAT_SIGNING_KEY_ID").into()),
+    emit_frontend_events: Some(false),
+    ..Default::default()
+};
+
+tauri::Builder::default()
+    .plugin(tauri_plugin_licenseseat::init_with_config(config));
+```
+
+`init_with_config` replaces the optional JSON plugin configuration rather than merging two sources of truth. These values are public client configuration embedded in the application, not secrets.
 
 ## Startup and state
 
