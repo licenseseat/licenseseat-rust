@@ -167,7 +167,10 @@ fn ambiguous_identity_and_timeout_configuration_is_rejected() {
         Err(Error::Configuration(_))
     ));
 
-    for identifier in [" ", " device", "device ", "device\nidentifier"] {
+    // "dev-1" exercises the 8-character minimum, which applies to NEW
+    // configuration only; fingerprints adopted from existing cached
+    // activations are exempt (see cache_tests.rs).
+    for identifier in [" ", " device", "device ", "device\nidentifier", "dev-1"] {
         let mut candidate = config(&storage);
         candidate.device_identifier = Some(identifier.into());
         assert!(matches!(

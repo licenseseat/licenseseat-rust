@@ -705,3 +705,68 @@ async fn authoritative_heartbeat_reanchors_a_poisoned_clock_watermark() {
          (anchored {anchored}, poisoned {poisoned_timestamp})"
     );
 }
+
+#[tokio::test]
+async fn restored_machine_file_for_a_foreign_license_fails_identity_bound_verification() {
+    let fixture = fixture();
+    let server = MockServer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let prefix = "ruby_foreign_machine_file_";
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/activate$"))
+        .respond_with(activation_responder())
+        .mount(&server)
+        .await;
+    let mut online_config = config(&server, &storage, &fixture);
+    online_config.storage_prefix = prefix.into();
+    let sdk = LicenseSeat::try_new(online_config.clone()).unwrap();
+    let foreign_owner_key = "FOREIGN-OWNER-KEY";
+    assert_ne!(foreign_owner_key, fixture["license_key"].as_str().unwrap());
+    sdk.activate(foreign_owner_key).await.unwrap();
+    drop(sdk);
+
+    // Simulate re-importing a signed machine file that belongs to a different
+    // license into this installation's cache.
+    std::fs::write(
+        storage.path().join(format!("{prefix}machine_file.json")),
+        serde_json::to_vec_pretty(&fixture["machine_file"]).unwrap(),
+    )
+    .unwrap();
+
+    let mut offline_config = online_config;
+    offline_config.api_base_url = "http://127.0.0.1:9".into();
+    offline_config.request_timeout = Duration::from_millis(100);
+    let restored_sdk = LicenseSeat::try_new(offline_config).unwrap();
+    let mut events = restored_sdk.subscribe();
+    let restore = restored_sdk.restore_license().await;
+
+    assert!(!restore.restored);
+    let validation = restore.validation.expect("offline validation result");
+    assert!(!validation.valid);
+    // The foreign artifact must fail the identity-bound verification itself
+    // (LICENSE_MISMATCH), not merely the later last-resort grant binding in
+    // `finalize_offline_validation`.
+    assert_ne!(
+        validation.code.as_deref(),
+        Some("offline_identity_mismatch")
+    );
+    assert!(
+        validation
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("LICENSE_MISMATCH")),
+        "{validation:?}"
+    );
+
+    let mut kinds = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        kinds.push(event.kind);
+    }
+    assert!(kinds.contains(&EventKind::MachineFileVerificationFailed));
+    assert!(
+        !kinds.contains(&EventKind::MachineFileVerified),
+        "verification success events must not fire for a foreign-license artifact"
+    );
+    assert!(!restored_sdk.has_entitlement("pro-feature"));
+}

@@ -571,6 +571,83 @@ fn test_legacy_cached_validation_is_never_promoted_to_runtime_trust() {
     ));
 }
 
+#[tokio::test]
+async fn short_fingerprint_cached_activation_can_validate_and_deactivate() {
+    // An activation cached before the 8-character fingerprint floor existed
+    // (or created by another SDK without it) must stay fully operable: its
+    // identifier is adopted, and validation/deactivation keep using the exact
+    // fingerprint that consumed the seat. The floor continues to apply to new
+    // configuration input (see configuration_security_tests.rs).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .respond_with(validation_responder())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/.*/deactivate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(deactivation_response()))
+        .mount(&server)
+        .await;
+
+    let prefix = unique_prefix();
+    let license_path = cache_path(&prefix, "license");
+    std::fs::create_dir_all(license_path.parent().expect("cache parent")).unwrap();
+    let cached_license = json!({
+        "license_key": "TEST-KEY",
+        "device_id": "dev-1",
+        "activation_id": "act-12345-uuid",
+        "activated_at": "2025-01-01T00:00:00Z",
+        "last_validated": "2025-01-02T00:00:00Z"
+    });
+    std::fs::write(
+        &license_path,
+        serde_json::to_string_pretty(&cached_license).unwrap(),
+    )
+    .unwrap();
+
+    let sdk = LicenseSeat::try_new(Config {
+        api_key: "test-api-key".into(),
+        product_slug: "test-product".into(),
+        api_base_url: server.uri(),
+        storage_prefix: prefix,
+        auto_validate_interval: Duration::from_secs(0),
+        heartbeat_interval: Duration::from_secs(0),
+        debug: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        sdk.fingerprint(),
+        "dev-1",
+        "the cached activation's short identifier must be adopted, not replaced"
+    );
+
+    let validation = sdk.validate().await.unwrap();
+    assert!(validation.valid);
+
+    sdk.deactivate().await.unwrap();
+    assert!(sdk.current_license().is_none());
+
+    let requests = server.received_requests().await.unwrap();
+    let device_ids: Vec<String> = requests
+        .iter()
+        .filter(|request| {
+            let path = request.url.path();
+            path.contains("/validate") || path.contains("/deactivate")
+        })
+        .map(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body["device_id"].as_str().unwrap_or_default().to_string()
+        })
+        .collect();
+    assert_eq!(
+        device_ids,
+        vec!["dev-1".to_string(), "dev-1".to_string()],
+        "requests must target the exact fingerprint that consumed the seat"
+    );
+}
+
 // ============================================================================
 // Thread Safety Tests
 // ============================================================================

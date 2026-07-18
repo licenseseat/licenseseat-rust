@@ -407,7 +407,10 @@ impl LicenseSeat {
         )?
         .map(ToString::to_string)
         .unwrap_or_else(|| self.inner.fingerprint.clone());
-        validate_fingerprint(&device_id)?;
+        // Explicit new aliases were strictly validated above; the fallback may
+        // be a short installation identifier adopted from an existing cached
+        // activation, which stays acceptable.
+        self.validate_request_fingerprint(&device_id)?;
         debug!("Starting activation request");
 
         self.emit(Event::new(EventKind::ActivationStart));
@@ -772,12 +775,15 @@ impl LicenseSeat {
         let product_slug = self.require_product_slug()?;
         self.require_api_key()?;
         validate_request_identifier("license_key", license_key)?;
+        // Deactivation targets an existing seat, so a fingerprint sourced from
+        // (or equal to) the cached activation is exempt from the new-input
+        // length floor; `deactivate()` forwards the cached `device_id` here.
         if let Some(fingerprint) = fingerprint {
-            validate_fingerprint(fingerprint)?;
+            self.validate_request_fingerprint(fingerprint)?;
         }
 
         let resolved_fingerprint = self.resolve_request_fingerprint(fingerprint);
-        validate_fingerprint(&resolved_fingerprint)?;
+        self.validate_request_fingerprint(&resolved_fingerprint)?;
         let (operation, cached_license) =
             self.begin_target_operation(&self.inner.current_deactivation_operation, |license| {
                 license.license_key == license_key && license.device_id == resolved_fingerprint
@@ -909,11 +915,14 @@ impl LicenseSeat {
         let product_slug = self.require_product_slug()?;
         self.require_api_key()?;
         validate_request_identifier("license_key", license_key)?;
+        // Heartbeats renew an existing seat: fingerprints sourced from the
+        // cached activation (including the short pre-floor ones forwarded by
+        // `heartbeat()` and the background heartbeat task) stay acceptable.
         if let Some(fingerprint) = fingerprint {
-            validate_fingerprint(fingerprint)?;
+            self.validate_request_fingerprint(fingerprint)?;
         }
         let resolved_fingerprint = self.resolve_request_fingerprint(fingerprint);
-        validate_fingerprint(&resolved_fingerprint)?;
+        self.validate_request_fingerprint(&resolved_fingerprint)?;
         let (operation, cached_license) =
             self.begin_target_operation(&self.inner.current_heartbeat_operation, |license| {
                 license.license_key == license_key && license.device_id == resolved_fingerprint
@@ -2211,8 +2220,11 @@ impl LicenseSeat {
         self.require_api_key()?;
         validate_request_identifier("license_key", license_key)?;
         validate_positive_days("ttl_days", ttl_days)?;
+        // Offline tokens are issued for an existing activation, so a
+        // fingerprint sourced from the cached record is exempt from the
+        // new-input length floor.
         if let Some(fingerprint) = fingerprint {
-            validate_fingerprint(fingerprint)?;
+            self.validate_request_fingerprint(fingerprint)?;
         }
         // Automatic refresh and host-initiated checkout share one state slot.
         // Serialize them so a refresh scheduled immediately after activation
@@ -2222,7 +2234,7 @@ impl LicenseSeat {
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(|| self.resolve_request_fingerprint(None));
-        validate_fingerprint(&fingerprint)?;
+        self.validate_request_fingerprint(&fingerprint)?;
         let cached_identity = self
             .current_license()
             .filter(|license| {
@@ -2356,7 +2368,11 @@ impl LicenseSeat {
         )?
         .map(ToString::to_string)
         .unwrap_or_else(|| self.resolve_request_fingerprint(None));
-        validate_fingerprint(&fingerprint)?;
+        // Explicit new aliases were strictly validated above; the fallback
+        // resolved from the cached activation is exempt from the new-input
+        // length floor so pre-floor activations can still check out and
+        // refresh machine files.
+        self.validate_request_fingerprint(&fingerprint)?;
         let cached_identity = self
             .current_license()
             .filter(|license| {
@@ -3030,7 +3046,18 @@ impl LicenseSeat {
         }
 
         if let Some(machine_file) = self.inner.cache.get_machine_file() {
-            match self.verify_machine_file(&machine_file, None, None, None) {
+            // Bind verification to the expected activation's license key.
+            // Without it, `verify_machine_file_inner` falls back to the
+            // artifact's own unsigned metadata, which makes the expected
+            // license check vacuous for a restored foreign-license artifact:
+            // it would emit `MachineFileVerified` and only fail later in
+            // `finalize_offline_validation`.
+            match self.verify_machine_file(
+                &machine_file,
+                None,
+                Some(&expected_identity.license_key),
+                None,
+            ) {
                 Ok(verify_result) if verify_result.valid => {
                     if let Some(payload) = verify_result.payload.as_ref() {
                         let authorization_expires_at =
@@ -3232,6 +3259,32 @@ impl LicenseSeat {
             .map(ToString::to_string)
             .or_else(|| self.current_license().map(|license| license.device_id))
             .unwrap_or_else(|| self.inner.fingerprint.clone())
+    }
+
+    /// Validate a fingerprint that is about to be sent in a request.
+    ///
+    /// New fingerprints keep the strict 8-255 character configuration floor
+    /// (`validate_fingerprint`). A fingerprint that matches this SDK's stable
+    /// installation identifier or the existing cached activation record is
+    /// exempt from the length floor: such identifiers were accepted by the
+    /// server when the seat was consumed (possibly by an older SDK release or
+    /// another platform without the floor), and rejecting them here would
+    /// strand the activation — it could never be validated, heartbeated, or
+    /// deactivated, and the next activation would burn a second seat. Exempt
+    /// values must still be 1-255 control-free characters without surrounding
+    /// whitespace.
+    fn validate_request_fingerprint(&self, value: &str) -> Result<()> {
+        if is_valid_fingerprint(value) {
+            return Ok(());
+        }
+        if self.inner.fingerprint == value
+            || self
+                .current_license()
+                .is_some_and(|license| license.device_id == value)
+        {
+            return validate_request_identifier("fingerprint", value);
+        }
+        validate_fingerprint(value)
     }
 
     fn support_tasks_should_continue(&self, generation: u64) -> bool {

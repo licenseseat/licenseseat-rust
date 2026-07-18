@@ -970,9 +970,16 @@ fn hex_bytes(bytes: &[u8]) -> String {
     encoded
 }
 
+/// An adopted or stored installation identifier must be non-empty, bounded,
+/// control-free, and free of surrounding whitespace, but it is deliberately
+/// not held to the 8-character floor applied to new `device_identifier`
+/// configuration. A cached activation created before that floor existed (or
+/// by another SDK without it) already consumed its server seat under the
+/// short identifier; silently discarding it would generate a fresh random ID
+/// and burn a second seat on the next activation.
 fn is_valid_installation_identifier(value: &str) -> bool {
     let trimmed = value.trim();
-    trimmed == value && (8..=255).contains(&value.len()) && !value.chars().any(char::is_control)
+    trimmed == value && (1..=255).contains(&value.len()) && !value.chars().any(char::is_control)
 }
 
 fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1456,6 +1463,34 @@ mod tests {
         std::fs::remove_file(current.path().join(format!("{prefix}last_seen_ts.json")))
             .expect("simulate loss of the durable copy");
         assert_eq!(cache.get_last_seen_timestamp(), None);
+    }
+
+    #[test]
+    fn short_legacy_installation_identifier_is_adopted() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let cache = LicenseCache::new("short_adopt_", Some(directory.path().into()));
+        assert_eq!(
+            cache
+                .get_or_create_installation_identifier(Some("dev-1"))
+                .expect("adoption"),
+            "dev-1",
+            "an existing activation's short fingerprint must be adopted, not silently replaced"
+        );
+        assert_eq!(
+            cache
+                .get_or_create_installation_identifier(None)
+                .expect("stored identifier"),
+            "dev-1",
+            "the adopted identifier must remain durable across reads"
+        );
+
+        // Malformed candidates are still rejected for adoption.
+        let fresh = tempfile::tempdir().expect("temp directory");
+        let fresh_cache = LicenseCache::new("short_adopt_fresh_", Some(fresh.path().into()));
+        let generated = fresh_cache
+            .get_or_create_installation_identifier(Some(" dev-1"))
+            .expect("generated identifier");
+        assert!(generated.starts_with("rust-"));
     }
 
     #[cfg(unix)]
