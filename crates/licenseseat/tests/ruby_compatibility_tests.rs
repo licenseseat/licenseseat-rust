@@ -7,7 +7,9 @@ mod common;
 
 use base64::Engine;
 use chrono::Utc;
-use common::{activation_responder, invalid_validation_responder};
+use common::{
+    activation_responder, heartbeat_responder, invalid_validation_responder, validation_responder,
+};
 use licenseseat::{
     Config, EventKind, LicenseSeat, LicenseStatus, MachineFile, OfflineFallbackMode,
     OfflineTokenResponse,
@@ -575,5 +577,131 @@ fn fixture_records_its_ruby_core_provenance() {
     assert_eq!(
         fixture["provenance"]["machine_file_contract_source"],
         "license_seat/lib/license_seat/services/offline_machine_file.rb"
+    );
+}
+
+#[tokio::test]
+async fn authoritative_online_validation_reanchors_a_poisoned_clock_watermark() {
+    let fixture = fixture();
+    let server = MockServer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let prefix = "ruby_watermark_reanchor_";
+    let (sdk, online_config) =
+        sdk_with_cached_machine_file(&server, &storage, &fixture, prefix).await;
+    drop(sdk);
+
+    // A transiently future-set clock poisoned the ratcheting watermark.
+    let last_seen_path = storage.path().join(format!("{prefix}last_seen_ts.json"));
+    let poisoned_timestamp = Utc::now().timestamp() + 3_600;
+    std::fs::write(
+        &last_seen_path,
+        serde_json::to_vec_pretty(&poisoned_timestamp).unwrap(),
+    )
+    .unwrap();
+
+    let mut offline_config = online_config.clone();
+    offline_config.api_base_url = "http://127.0.0.1:9".into();
+    offline_config.request_timeout = Duration::from_millis(100);
+
+    // Offline validation of the perfectly valid cached artifact fails closed.
+    let poisoned_sdk = LicenseSeat::try_new(offline_config.clone()).unwrap();
+    let poisoned_restore = poisoned_sdk.restore_license().await;
+    assert!(!poisoned_restore.restored);
+    assert_eq!(
+        poisoned_restore
+            .validation
+            .expect("offline validation result")
+            .code
+            .as_deref(),
+        Some("clock_tamper")
+    );
+    drop(poisoned_sdk);
+
+    // The server then accepts an authenticated validation, an authoritative
+    // signal that the current local time is trustworthy: the watermark is
+    // re-anchored downward instead of ratcheting.
+    Mock::given(method("POST"))
+        .and(path_regex(r"/validate$"))
+        .respond_with(validation_responder())
+        .mount(&server)
+        .await;
+    let online_sdk = LicenseSeat::try_new(online_config).unwrap();
+    let validation = online_sdk
+        .validate_key(fixture["license_key"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert!(validation.valid);
+    drop(online_sdk);
+    let anchored: i64 = serde_json::from_slice(&std::fs::read(&last_seen_path).unwrap()).unwrap();
+    assert!(
+        anchored < poisoned_timestamp,
+        "authoritative online validation must be able to lower the watermark \
+         (anchored {anchored}, poisoned {poisoned_timestamp})"
+    );
+
+    // The previously failing offline validation of the same artifact recovers.
+    let recovered_sdk = LicenseSeat::try_new(offline_config.clone()).unwrap();
+    let recovered_restore = recovered_sdk.restore_license().await;
+    assert!(recovered_restore.restored, "{recovered_restore:?}");
+    let recovered_validation = recovered_restore.validation.expect("offline validation");
+    assert!(recovered_validation.valid);
+    assert!(recovered_validation.offline);
+    assert!(recovered_sdk.has_entitlement("pro-feature"));
+    drop(recovered_sdk);
+
+    // Rollback detection still trips afterward on an actual clock rollback:
+    // the persisted watermark sits ahead of the rolled-back clock by more
+    // than the allowed skew.
+    let post_rollback_watermark = Utc::now().timestamp() + 3_600;
+    std::fs::write(
+        &last_seen_path,
+        serde_json::to_vec_pretty(&post_rollback_watermark).unwrap(),
+    )
+    .unwrap();
+    let rolled_back_sdk = LicenseSeat::try_new(offline_config).unwrap();
+    let rolled_back_restore = rolled_back_sdk.restore_license().await;
+    assert!(!rolled_back_restore.restored);
+    assert_eq!(
+        rolled_back_restore
+            .validation
+            .expect("offline validation result")
+            .code
+            .as_deref(),
+        Some("clock_tamper")
+    );
+}
+
+#[tokio::test]
+async fn authoritative_heartbeat_reanchors_a_poisoned_clock_watermark() {
+    let fixture = fixture();
+    let server = MockServer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    let prefix = "ruby_watermark_heartbeat_";
+    let (sdk, online_config) =
+        sdk_with_cached_machine_file(&server, &storage, &fixture, prefix).await;
+    drop(sdk);
+
+    let last_seen_path = storage.path().join(format!("{prefix}last_seen_ts.json"));
+    let poisoned_timestamp = Utc::now().timestamp() + 3_600;
+    std::fs::write(
+        &last_seen_path,
+        serde_json::to_vec_pretty(&poisoned_timestamp).unwrap(),
+    )
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/heartbeat$"))
+        .respond_with(heartbeat_responder())
+        .mount(&server)
+        .await;
+    let online_sdk = LicenseSeat::try_new(online_config).unwrap();
+    online_sdk.heartbeat().await.unwrap();
+    drop(online_sdk);
+
+    let anchored: i64 = serde_json::from_slice(&std::fs::read(&last_seen_path).unwrap()).unwrap();
+    assert!(
+        anchored < poisoned_timestamp,
+        "a server-accepted heartbeat must also re-anchor the watermark \
+         (anchored {anchored}, poisoned {poisoned_timestamp})"
     );
 }

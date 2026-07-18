@@ -13,13 +13,23 @@ use std::sync::{Mutex, MutexGuard};
 
 const INSTALLATION_IDENTIFIER_KEY: &str = "installation_identifier";
 const MAX_CACHE_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const LAST_SEEN_TIMESTAMP_KEY: &str = "last_seen_ts";
 const LICENSE_STATE_KEYS: &[&str] = &[
     "license",
     "license_snapshot",
     "machine_file",
     "offline_token",
-    "last_seen_ts",
+    LAST_SEEN_TIMESTAMP_KEY,
 ];
+/// Keys that deliberately survive `clear()`/`reset()`.
+///
+/// The installation identifier survives so an upgrade or reset never consumes
+/// an extra server seat. The clock-rollback watermark survives so a local
+/// reset cannot be combined with a clock rollback to re-import previously
+/// exported signed artifact files and extend an offline window; it is
+/// re-anchored (and may move backward) only by an authoritative online
+/// operation.
+const CLEAR_SURVIVING_KEYS: &[&str] = &[INSTALLATION_IDENTIFIER_KEY, LAST_SEEN_TIMESTAMP_KEY];
 
 /// Cache for persisting license data.
 #[derive(Debug)]
@@ -234,21 +244,27 @@ impl LicenseCache {
             .into_iter()
             .flatten()
         {
-            if existing_real_directory(directory)? {
-                let path = self
-                    .path_in(Some(directory), key)
-                    .ok_or_else(|| Error::Cache("invalid cache key".into()))?;
-                let target_file_name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .ok_or_else(|| Error::Cache("invalid cache file name".into()))?;
-                let removed_file = remove_cache_file(&path)?;
-                let removed_temporary =
-                    remove_atomic_temporary_files_for_target(directory, target_file_name)?;
-                if removed_file || removed_temporary {
-                    sync_parent_directory(directory)?;
-                }
-            }
+            self.remove_key_in_directory_unlocked(directory, key)?;
+        }
+        Ok(())
+    }
+
+    fn remove_key_in_directory_unlocked(&self, directory: &Path, key: &str) -> Result<()> {
+        if !existing_real_directory(directory)? {
+            return Ok(());
+        }
+        let path = self
+            .path_in(Some(directory), key)
+            .ok_or_else(|| Error::Cache("invalid cache key".into()))?;
+        let target_file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::Cache("invalid cache file name".into()))?;
+        let removed_file = remove_cache_file(&path)?;
+        let removed_temporary =
+            remove_atomic_temporary_files_for_target(directory, target_file_name)?;
+        if removed_file || removed_temporary {
+            sync_parent_directory(directory)?;
         }
         Ok(())
     }
@@ -262,11 +278,15 @@ impl LicenseCache {
         // Remove every grant/supporting artifact before deleting the license
         // record. When the record is a denial tombstone, this ordering ensures
         // a partial cleanup cannot expose an older signed artifact without the
-        // stronger denial that blocks it.
+        // stronger denial that blocks it. The clock-rollback watermark is
+        // preserved exactly like the installation identifier (see
+        // `CLEAR_SURVIVING_KEYS`); license and artifact grants die here, so
+        // keeping the watermark costs nothing and closes the
+        // "reset, roll the clock back, re-import artifact files" variant.
         for key in LICENSE_STATE_KEYS
             .iter()
             .copied()
-            .filter(|key| *key != "license")
+            .filter(|key| *key != "license" && !CLEAR_SURVIVING_KEYS.contains(key))
         {
             if let Some(path) = self.path_in(Some(directory), key) {
                 removed_any |= remove_cache_file(&path)?;
@@ -395,7 +415,10 @@ impl LicenseCache {
         self.set_unlocked("license", license)?;
 
         let mut warnings = Vec::new();
-        if let Err(error) = self.set_last_seen_timestamp_unlocked(observed_at) {
+        // A committed activation is an authoritative online acceptance, so the
+        // watermark is re-anchored (possibly lowered) to the observed commit
+        // time rather than max()-advanced. See `anchor_last_seen_timestamp`.
+        if let Err(error) = self.anchor_last_seen_timestamp_unlocked(observed_at) {
             warnings.push(format!(
                 "activation was saved but the clock watermark could not be updated: {error}"
             ));
@@ -598,7 +621,11 @@ impl LicenseCache {
     // Timestamps
     // ========================================================================
 
-    /// Store the last seen timestamp (for clock tampering detection).
+    /// Advance the last seen timestamp (for clock tampering detection).
+    ///
+    /// This only ratchets upward. Offline verification must use this method so
+    /// a rolled-back clock can never lower the watermark. Authoritative online
+    /// successes use [`Self::anchor_last_seen_timestamp`] instead.
     pub fn set_last_seen_timestamp(&self, timestamp: i64) -> Result<()> {
         if timestamp <= 0 {
             return Err(Error::Cache("last-seen timestamp must be positive".into()));
@@ -608,13 +635,47 @@ impl LicenseCache {
     }
 
     fn set_last_seen_timestamp_unlocked(&self, timestamp: i64) -> Result<()> {
-        let existing = self.get_unlocked::<i64>("last_seen_ts").unwrap_or_default();
-        self.set_unlocked("last_seen_ts", &timestamp.max(existing))
+        let existing = self
+            .get_unlocked::<i64>(LAST_SEEN_TIMESTAMP_KEY)
+            .unwrap_or_default();
+        self.set_unlocked(LAST_SEEN_TIMESTAMP_KEY, &timestamp.max(existing))
+    }
+
+    /// Re-anchor the clock-rollback watermark to an authoritative observation.
+    ///
+    /// Unlike [`Self::set_last_seen_timestamp`], this may LOWER the stored
+    /// value. It must only be called when the server has just accepted an
+    /// authenticated request (activation commit, online validation success,
+    /// heartbeat success): the server accepted the request as valid *now*, so
+    /// the current local time is the best available trust anchor. Re-anchoring
+    /// recovers installations whose watermark was poisoned by a transiently
+    /// future-set clock, while rollback detection continues to protect the
+    /// offline windows between authoritative contacts.
+    pub fn anchor_last_seen_timestamp(&self, timestamp: i64) -> Result<()> {
+        if timestamp <= 0 {
+            return Err(Error::Cache("last-seen timestamp must be positive".into()));
+        }
+        let _guard = self.lock_io()?;
+        self.anchor_last_seen_timestamp_unlocked(timestamp)
+    }
+
+    fn anchor_last_seen_timestamp_unlocked(&self, timestamp: i64) -> Result<()> {
+        self.set_unlocked(LAST_SEEN_TIMESTAMP_KEY, &timestamp)?;
+        // Writes only ever target the durable directory, so the anchor above
+        // cannot lower a stale copy of the watermark left in the legacy cache
+        // directory. Purge that slot here: the legacy read fallback in
+        // `get_unlocked` copies legacy values back verbatim whenever the
+        // durable file is missing, so a surviving legacy copy could otherwise
+        // re-poison the watermark this authoritative anchor just repaired.
+        if let Some(legacy_directory) = self.legacy_cache_dir.as_deref() {
+            self.remove_key_in_directory_unlocked(legacy_directory, LAST_SEEN_TIMESTAMP_KEY)?;
+        }
+        Ok(())
     }
 
     /// Get the last seen timestamp.
     pub fn get_last_seen_timestamp(&self) -> Option<i64> {
-        self.get("last_seen_ts")
+        self.get(LAST_SEEN_TIMESTAMP_KEY)
     }
 
     // ========================================================================
@@ -657,7 +718,9 @@ impl LicenseCache {
     }
 
     /// Clear license grants and derived artifacts while preserving the stable
-    /// installation identifier.
+    /// installation identifier and the clock-rollback watermark
+    /// (`last_seen_ts`), which only authoritative online operations may
+    /// re-anchor.
     pub fn clear(&self) -> Result<()> {
         let _guard = self.lock_io()?;
         self.clear_unlocked()
@@ -1301,6 +1364,98 @@ mod tests {
         cache.set_last_seen_timestamp(100).expect("older timestamp");
         assert_eq!(cache.get_last_seen_timestamp(), Some(200));
         assert!(cache.set_last_seen_timestamp(0).is_err());
+    }
+
+    #[test]
+    fn authoritative_anchor_may_lower_watermark() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let cache = LicenseCache::new("watermark_anchor_", Some(directory.path().into()));
+        // A transiently future-set clock poisoned the ratcheting watermark.
+        cache
+            .set_last_seen_timestamp(4_102_444_800)
+            .expect("poisoned future timestamp");
+        cache
+            .anchor_last_seen_timestamp(1_700_000_000)
+            .expect("authoritative online re-anchor");
+        assert_eq!(cache.get_last_seen_timestamp(), Some(1_700_000_000));
+        assert!(cache.anchor_last_seen_timestamp(0).is_err());
+        // The offline ratchet still refuses to move backward afterwards.
+        cache.set_last_seen_timestamp(100).expect("older timestamp");
+        assert_eq!(cache.get_last_seen_timestamp(), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn clear_preserves_clock_rollback_watermark() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let cache = LicenseCache::new("watermark_clear_", Some(directory.path().into()));
+        let license = sample_license("KEY", "fingerprint", "activation");
+        cache
+            .commit_activation(&license, 1_700_000_000)
+            .expect("activation commit");
+        assert_eq!(cache.get_last_seen_timestamp(), Some(1_700_000_000));
+
+        cache.clear().expect("clear");
+        assert!(cache.get_license().is_none());
+        assert_eq!(
+            cache.get_last_seen_timestamp(),
+            Some(1_700_000_000),
+            "clear/reset must preserve the rollback watermark like the installation identifier"
+        );
+
+        cache
+            .commit_activation(&license, 1_700_000_100)
+            .expect("second activation commit");
+        assert!(
+            cache
+                .invalidate_and_clear(
+                    &license.identity(),
+                    "locally_reset",
+                    "License state was reset locally",
+                    chrono::Utc::now(),
+                )
+                .expect("reset-style invalidate and clear")
+        );
+        assert!(cache.get_license().is_none());
+        assert_eq!(
+            cache.get_last_seen_timestamp(),
+            Some(1_700_000_100),
+            "the reset path must also preserve the rollback watermark"
+        );
+    }
+
+    #[test]
+    fn anchor_purges_the_stale_legacy_watermark_slot() {
+        let current = tempfile::tempdir().expect("current directory");
+        let legacy = tempfile::tempdir().expect("legacy directory");
+        let prefix = "watermark_legacy_";
+        let poisoned_legacy = LicenseCache::new(prefix, Some(legacy.path().into()));
+        poisoned_legacy
+            .set_last_seen_timestamp(4_102_444_800)
+            .expect("poisoned legacy watermark");
+
+        let cache = LicenseCache {
+            prefix: prefix.into(),
+            cache_dir: Some(current.path().into()),
+            legacy_cache_dir: Some(legacy.path().into()),
+            io_lock: Mutex::new(()),
+        };
+        cache
+            .anchor_last_seen_timestamp(1_700_000_000)
+            .expect("authoritative online re-anchor");
+        assert_eq!(cache.get_last_seen_timestamp(), Some(1_700_000_000));
+        assert!(
+            !legacy
+                .path()
+                .join(format!("{prefix}last_seen_ts.json"))
+                .exists(),
+            "anchoring must purge the legacy watermark slot"
+        );
+
+        // Even if the durable copy is later lost, the legacy read fallback can
+        // no longer resurrect the poisoned pre-anchor value.
+        std::fs::remove_file(current.path().join(format!("{prefix}last_seen_ts.json")))
+            .expect("simulate loss of the durable copy");
+        assert_eq!(cache.get_last_seen_timestamp(), None);
     }
 
     #[cfg(unix)]

@@ -619,10 +619,19 @@ impl LicenseSeat {
                     );
                 }
                 if result.valid && stateful {
+                    // The server has just accepted this authenticated
+                    // validation, so the local clock that observed the
+                    // acceptance is the best available trust anchor: re-anchor
+                    // the rollback watermark (possibly lowering it) instead of
+                    // ratcheting. This recovers installations whose watermark
+                    // was poisoned by a transiently future-set clock. Offline
+                    // verification keeps the ratcheting
+                    // `set_last_seen_timestamp`. See
+                    // `LicenseCache::anchor_last_seen_timestamp`.
                     if let Err(error) = self
                         .inner
                         .cache
-                        .set_last_seen_timestamp(observed_at.timestamp())
+                        .anchor_last_seen_timestamp(observed_at.timestamp())
                     {
                         self.emit(Event::with_error(EventKind::SdkError, error.to_string()));
                         if let Err(cleanup_error) = self.inner.cache.clear_offline_assets() {
@@ -948,10 +957,14 @@ impl LicenseSeat {
                             operation: "heartbeat",
                         });
                     }
+                    // A server-accepted heartbeat is an authoritative online
+                    // success like validation above: re-anchor (possibly
+                    // lower) the rollback watermark rather than ratcheting.
+                    // See `LicenseCache::anchor_last_seen_timestamp`.
                     if let Err(error) = self
                         .inner
                         .cache
-                        .set_last_seen_timestamp(observed_at.timestamp())
+                        .anchor_last_seen_timestamp(observed_at.timestamp())
                     {
                         self.emit(Event::with_error(EventKind::SdkError, error.to_string()));
                         if let Err(cleanup_error) = self.inner.cache.clear_offline_assets() {
@@ -3162,6 +3175,12 @@ impl LicenseSeat {
                     Some("Offline artifact did not match the active license or product".into()),
                 );
             } else {
+                // Offline verification is not authoritative for time: it may
+                // only ratchet the watermark forward. Lowering the watermark
+                // is reserved for authoritative online successes
+                // (`LicenseCache::anchor_last_seen_timestamp`), otherwise a
+                // rolled-back clock plus a re-imported signed artifact could
+                // stretch the offline window.
                 self.inner.cache.set_last_seen_timestamp(now)?;
             }
         }
