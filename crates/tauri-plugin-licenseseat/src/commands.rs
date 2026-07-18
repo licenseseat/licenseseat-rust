@@ -1217,16 +1217,33 @@ pub async fn heartbeat_key(
     Ok(())
 }
 
+/// Run a blocking core-SDK call off the invoking thread.
+///
+/// Tauri executes command handlers on its main thread. The synchronous core
+/// calls below take the core commit mutex — which can be held across `fsync`
+/// and a cross-process advisory file lock — and may perform signature crypto
+/// and multi-megabyte cache IO, so each command hops to the blocking pool
+/// with an owned SDK handle instead of stalling the UI thread.
+async fn run_core_blocking<T, F>(task: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    Ok(tauri::async_runtime::spawn_blocking(task).await?)
+}
+
 /// Get the current license status.
 #[tauri::command]
-pub fn get_status(sdk: State<'_, licenseseat::LicenseSeat>) -> StatusResponse {
-    sdk.status().into()
+pub async fn get_status(sdk: State<'_, licenseseat::LicenseSeat>) -> Result<StatusResponse> {
+    let sdk = sdk.inner().clone();
+    run_core_blocking(move || StatusResponse::from(sdk.status())).await
 }
 
 /// Get the stable client status string.
 #[tauri::command]
-pub fn get_client_status(sdk: State<'_, licenseseat::LicenseSeat>) -> String {
-    sdk.get_client_status().to_string()
+pub async fn get_client_status(sdk: State<'_, licenseseat::LicenseSeat>) -> Result<String> {
+    let sdk = sdk.inner().clone();
+    run_core_blocking(move || sdk.get_client_status().to_string()).await
 }
 
 /// Whether the SDK currently believes the API is reachable.
@@ -1255,45 +1272,62 @@ pub async fn health(sdk: State<'_, licenseseat::LicenseSeat>) -> Result<bool> {
 
 /// Check if an entitlement is active.
 #[tauri::command]
-pub fn check_entitlement(
+pub async fn check_entitlement(
     sdk: State<'_, licenseseat::LicenseSeat>,
     entitlement_key: String,
-) -> EntitlementResponse {
-    sdk.check_entitlement(&entitlement_key).into()
+) -> Result<EntitlementResponse> {
+    let sdk = sdk.inner().clone();
+    run_core_blocking(move || EntitlementResponse::from(sdk.check_entitlement(&entitlement_key)))
+        .await
 }
 
 /// List active entitlements from runtime-established trusted state.
 #[tauri::command]
-pub fn get_entitlements(
+pub async fn get_entitlements(
     sdk: State<'_, licenseseat::LicenseSeat>,
-) -> Vec<EntitlementRecordResponse> {
-    sdk.active_entitlements()
-        .into_iter()
-        .map(Into::into)
-        .collect()
+) -> Result<Vec<EntitlementRecordResponse>> {
+    let sdk = sdk.inner().clone();
+    run_core_blocking(move || {
+        sdk.active_entitlements()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    })
+    .await
 }
 
 /// Check if an entitlement is active (returns bool).
 #[tauri::command]
-pub fn has_entitlement(sdk: State<'_, licenseseat::LicenseSeat>, entitlement_key: String) -> bool {
-    sdk.has_entitlement(&entitlement_key)
+pub async fn has_entitlement(
+    sdk: State<'_, licenseseat::LicenseSeat>,
+    entitlement_key: String,
+) -> Result<bool> {
+    let sdk = sdk.inner().clone();
+    run_core_blocking(move || sdk.has_entitlement(&entitlement_key)).await
 }
 
 /// Get the current cached license.
 #[tauri::command]
-pub fn get_license(sdk: State<'_, licenseseat::LicenseSeat>) -> Option<LicenseResponse> {
-    sdk.current_license().map(Into::into)
+pub async fn get_license(
+    sdk: State<'_, licenseseat::LicenseSeat>,
+) -> Result<Option<LicenseResponse>> {
+    let sdk = sdk.inner().clone();
+    run_core_blocking(move || sdk.current_license().map(LicenseResponse::from)).await
 }
 
 /// Get a consolidated view of the current plugin state.
 #[tauri::command]
-pub fn get_state(sdk: State<'_, licenseseat::LicenseSeat>) -> StateResponse {
-    map_state_response(&sdk)
+pub async fn get_state(sdk: State<'_, licenseseat::LicenseSeat>) -> Result<StateResponse> {
+    let sdk = sdk.inner().clone();
+    run_core_blocking(move || map_state_response(&sdk)).await
 }
 
 #[tauri::command]
-pub fn get_admin_snapshot(sdk: State<'_, licenseseat::LicenseSeat>) -> AdminSnapshotResponse {
-    map_admin_snapshot_response(&sdk, sdk.config())
+pub async fn get_admin_snapshot(
+    sdk: State<'_, licenseseat::LicenseSeat>,
+) -> Result<AdminSnapshotResponse> {
+    let sdk = sdk.inner().clone();
+    run_core_blocking(move || map_admin_snapshot_response(&sdk, sdk.config())).await
 }
 
 /// Get the latest release for a product.
@@ -1371,13 +1405,17 @@ pub async fn generate_offline_token(
 
 /// Verify a legacy offline token locally.
 #[tauri::command]
-pub fn verify_offline_token(
+pub async fn verify_offline_token(
     sdk: State<'_, licenseseat::LicenseSeat>,
     offline_token: OfflineTokenResponse,
     public_key_b64: Option<String>,
 ) -> Result<bool> {
+    let sdk = sdk.inner().clone();
     let offline_token: CoreOfflineTokenResponse = offline_token.into();
-    Ok(sdk.verify_offline_token(&offline_token, public_key_b64.as_deref())?)
+    Ok(run_core_blocking(move || {
+        sdk.verify_offline_token(&offline_token, public_key_b64.as_deref())
+    })
+    .await??)
 }
 
 /// Checkout a machine file for offline validation.
@@ -1423,26 +1461,31 @@ pub async fn sync_offline_assets(sdk: State<'_, licenseseat::LicenseSeat>) -> Re
 
 /// Verify a machine file locally.
 #[tauri::command]
-pub fn verify_machine_file(
+pub async fn verify_machine_file(
     sdk: State<'_, licenseseat::LicenseSeat>,
     machine_file: MachineFileResponse,
     options: Option<MachineFileVerificationOptionsInput>,
 ) -> Result<MachineFileVerificationResultResponse> {
+    let sdk = sdk.inner().clone();
     let options = options.unwrap_or_default();
     let machine_file = MachineFile::try_from(machine_file)?;
-    let result = sdk.verify_machine_file(
-        &machine_file,
-        options.public_key_b64.as_deref(),
-        options.license_key.as_deref(),
-        options.fingerprint.as_deref(),
-    )?;
+    let result = run_core_blocking(move || {
+        sdk.verify_machine_file(
+            &machine_file,
+            options.public_key_b64.as_deref(),
+            options.license_key.as_deref(),
+            options.fingerprint.as_deref(),
+        )
+    })
+    .await??;
     Ok(result.into())
 }
 
 /// Reset the SDK state.
 #[tauri::command]
-pub fn reset(sdk: State<'_, licenseseat::LicenseSeat>) -> Result<()> {
-    sdk.try_reset()?;
+pub async fn reset(sdk: State<'_, licenseseat::LicenseSeat>) -> Result<()> {
+    let sdk = sdk.inner().clone();
+    run_core_blocking(move || sdk.try_reset()).await??;
     Ok(())
 }
 

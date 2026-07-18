@@ -370,6 +370,13 @@ These changes are security-significant and should be called out even when the Ru
 | `bootstrapState` revalidated by default | Restore only unless explicitly requested |
 | TLS backend flags were additive accidentally | Backend selection is explicit and independently tested |
 | One Rust 1.85 contract covered core and Tauri | Core 1.85 + Tauri 1.88 locked CI gates; patched parser graph |
+| HTTP redirects were followed (up to 10 in v0.5.3) | Redirects are disabled; `api_base_url` must be the canonical, redirect-free API endpoint |
+| Any non-empty fingerprint/`device_identifier` was accepted | New configuration/creation input requires 8-255 characters; fingerprints and installation identifiers sourced from an existing cached activation are exempt so pre-floor seats stay usable |
+| `max_retries` was unbounded | Values above 10 fail construction with a configuration error |
+| TS admin snapshot exposed `apiKey`, `deviceIdentifier`, `signingPublicKey`, `SigningKeyRecord.publicKey`, and `cachePaths.signingKeyPath` | Renamed to `apiKeyConfigured`, `deviceIdentifierConfigured`, `signingPublicKeyConfigured`, and `publicKeyConfigured` presence booleans; `cachePaths.signingKeyPath` removed |
+| `PluginConfig` was `app.manage`d and readable from Tauri state | Only the core SDK handle is managed |
+| `activateAndGetState` issued an extra validation request | Returns the activation plus one `getState()` snapshot; the activation response is already the validated grant |
+| `clear()`/reset deleted the clock-rollback watermark, and offline verification was its only writer | `last_seen_ts` survives clear/reset like the installation identifier; authoritative online successes (activation, validation, heartbeat) re-anchor it and may lower it, while offline verification still only ratchets it forward |
 
 Migration guidance:
 

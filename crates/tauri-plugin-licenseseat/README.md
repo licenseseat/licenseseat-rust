@@ -199,7 +199,7 @@ const detail = await checkEntitlement('cloud-sync');
 // reason: 'nolicense' | 'invalidlicense' | 'notfound' | 'expired' | undefined
 ```
 
-Activation immediately establishes a trusted online grant. `activateAndGetState` then attempts one validation, but intentionally returns the latest activation state even if that extra check fails.
+Activation immediately establishes a trusted online grant. `activateAndGetState` performs no additional validation request — the activation response already contains the validated grant — and simply returns one `getState()` snapshot read after the activation succeeds.
 
 Use `hasEntitlement`, `checkEntitlement`, `getEntitlements`, or the entitlement fields in `getState`. Do not gate from `getLicense` or raw `validation.license.activeEntitlements`; diagnostic data can exist while the process is pending/untrusted.
 
@@ -269,7 +269,7 @@ try {
   await activate(customerLicenseKey);
 } catch (cause) {
   const error: LicenseSeatPluginError = normalizeError(cause);
-  console.error(error.code, error.message, error.status, error.details);
+  console.error(error.code, error.message, error.status, error.cause);
 }
 ```
 

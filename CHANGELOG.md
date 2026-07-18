@@ -73,6 +73,26 @@ and complete local release gate.
   wildcard arm.
 - Startup restore uses validation itself as the single reachability/authority
   probe, avoiding a redundant health request and health-to-validation race.
+- HTTP redirects are no longer followed (0.5.3 followed up to 10);
+  `api_base_url` must point at the canonical, redirect-free API endpoint.
+- New `device_identifier`/fingerprint configuration and creation input must be
+  8-255 characters. Fingerprints and installation identifiers sourced from an
+  existing cached activation are exempt, so seats activated before the floor
+  (or by another SDK without it) can still validate, heartbeat, deactivate,
+  and be adopted instead of burning a second seat.
+- `max_retries` above 10 now fails construction with a configuration error.
+- The Tauri admin snapshot replaces `apiKey`, `deviceIdentifier`,
+  `signingPublicKey`, and `SigningKeyRecord.publicKey` with
+  `apiKeyConfigured`/`deviceIdentifierConfigured`/`signingPublicKeyConfigured`/
+  `publicKeyConfigured` presence booleans and removes
+  `cachePaths.signingKeyPath`; `PluginConfig` is no longer `app.manage`d.
+- `activateAndGetState` no longer issues an extra validation request; it
+  returns the activation plus one state snapshot.
+- The clock-rollback watermark (`last_seen_ts`) now survives `clear()`/reset
+  like the installation identifier. Authoritative online successes
+  (activation, validation, heartbeat) re-anchor it — and may lower it, which
+  recovers installations poisoned by a transiently future-set clock — while
+  offline verification still only ratchets it forward.
 
 ### Fixed
 
@@ -99,6 +119,17 @@ and complete local release gate.
 - Fixed signed-offline fallback when health would succeed but validation itself
   returns a transient outage, and guaranteed terminal offline failure events
   for cache/commit errors.
+- Bound cached machine-file verification during offline validation to the
+  expected license key, so a restored foreign-license artifact fails
+  verification with `LICENSE_MISMATCH` instead of emitting
+  `MachineFileVerified` and relying on the final grant binding.
+- Moved the synchronous Tauri commands (status/state/entitlement/license
+  reads, offline verification helpers, and reset) onto the blocking pool so
+  the core commit mutex, cross-process file lock, crypto, and cache IO can no
+  longer stall Tauri's main thread.
+- Added a plugin test that pins the triplicated command registry: the
+  `build.rs` command list and the default plus opt-in permission sets must
+  exactly partition the command surface.
 - Corrected documentation for fallback policy, Base64 encoding, telemetry,
   signing-key pinning, installation identity, Tauri permissions, and trusted
   entitlement use.
