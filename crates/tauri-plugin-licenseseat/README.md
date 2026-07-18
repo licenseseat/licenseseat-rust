@@ -254,6 +254,8 @@ Event names use `licenseseat://` and include lifecycle, offline artifact, offlin
 
 The bridge handles Tokio broadcast lag by warning and continuing rather than terminating permanently. Consumers should resynchronize through `getState` after any suspected gap.
 
+**Events are not gated by the plugin permission system.** The bridge emits through Tauri's global event system, and listening requires only `core:event:allow-listen` (part of `core:default`) — no `licenseseat:*` permission. Any window holding core defaults can therefore observe every bridged payload, including `activation-success`/`license-loaded` payloads that carry the license key. If any window renders remote or third-party content, set `emitFrontendEvents: false` and have trusted windows poll `getState`, or withhold `core:event:allow-listen` from that window's capability. The native-facade pattern above avoids the exposure entirely.
+
 ## Error handling
 
 Every command rejects with a normalized `LicenseSeatPluginError`:
