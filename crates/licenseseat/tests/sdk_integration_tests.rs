@@ -47,13 +47,16 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
+        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
         device_identifier: Some("device-123".into()),
         auto_validate_interval: Duration::from_secs(0), // Disable for tests
         heartbeat_interval: Duration::from_secs(0),     // Disable for tests
         offline_fallback_mode: OfflineFallbackMode::NetworkOnly,
-        max_offline_days: 0,
+        // Offline-oriented integration tests opt in explicitly. The production
+        // default remains zero, which disables offline authority.
+        max_offline_days: 7,
         debug: true,
         telemetry_enabled: true,
         ..Default::default()
@@ -143,13 +146,35 @@ fn activation_response_with_license(
 }
 
 fn validation_response(valid: bool, license_key: &str) -> serde_json::Value {
+    validation_response_for_fingerprint(valid, license_key, "device-123")
+}
+
+fn validation_response_for_fingerprint(
+    valid: bool,
+    license_key: &str,
+    fingerprint: &str,
+) -> serde_json::Value {
     let status = if valid { "active" } else { "expired" };
     let mut response = json!({
         "object": "validation_result",
         "valid": valid,
         "warnings": null,
         "license": license_json(license_key, status, "pro", "hardware_locked", &[], "Test App"),
-        "activation": null
+        "activation": if valid {
+            Some(json!({
+                "object": "activation",
+                "id": "act-12345-uuid",
+                "device_id": fingerprint,
+                "device_name": "Test Device",
+                "license_key": license_key,
+                "activated_at": Utc::now().to_rfc3339(),
+                "deactivated_at": null,
+                "ip_address": "127.0.0.1",
+                "metadata": null
+            }))
+        } else {
+            None
+        }
     });
     if valid {
         response["code"] = serde_json::Value::Null;
@@ -162,6 +187,13 @@ fn validation_response(valid: bool, license_key: &str) -> serde_json::Value {
 }
 
 fn validation_with_entitlements(license_key: &str) -> serde_json::Value {
+    validation_with_entitlements_for_fingerprint(license_key, "device-123")
+}
+
+fn validation_with_entitlements_for_fingerprint(
+    license_key: &str,
+    fingerprint: &str,
+) -> serde_json::Value {
     json!({
         "object": "validation_result",
         "valid": true,
@@ -176,7 +208,17 @@ fn validation_with_entitlements(license_key: &str) -> serde_json::Value {
             &["pro-features", "api-access"],
             "Test App"
         ),
-        "activation": null
+        "activation": {
+            "object": "activation",
+            "id": "act-12345-uuid",
+            "device_id": fingerprint,
+            "device_name": "Test Device",
+            "license_key": license_key,
+            "activated_at": Utc::now().to_rfc3339(),
+            "deactivated_at": null,
+            "ip_address": "127.0.0.1",
+            "metadata": null
+        }
     })
 }
 
@@ -316,6 +358,9 @@ fn build_machine_file_fixture_with_timing(
         .unwrap_or_else(|| json!([]));
     let expires_at = issued_at + chrono::Duration::seconds(ttl);
 
+    let now = chrono::DateTime::<Utc>::from_timestamp(Utc::now().timestamp(), 0).unwrap();
+    let expires_at = now + chrono::Duration::days(30);
+
     let payload = json!({
         "meta": {
             "schema_version": 2,
@@ -383,10 +428,16 @@ fn build_machine_file_fixture_with_timing(
         "alg": "aes-256-gcm+ed25519",
         "kid": "key-2026"
     });
-    let certificate = format!(
-        "-----BEGIN MACHINE FILE-----\n{}\n-----END MACHINE FILE-----",
-        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&envelope).unwrap())
-    );
+    let encoded_envelope =
+        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&envelope).unwrap());
+    let wrapped_envelope = encoded_envelope
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let certificate =
+        format!("-----BEGIN MACHINE FILE-----\n{wrapped_envelope}\n-----END MACHINE FILE-----");
 
     (
         json!({
@@ -407,6 +458,38 @@ fn build_machine_file_fixture_with_timing(
         }),
         public_key_b64,
     )
+}
+
+#[cfg(feature = "offline")]
+fn machine_file_license_json(license: &serde_json::Value) -> serde_json::Value {
+    let key = license["key"].as_str().unwrap();
+    let entitlements = license["active_entitlements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entitlement| {
+            json!({
+                "key": entitlement["key"],
+                "expires_at": entitlement["expires_at"]
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "type": "licenses",
+        "id": key,
+        "attributes": {
+            "key": key,
+            "status": license["status"],
+            "mode": license["mode"],
+            "seat_limit": license["seat_limit"],
+            "plan_key": license["plan_key"],
+            "product_slug": license["product"]["slug"],
+            "starts_at": license["starts_at"],
+            "ends_at": license["expires_at"],
+            "entitlements": entitlements,
+            "metadata": {}
+        }
+    })
 }
 
 #[cfg(feature = "offline")]
@@ -500,7 +583,7 @@ async fn test_activation_success() {
     let license_key = "TEST-LICENSE-KEY";
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, "device-123")),
@@ -524,7 +607,7 @@ async fn test_activation_caches_license() {
     let license_key = "TEST-LICENSE-KEY";
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, "device-123")),
@@ -548,7 +631,7 @@ async fn test_activation_with_custom_device_id() {
     let custom_device_id = "custom-device-12345";
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, custom_device_id)),
@@ -572,11 +655,48 @@ async fn test_activation_with_custom_device_id() {
 }
 
 #[tokio::test]
+async fn test_conflicting_fingerprint_aliases_are_rejected_before_network_access() {
+    let server = MockServer::start().await;
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    let result = sdk
+        .activate_with_options(
+            "TEST-LICENSE-KEY",
+            licenseseat::ActivationOptions {
+                fingerprint: Some("fingerprint-one".into()),
+                device_id: Some("fingerprint-two".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+    assert!(matches!(result, Err(licenseseat::Error::Configuration(_))));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_invalid_fingerprint_is_rejected_before_network_access() {
+    let server = MockServer::start().await;
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    let result = sdk
+        .activate_with_options(
+            "TEST-LICENSE-KEY",
+            licenseseat::ActivationOptions {
+                fingerprint: Some("short".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+    assert!(matches!(result, Err(licenseseat::Error::Configuration(_))));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_activation_invalid_license() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(404).set_body_json(api_error_response(
             "license_not_found",
             "License key not found",
@@ -621,7 +741,7 @@ async fn test_validation_success() {
     let license_key = "TEST-LICENSE-KEY";
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, "device-123")),
@@ -630,7 +750,7 @@ async fn test_validation_success() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(validation_response(true, license_key)),
         )
@@ -652,7 +772,7 @@ async fn test_validation_with_entitlements() {
     let license_key = "TEST-LICENSE-KEY";
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, "device-123")),
@@ -661,7 +781,7 @@ async fn test_validation_with_entitlements() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(validation_with_entitlements(license_key)),
         )
@@ -684,7 +804,7 @@ async fn test_validation_invalid() {
     let license_key = "TEST-LICENSE-KEY";
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, "device-123")),
@@ -693,7 +813,7 @@ async fn test_validation_invalid() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(validation_response(false, license_key)),
         )
@@ -710,6 +830,67 @@ async fn test_validation_invalid() {
     assert_eq!(validation.code.as_deref(), Some("license_expired"));
 }
 
+#[tokio::test]
+async fn test_invalid_validation_cannot_grant_returned_entitlements() {
+    let server = MockServer::start().await;
+    let license_key = "TEST-LICENSE-KEY";
+    let mut invalid = validation_with_entitlements(license_key);
+    invalid["valid"] = json!(false);
+    invalid["code"] = json!("license_suspended");
+    invalid["message"] = json!("License is suspended");
+    invalid["license"]["status"] = json!("suspended");
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(activation_response(license_key, "device-123")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(invalid))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    sdk.activate(license_key).await.unwrap();
+    assert!(!sdk.validate().await.unwrap().valid);
+    assert!(!sdk.has_entitlement("pro-features"));
+    assert!(!sdk.check_entitlement("pro-features").active);
+}
+
+#[tokio::test]
+async fn test_valid_flag_with_expired_license_fails_closed() {
+    let server = MockServer::start().await;
+    let license_key = "TEST-LICENSE-KEY";
+    let mut inconsistent = validation_with_entitlements(license_key);
+    inconsistent["license"]["status"] = json!("expired");
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(activation_response(license_key, "device-123")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(inconsistent))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    sdk.activate(license_key).await.unwrap();
+    assert!(matches!(
+        sdk.validate().await,
+        Err(licenseseat::Error::InvalidResponse(_))
+    ));
+    assert!(!sdk.has_entitlement("pro-features"));
+}
+
 // ============================================================================
 // Entitlement Tests
 // ============================================================================
@@ -720,7 +901,7 @@ async fn test_entitlement_active() {
     let license_key = "TEST-LICENSE-KEY";
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, "device-123")),
@@ -729,7 +910,7 @@ async fn test_entitlement_active() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(validation_with_entitlements(license_key)),
         )
@@ -753,7 +934,7 @@ async fn test_entitlement_not_found() {
     let license_key = "TEST-LICENSE-KEY";
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, "device-123")),
@@ -762,7 +943,7 @@ async fn test_entitlement_not_found() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(validation_with_entitlements(license_key)),
         )
@@ -799,7 +980,7 @@ async fn test_deactivation_success() {
     let license_key = "TEST-LICENSE-KEY";
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, "device-123")),
@@ -808,7 +989,7 @@ async fn test_deactivation_success() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/deactivate"))
+        .and(path_regex(r"/products/.*/licenses/deactivate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(deactivation_response()))
         .mount(&server)
         .await;
@@ -830,9 +1011,7 @@ async fn test_deactivate_key_uses_explicit_license_and_fingerprint() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path(
-            "/products/test-product/licenses/TEST-LICENSE-KEY/deactivate",
-        ))
+        .and(path("/products/test-product/licenses/deactivate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(deactivation_response()))
         .mount(&server)
         .await;
@@ -984,7 +1163,7 @@ async fn test_status_active_immediately_after_activation() {
     let license_key = "TEST-LICENSE-KEY";
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, "device-123")),
@@ -1007,7 +1186,7 @@ async fn test_status_active_after_validation() {
     let license_key = "TEST-LICENSE-KEY";
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, "device-123")),
@@ -1016,7 +1195,7 @@ async fn test_status_active_after_validation() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(validation_response(true, license_key)),
         )
@@ -1200,7 +1379,7 @@ async fn test_heartbeat_success() {
     let license_key = "TEST-LICENSE-KEY";
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, "device-123")),
@@ -1209,7 +1388,7 @@ async fn test_heartbeat_success() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/heartbeat"))
+        .and(path_regex(r"/products/.*/licenses/heartbeat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(heartbeat_response(license_key)))
         .mount(&server)
         .await;
@@ -1247,7 +1426,7 @@ async fn test_offline_restore_does_not_reuse_unsigned_heartbeat_metadata() {
         build_machine_file_fixture_without_license(license_key, fingerprint);
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201).set_body_json(activation_response_with_license(
                 license_key,
@@ -1259,7 +1438,7 @@ async fn test_offline_restore_does_not_reuse_unsigned_heartbeat_metadata() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/heartbeat"))
+        .and(path_regex(r"/products/.*/licenses/heartbeat"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(heartbeat_response_with_license(heartbeat_license)),
@@ -1268,9 +1447,7 @@ async fn test_offline_restore_does_not_reuse_unsigned_heartbeat_metadata() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path(
-            "/products/test-product/licenses/TEST-LICENSE-KEY/machine-file",
-        ))
+        .and(path("/products/test-product/licenses/machine-file"))
         .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
         .mount(&server)
         .await;
@@ -1499,9 +1676,7 @@ async fn test_heartbeat_key_uses_explicit_license_and_fingerprint() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path(
-            "/products/test-product/licenses/TEST-LICENSE-KEY/heartbeat",
-        ))
+        .and(path("/products/test-product/licenses/heartbeat"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(heartbeat_response("TEST-LICENSE-KEY")),
         )
@@ -1542,7 +1717,7 @@ async fn test_reset_clears_license() {
     let license_key = "TEST-LICENSE-KEY";
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, "device-123")),
@@ -1570,7 +1745,7 @@ async fn test_api_error_401_unauthorized() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(401)
                 .set_body_json(api_error_response("invalid_api_key", "Invalid API key")),
@@ -1602,7 +1777,7 @@ async fn test_api_error_422_seat_limit() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(422).set_body_json(api_error_response(
             "seat_limit_exceeded",
             "License seat limit exceeded",
@@ -1633,7 +1808,7 @@ async fn test_full_license_lifecycle() {
 
     // Setup all mocks
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response(license_key, "device-123")),
@@ -1642,7 +1817,7 @@ async fn test_full_license_lifecycle() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(validation_with_entitlements(license_key)),
         )
@@ -1650,7 +1825,7 @@ async fn test_full_license_lifecycle() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/deactivate"))
+        .and(path_regex(r"/products/.*/licenses/deactivate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(deactivation_response()))
         .mount(&server)
         .await;
@@ -1798,6 +1973,37 @@ async fn test_generate_download_token() {
 
 #[cfg(feature = "offline")]
 #[tokio::test]
+async fn test_invalid_machine_file_lifetime_options_are_rejected_before_network_access() {
+    let server = MockServer::start().await;
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+
+    let invalid_ttl = sdk
+        .checkout_machine_file("TEST-LICENSE-KEY", Some("fingerprint-123"), Some(0))
+        .await;
+    assert!(matches!(
+        invalid_ttl,
+        Err(licenseseat::Error::Configuration(_))
+    ));
+
+    let invalid_grace = sdk
+        .checkout_machine_file_with_options(
+            "TEST-LICENSE-KEY",
+            licenseseat::MachineFileCheckoutOptions {
+                fingerprint: Some("fingerprint-123".into()),
+                grace_period_days: Some(31),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(
+        invalid_grace,
+        Err(licenseseat::Error::Configuration(_))
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
 async fn test_checkout_machine_file() {
     let server = MockServer::start().await;
     let license_key = "TEST-LICENSE-KEY";
@@ -1842,9 +2048,7 @@ async fn test_checkout_machine_file_parses_errors_array() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path(
-            "/products/test-product/licenses/TEST-LICENSE-KEY/machine-file",
-        ))
+        .and(path("/products/test-product/licenses/machine-file"))
         .respond_with(ResponseTemplate::new(422).set_body_json(json!({
             "errors": [
                 {
@@ -2046,9 +2250,7 @@ async fn test_checkout_machine_file_preserves_json_api_error_details() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path(
-            "/products/test-product/licenses/TEST-LICENSE-KEY/machine-file",
-        ))
+        .and(path("/products/test-product/licenses/machine-file"))
         .respond_with(ResponseTemplate::new(422).set_body_json(json!({
             "errors": [
                 {
@@ -2112,7 +2314,7 @@ async fn test_verify_machine_file_and_restore_offline() {
         build_machine_file_fixture(license_key, fingerprint);
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201).set_body_json(activation_response(license_key, fingerprint)),
         )
@@ -2120,9 +2322,7 @@ async fn test_verify_machine_file_and_restore_offline() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path(
-            "/products/test-product/licenses/TEST-LICENSE-KEY/machine-file",
-        ))
+        .and(path("/products/test-product/licenses/machine-file"))
         .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response.clone()))
         .mount(&server)
         .await;
@@ -2186,7 +2386,7 @@ async fn test_offline_restore_does_not_reuse_unsigned_activation_metadata_when_s
         build_machine_file_fixture_without_license(license_key, fingerprint);
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201).set_body_json(activation_response_with_license(
                 license_key,
@@ -2198,9 +2398,7 @@ async fn test_offline_restore_does_not_reuse_unsigned_activation_metadata_when_s
         .await;
 
     Mock::given(method("POST"))
-        .and(path(
-            "/products/test-product/licenses/TEST-LICENSE-KEY/machine-file",
-        ))
+        .and(path("/products/test-product/licenses/machine-file"))
         .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
         .mount(&server)
         .await;
@@ -2259,7 +2457,7 @@ async fn test_offline_restore_does_not_reuse_unsigned_validation_metadata_when_s
         build_machine_file_fixture_without_license(license_key, fingerprint);
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201).set_body_json(activation_response(license_key, fingerprint)),
         )
@@ -2267,19 +2465,15 @@ async fn test_offline_restore_does_not_reuse_unsigned_validation_metadata_when_s
         .await;
 
     Mock::given(method("POST"))
-        .and(path(
-            "/products/test-product/licenses/TEST-LICENSE-KEY/validate",
+        .and(path("/products/test-product/licenses/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            validation_with_entitlements_for_fingerprint(license_key, fingerprint),
         ))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(validation_with_entitlements(license_key)),
-        )
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path(
-            "/products/test-product/licenses/TEST-LICENSE-KEY/machine-file",
-        ))
+        .and(path("/products/test-product/licenses/machine-file"))
         .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
         .mount(&server)
         .await;
@@ -2352,7 +2546,7 @@ async fn test_restore_offline_prefers_embedded_machine_file_license_over_cached_
     );
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201).set_body_json(activation_response(license_key, fingerprint)),
         )
@@ -2360,19 +2554,15 @@ async fn test_restore_offline_prefers_embedded_machine_file_license_over_cached_
         .await;
 
     Mock::given(method("POST"))
-        .and(path(
-            "/products/test-product/licenses/TEST-LICENSE-KEY/validate",
+        .and(path("/products/test-product/licenses/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            validation_with_entitlements_for_fingerprint(license_key, fingerprint),
         ))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(validation_with_entitlements(license_key)),
-        )
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path(
-            "/products/test-product/licenses/TEST-LICENSE-KEY/machine-file",
-        ))
+        .and(path("/products/test-product/licenses/machine-file"))
         .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
         .mount(&server)
         .await;
@@ -2444,7 +2634,7 @@ async fn test_auth_header_present() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .and(header("Authorization", "Bearer test-api-key"))
         .respond_with(
             ResponseTemplate::new(201).set_body_json(activation_response("TEST-KEY", "device-123")),
@@ -2457,4 +2647,383 @@ async fn test_auth_header_present() {
 
     // If the auth header wasn't present, the mock wouldn't match
     assert!(result.is_ok());
+}
+
+// ============================================================================
+// Adversarial Trust-Boundary Regression Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_valid_validation_for_another_key_cannot_replace_current_authorization() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(activation_response("CURRENT-KEY", "device-123")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(validation_with_entitlements("OTHER-KEY")),
+        )
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    sdk.activate("CURRENT-KEY").await.unwrap();
+    let other = sdk.validate_key("OTHER-KEY").await.unwrap();
+
+    assert!(other.valid);
+    assert_eq!(other.license.key, "OTHER-KEY");
+    assert!(sdk.current_license().unwrap().validation.is_none());
+    assert!(!sdk.has_entitlement("pro-features"));
+    assert!(matches!(sdk.status(), LicenseStatus::Pending { .. }));
+}
+
+#[tokio::test]
+async fn test_valid_validation_requires_matching_activation_proof() {
+    let server = MockServer::start().await;
+    let mut response = validation_with_entitlements("TEST-LICENSE-KEY");
+    response["activation"] = serde_json::Value::Null;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(activation_response("TEST-LICENSE-KEY", "device-123")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    sdk.activate("TEST-LICENSE-KEY").await.unwrap();
+
+    assert!(matches!(
+        sdk.validate().await,
+        Err(licenseseat::Error::InvalidResponse(_))
+    ));
+    assert!(sdk.current_license().unwrap().validation.is_none());
+    assert!(!sdk.has_entitlement("pro-features"));
+}
+
+#[tokio::test]
+async fn test_inactive_activation_response_is_rejected() {
+    let server = MockServer::start().await;
+    let mut response = activation_response("TEST-LICENSE-KEY", "device-123");
+    response["license"]["status"] = json!("revoked");
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(response))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    assert!(matches!(
+        sdk.activate("TEST-LICENSE-KEY").await,
+        Err(licenseseat::Error::InvalidResponse(_))
+    ));
+    assert!(sdk.current_license().is_none());
+}
+
+#[tokio::test]
+async fn test_mismatched_deactivation_response_does_not_clear_current_license() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(activation_response("TEST-LICENSE-KEY", "device-123")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/deactivate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "deactivation",
+            "activation_id": "different-activation",
+            "deactivated_at": Utc::now().to_rfc3339()
+        })))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    sdk.activate("TEST-LICENSE-KEY").await.unwrap();
+
+    assert!(matches!(
+        sdk.deactivate().await,
+        Err(licenseseat::Error::InvalidResponse(_))
+    ));
+    assert!(sdk.current_license().is_some());
+}
+
+#[tokio::test]
+async fn test_inactive_heartbeat_revokes_current_in_memory_state() {
+    let server = MockServer::start().await;
+    let mut heartbeat = heartbeat_response("TEST-LICENSE-KEY");
+    heartbeat["license"]["status"] = json!("suspended");
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(activation_response("TEST-LICENSE-KEY", "device-123")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/heartbeat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(heartbeat))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    sdk.activate("TEST-LICENSE-KEY").await.unwrap();
+
+    assert!(matches!(
+        sdk.heartbeat().await,
+        Err(licenseseat::Error::InvalidResponse(_))
+    ));
+    assert!(sdk.current_license().is_none());
+}
+
+#[tokio::test]
+async fn test_untrusted_api_error_text_is_sanitized() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "error": {
+                "code": "invalid\nforged_code",
+                "message": "attacker text\nforged log line"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    let error = sdk.activate("TEST-LICENSE-KEY").await.unwrap_err();
+
+    match &error {
+        licenseseat::Error::Api { code, message, .. } => {
+            assert!(code.is_none());
+            assert_eq!(message, "Request failed");
+        }
+        other => panic!("expected API error, got {other:?}"),
+    }
+    let display = error.to_string();
+    assert!(!display.contains("forged"));
+    assert!(!display.contains('\n'));
+}
+
+#[tokio::test]
+async fn test_malformed_health_and_release_responses_fail_closed() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "health",
+            "status": "degraded",
+            "api_version": "test",
+            "timestamp": Utc::now().to_rfc3339()
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/products/test-product/releases/latest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "release",
+            "version": "9.9.9",
+            "channel": "stable",
+            "platform": "macos",
+            "published_at": Utc::now().to_rfc3339(),
+            "product_slug": "other-product"
+        })))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    assert!(matches!(
+        sdk.health_check().await,
+        Err(licenseseat::Error::InvalidResponse(_))
+    ));
+    assert!(!sdk.is_online());
+    assert!(sdk.last_health_error().is_some());
+    assert!(matches!(
+        sdk.get_latest_release(None, None, None).await,
+        Err(licenseseat::Error::InvalidResponse(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_expired_download_token_response_is_rejected() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/releases/2.1.0/download_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "download_token",
+            "token": "signed-download-token",
+            "expires_at": (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()
+        })))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    assert!(matches!(
+        sdk.generate_download_token("2.1.0", "TEST-LICENSE-KEY", None, Some("macos"))
+            .await,
+        Err(licenseseat::Error::InvalidResponse(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_invalid_release_filter_is_rejected_before_network_access() {
+    let server = MockServer::start().await;
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+
+    assert!(matches!(
+        sdk.get_latest_release(None, Some("../../beta"), None).await,
+        Err(licenseseat::Error::Configuration(_))
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn test_signed_machine_file_is_bound_to_configured_product() {
+    let server = MockServer::start().await;
+    let license_key = "TEST-LICENSE-KEY";
+    let fingerprint = "stable-product-bound-fingerprint";
+    let (machine_file_response, public_key) =
+        build_machine_file_fixture_without_license(license_key, fingerprint);
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/licenses/machine-file"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    config.device_identifier = Some(fingerprint.into());
+    config.signing_public_key = Some(public_key.clone());
+    config.signing_key_id = Some("key-2026".into());
+    let sdk = LicenseSeat::new(config);
+    let machine_file = sdk
+        .checkout_machine_file(license_key, Some(fingerprint), Some(30))
+        .await
+        .unwrap();
+
+    let mut other_product_config = test_config(&server.uri());
+    other_product_config.product_slug = "other-product".into();
+    other_product_config.device_identifier = Some(fingerprint.into());
+    other_product_config.signing_public_key = Some(public_key);
+    other_product_config.signing_key_id = Some("key-2026".into());
+    let other_product_sdk = LicenseSeat::new(other_product_config);
+
+    assert!(matches!(
+        other_product_sdk.inspect_machine_file(
+            &machine_file,
+            None,
+            Some(license_key),
+            Some(fingerprint)
+        ),
+        Err(licenseseat::Error::OfflineVerificationFailed(message))
+            if message == "PRODUCT_MISMATCH"
+    ));
+}
+
+#[tokio::test]
+async fn test_unclassified_deactivation_404_does_not_clear_local_state() {
+    let server = MockServer::start().await;
+    let license_key = "TEST-LICENSE-KEY";
+    let fingerprint = "stable-deactivation-404-fingerprint";
+
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response(license_key, fingerprint)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/licenses/deactivate"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": {
+                "code": "product_not_found",
+                "message": "Product not found"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    config.device_identifier = Some(fingerprint.into());
+    let sdk = LicenseSeat::new(config);
+    sdk.activate(license_key).await.unwrap();
+
+    assert!(matches!(
+        sdk.deactivate().await,
+        Err(licenseseat::Error::Api {
+            status: 404,
+            code: Some(code),
+            ..
+        }) if code == "product_not_found"
+    ));
+    assert_eq!(
+        sdk.current_license()
+            .as_ref()
+            .map(|license| license.license_key.as_str()),
+        Some(license_key)
+    );
+}
+
+#[tokio::test]
+async fn test_duplicate_keys_in_nested_api_metadata_are_rejected() {
+    let server = MockServer::start().await;
+    let response = r#"{
+        "object":"activation",
+        "id":"act-12345-uuid",
+        "device_id":"device-123",
+        "device_name":"Test Device",
+        "license_key":"TEST-LICENSE-KEY",
+        "activated_at":"2026-01-01T00:00:00Z",
+        "deactivated_at":null,
+        "ip_address":"127.0.0.1",
+        "metadata":{"role":"user","role":"admin"},
+        "license":{
+            "object":"license",
+            "key":"TEST-LICENSE-KEY",
+            "status":"active",
+            "starts_at":null,
+            "expires_at":null,
+            "mode":"hardware_locked",
+            "plan_key":"pro",
+            "seat_limit":5,
+            "active_seats":1,
+            "active_entitlements":[],
+            "metadata":null,
+            "product":{"slug":"test-product","name":"Test App"}
+        }
+    }"#;
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/licenses/activate"))
+        .respond_with(ResponseTemplate::new(201).set_body_raw(response, "application/json"))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    assert!(matches!(
+        sdk.activate("TEST-LICENSE-KEY").await,
+        Err(licenseseat::Error::Json(_))
+    ));
+    assert!(sdk.current_license().is_none());
 }

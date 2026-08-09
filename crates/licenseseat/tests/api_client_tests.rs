@@ -24,6 +24,7 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
+        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
         device_identifier: Some("device-123".into()),
@@ -100,7 +101,7 @@ async fn test_retry_on_5xx_then_success() {
 
     // Mount success response first (will be tried after error responses are exhausted)
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response())
@@ -111,7 +112,7 @@ async fn test_retry_on_5xx_then_success() {
 
     // Mount error response that only triggers once (mounted last = matched first)
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(502).set_body_string(r#"{"error":"bad gateway"}"#))
         .up_to_n_times(1)
         .mount(&server)
@@ -130,7 +131,7 @@ async fn test_retry_on_503_service_unavailable() {
 
     // Mount success response (baseline)
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response())
@@ -141,7 +142,7 @@ async fn test_retry_on_503_service_unavailable() {
 
     // Mount 503 errors that trigger twice
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(503).set_body_string(r#"{"error":"service unavailable"}"#),
         )
@@ -161,7 +162,7 @@ async fn test_4xx_client_errors_return_error() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({
             "error": {
                 "code": "invalid_request",
@@ -188,7 +189,7 @@ async fn test_404_returns_error() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(404).set_body_json(json!({
             "error": {
                 "code": "license_not_found",
@@ -206,7 +207,7 @@ async fn test_404_returns_error() {
 }
 
 #[tokio::test]
-async fn test_activate_encodes_license_key_in_request_path() {
+async fn test_activate_keeps_license_key_out_of_request_path() {
     let server = MockServer::start().await;
     let license_key = "TEST KEY/with#chars";
 
@@ -229,8 +230,11 @@ async fn test_activate_encodes_license_key_in_request_path() {
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].url.path(),
-        "/products/test-product/licenses/TEST%20KEY%2Fwith%23chars/activate"
+        "/products/test-product/licenses/activate"
     );
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["license_key"], license_key);
+    assert!(!requests[0].url.as_str().contains("TEST"));
 }
 
 #[tokio::test]
@@ -239,9 +243,7 @@ async fn test_activate_preserves_api_base_url_prefix_without_trailing_slash() {
     let base_url = format!("{}/api/v1", server.uri());
 
     Mock::given(method("POST"))
-        .and(path(
-            "/api/v1/products/test-product/licenses/TEST-KEY/activate",
-        ))
+        .and(path("/api/v1/products/test-product/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response())
@@ -263,9 +265,7 @@ async fn test_activate_preserves_api_base_url_prefix_with_trailing_slash() {
     let base_url = format!("{}/api/v1/", server.uri());
 
     Mock::given(method("POST"))
-        .and(path(
-            "/api/v1/products/test-product/licenses/TEST-KEY/activate",
-        ))
+        .and(path("/api/v1/products/test-product/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response())
@@ -347,7 +347,7 @@ async fn test_401_unauthorized_returns_error() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(401).set_body_json(json!({
             "error": {
                 "code": "invalid_api_key",
@@ -582,7 +582,7 @@ async fn test_authorization_header() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .and(header("Authorization", "Bearer test-api-key"))
         .respond_with(
             ResponseTemplate::new(201)
@@ -605,7 +605,7 @@ async fn test_content_type_header() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .and(header("Content-Type", "application/json"))
         .respond_with(
             ResponseTemplate::new(201)
@@ -628,7 +628,7 @@ async fn test_user_agent_header_present() {
 
     // Just verify a User-Agent header exists (any value)
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(activation_response())
@@ -653,7 +653,7 @@ async fn test_api_error_parsing() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(404).set_body_json(json!({
             "error": {
                 "code": "license_not_found",
@@ -678,7 +678,7 @@ async fn test_api_error_without_code() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(500).set_body_json(json!({
             "error": {
                 "message": "Internal server error"

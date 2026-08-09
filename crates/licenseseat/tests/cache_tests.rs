@@ -35,6 +35,7 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
+        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix(),
         device_identifier: Some("device-123".into()),
@@ -100,7 +101,7 @@ async fn test_license_cleared_after_deactivation() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/deactivate"))
+        .and(path_regex(r"/products/.*/licenses/deactivate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(deactivation_response()))
         .mount(&server)
         .await;
@@ -254,6 +255,7 @@ async fn test_same_prefix_shares_cache() {
     let config1 = Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
+        device_identifier: Some("device-123".into()),
         api_base_url: server.uri(),
         storage_prefix: prefix.clone(),
         auto_validate_interval: Duration::from_secs(0),
@@ -295,6 +297,7 @@ async fn test_license_persists_across_sdk_instances() {
         let config = Config {
             api_key: "test-api-key".into(),
             product_slug: "test-product".into(),
+            device_identifier: Some("device-123".into()),
             api_base_url: server.uri(),
             storage_prefix: prefix.clone(),
             auto_validate_interval: Duration::from_secs(0),
@@ -311,6 +314,7 @@ async fn test_license_persists_across_sdk_instances() {
         let config = Config {
             api_key: "test-api-key".into(),
             product_slug: "test-product".into(),
+            device_identifier: Some("device-123".into()),
             api_base_url: server.uri(),
             storage_prefix: prefix,
             auto_validate_interval: Duration::from_secs(0),
@@ -326,7 +330,7 @@ async fn test_license_persists_across_sdk_instances() {
 }
 
 #[tokio::test]
-async fn test_validation_persists_across_instances() {
+async fn test_persisted_validation_requires_revalidation_after_restart() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -348,6 +352,7 @@ async fn test_validation_persists_across_instances() {
         let config = Config {
             api_key: "test-api-key".into(),
             product_slug: "test-product".into(),
+            device_identifier: Some("device-123".into()),
             api_base_url: server.uri(),
             storage_prefix: prefix.clone(),
             ..Default::default()
@@ -358,11 +363,13 @@ async fn test_validation_persists_across_instances() {
         sdk.validate().await.unwrap();
     }
 
-    // Second SDK instance - should have validation result
+    // A local cache file is not an authentication boundary. A new process may
+    // recover activation identity, but must revalidate before granting access.
     {
         let config = Config {
             api_key: "test-api-key".into(),
             product_slug: "test-product".into(),
+            device_identifier: Some("device-123".into()),
             api_base_url: server.uri(),
             storage_prefix: prefix,
             ..Default::default()
@@ -370,8 +377,9 @@ async fn test_validation_persists_across_instances() {
 
         let sdk = LicenseSeat::new(config);
         let license = sdk.current_license().unwrap();
-        assert!(license.validation.is_some());
-        assert!(license.validation.unwrap().valid);
+        assert!(license.validation.is_none());
+        assert!(matches!(sdk.status(), LicenseStatus::Pending { .. }));
+        assert!(!sdk.has_entitlement("pro"));
     }
 }
 
@@ -697,7 +705,7 @@ async fn test_concurrent_entitlement_checks() {
     ];
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "object": "activation",
             "id": "act-12345-uuid",
@@ -720,7 +728,7 @@ async fn test_concurrent_entitlement_checks() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "object": "validation_result",
             "valid": true,
@@ -736,6 +744,16 @@ async fn test_concurrent_entitlement_checks() {
                     {"key": "feature-b"}
                 ],
                 "product": {"slug": "test-product", "name": "Test App"}
+            },
+            "activation": {
+                "object": "activation",
+                "id": "act-12345-uuid",
+                "device_id": "device-123",
+                "license_key": "TEST-KEY",
+                "activated_at": "2025-01-01T00:00:00Z",
+                "deactivated_at": null,
+                "ip_address": "127.0.0.1",
+                "metadata": null
             }
         })))
         .mount(&server)
@@ -800,7 +818,7 @@ async fn test_license_data_integrity() {
     });
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(custom_activation))
         .mount(&server)
         .await;
@@ -829,7 +847,7 @@ async fn test_entitlements_preserved_in_cache() {
     ];
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "object": "activation",
             "id": "act-uuid",
@@ -852,7 +870,7 @@ async fn test_entitlements_preserved_in_cache() {
 
     // Use a deliberately distant date so this test does not decay with time.
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "object": "validation_result",
             "valid": true,
@@ -910,7 +928,7 @@ async fn test_empty_entitlements() {
         .await;
 
     let sdk = LicenseSeat::new(test_config(&server.uri()));
-    sdk.activate("KEY").await.unwrap();
+    sdk.activate("TEST-KEY").await.unwrap();
     sdk.validate().await.unwrap();
 
     // No entitlements should mean has_entitlement returns false

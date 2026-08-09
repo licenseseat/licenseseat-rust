@@ -23,6 +23,7 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
+        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
         auto_validate_interval: Duration::from_secs(0),
@@ -139,7 +140,7 @@ async fn test_custom_device_id_used() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201).set_body_json(activation_response("my-custom-device-id")),
         )
@@ -174,7 +175,7 @@ async fn test_device_fingerprint_alias_used() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201).set_body_json(activation_response("legacy-device-id")),
         )
@@ -208,7 +209,7 @@ async fn test_config_device_identifier_used() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201).set_body_json(activation_response("config-level-device-id")),
         )
@@ -240,7 +241,7 @@ async fn test_activation_options_override_config() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(201).set_body_json(activation_response("options-device-id")),
         )

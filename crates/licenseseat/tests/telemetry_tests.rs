@@ -23,6 +23,7 @@ fn test_config(base_url: &str, telemetry_enabled: bool) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
+        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
         device_identifier: Some("device-123".into()),
@@ -99,7 +100,17 @@ fn validation_response() -> Value {
                 "name": "Test App"
             }
         },
-        "activation": null
+        "activation": {
+            "object": "activation",
+            "id": "act-12345-uuid",
+            "device_id": "device-123",
+            "device_name": "Test Device",
+            "license_key": "TEST-KEY",
+            "activated_at": "2025-01-01T00:00:00Z",
+            "deactivated_at": null,
+            "ip_address": "127.0.0.1",
+            "metadata": null
+        }
     })
 }
 
@@ -112,7 +123,7 @@ async fn test_telemetry_included_in_activation_request() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
@@ -146,7 +157,7 @@ async fn test_telemetry_includes_app_version() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
@@ -167,7 +178,7 @@ async fn test_telemetry_excluded_when_disabled() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
@@ -188,13 +199,13 @@ async fn test_telemetry_included_in_heartbeat() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/heartbeat"))
+        .and(path_regex(r"/products/.*/licenses/heartbeat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(heartbeat_response()))
         .mount(&server)
         .await;
@@ -222,13 +233,13 @@ async fn test_telemetry_included_in_validation() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(validation_response()))
         .mount(&server)
         .await;
@@ -260,7 +271,7 @@ async fn test_telemetry_has_required_fields() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
@@ -284,7 +295,7 @@ async fn test_telemetry_fields_are_snake_case() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
@@ -312,7 +323,7 @@ async fn test_telemetry_no_null_values() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;

@@ -9,6 +9,7 @@ use licenseseat::{
     RestoreResult, SigningKeyResponse, ValidationResult,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::State;
@@ -860,8 +861,16 @@ fn cache_dir_for_config(config: &licenseseat::Config) -> Option<PathBuf> {
 }
 
 fn cache_path_for_key(config: &licenseseat::Config, key: &str) -> Option<String> {
+    let namespace = digest_hex(config.storage_prefix.as_bytes());
+    let key_digest = digest_hex(key.as_bytes());
     cache_dir_for_config(config)
-        .map(|dir| dir.join(format!("{}{}.json", config.storage_prefix, key)))
+        .map(|dir| {
+            dir.join(format!(
+                "v2-{}-{}.json",
+                &namespace[..32],
+                &key_digest[..32]
+            ))
+        })
         .map(|path| path.to_string_lossy().into_owned())
 }
 
@@ -912,7 +921,7 @@ fn build_admin_cache_paths_response(config: &licenseseat::Config) -> AdminCacheP
     AdminCachePathsResponse {
         cache_dir: cache_dir_for_config(config).map(|value| value.to_string_lossy().into_owned()),
         license_path: cache_path_for_key(config, "license"),
-        license_snapshot_path: cache_path_for_key(config, "license_snapshot"),
+        license_snapshot_path: None,
         machine_file_path: cache_path_for_key(config, "machine_file"),
         offline_token_path: cache_path_for_key(config, "offline_token"),
         last_seen_timestamp_path: cache_path_for_key(config, "last_seen_ts"),
@@ -1491,15 +1500,16 @@ pub async fn reset(sdk: State<'_, licenseseat::LicenseSeat>) -> Result<()> {
 
 pub(crate) fn event_payload_to_json(data: Option<EventData>) -> serde_json::Value {
     match data {
-        Some(EventData::License(license)) => {
-            serde_json::to_value(LicenseResponse::from(*license)).unwrap_or(serde_json::Value::Null)
-        }
-        Some(EventData::Validation(result)) => {
-            serde_json::to_value(ValidationResultResponse::from(*result))
-                .unwrap_or(serde_json::Value::Null)
-        }
-        Some(EventData::Error(error)) | Some(EventData::Message(error)) => {
-            serde_json::Value::String(error)
+        Some(EventData::License(license)) => serde_json::json!({
+            "activatedAt": license.activated_at.to_rfc3339()
+        }),
+        Some(EventData::Validation(result)) => serde_json::json!({
+            "valid": result.valid,
+            "code": result.code,
+            "offline": result.offline
+        }),
+        Some(EventData::Error(_)) | Some(EventData::Message(_)) => {
+            serde_json::Value::String("LicenseSeat operation failed".into())
         }
         Some(EventData::NextRunAt(next_run_at)) => {
             serde_json::Value::String(next_run_at.to_rfc3339())
@@ -1701,8 +1711,12 @@ mod tests {
             }))));
 
         assert_eq!(payload["valid"], json!(false));
-        assert_eq!(payload["license"]["planKey"], json!("pro"));
-        assert_eq!(payload["message"], json!("License is invalid"));
+        assert_eq!(payload["code"], json!("license_invalid"));
+        assert_eq!(payload["offline"], json!(false));
+        let serialized = payload.to_string();
+        assert!(!serialized.contains("TEST-KEY"));
+        assert!(!serialized.contains("License is invalid"));
+        assert!(!serialized.contains("pro"));
     }
 
     #[test]

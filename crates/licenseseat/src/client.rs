@@ -8,7 +8,7 @@ use crate::models::*;
 use crate::telemetry::Telemetry;
 
 use chrono::Utc;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::de::DeserializeOwned;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,6 +16,18 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, broadcast, watch};
 use tracing::{debug, warn};
+
+const MAX_API_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_API_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RESPONSE_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_ERROR_DETAILS_BYTES: usize = 64 * 1024;
+const MAX_ERROR_MESSAGE_BYTES: usize = 1_024;
+const MAX_JSON_DEPTH: usize = 20;
+const MAX_JSON_NODES: usize = 10_000;
+const MAX_OFFLINE_DAYS: u32 = 36_600;
+#[cfg(feature = "offline")]
+const MAX_MACHINE_FILE_TTL_SECONDS: i64 = 36_600 * 86_400;
+const MAX_BACKGROUND_INTERVAL: Duration = Duration::from_secs(366 * 86_400);
 
 #[cfg(feature = "offline")]
 use crate::device::collect_fingerprint_components;
@@ -57,8 +69,19 @@ pub struct LicenseSeat {
 
 struct LicenseSeatInner {
     config: Config,
-    http: reqwest::Client,
+    // Client construction can fail (for example when the platform TLS backend
+    // cannot initialize). Keep that failure sticky and fail closed at request
+    // time instead of silently falling back to reqwest defaults, which would
+    // re-enable redirects and discard the configured headers and timeout.
+    http: Option<reqwest::Client>,
     cache: LicenseCache,
+    // Persisted online validation is only a recovery hint: local cache files are
+    // writable by the end user and therefore cannot be an authorization root.
+    license: Mutex<Option<License>>,
+    #[cfg(feature = "offline")]
+    // Keys fetched over authenticated HTTPS are trusted only for this process.
+    // A persisted public-key cache is diagnostic data, not a trust anchor.
+    trusted_signing_keys: Mutex<HashMap<String, SigningKeyResponse>>,
     event_tx: broadcast::Sender<Event>,
     fingerprint: String,
     state_commit_lock: Mutex<()>,
@@ -314,6 +337,9 @@ impl LicenseSeat {
             config,
             http,
             cache,
+            license: Mutex::new(cached_license),
+            #[cfg(feature = "offline")]
+            trusted_signing_keys: Mutex::new(HashMap::new()),
             event_tx,
             fingerprint,
             state_commit_lock: Mutex::new(()),
@@ -416,6 +442,7 @@ impl LicenseSeat {
         self.emit(Event::new(EventKind::ActivationStart));
 
         let mut body = fingerprint_alias_payload(&device_id, true);
+        body["license_key"] = serde_json::json!(license_key);
 
         if let Some(name) = &options.device_name {
             body["device_name"] = serde_json::json!(name);
@@ -425,7 +452,7 @@ impl LicenseSeat {
             body["metadata"] = serde_json::json!(metadata);
         }
 
-        let path = build_license_action_path(product_slug, license_key, "activate");
+        let path = build_license_action_path(product_slug, "activate");
 
         let outcome = match self.post::<ActivationResponse>(&path, Some(body)).await {
             Ok(activation) => (|| -> Result<(License, Vec<String>)> {
@@ -489,7 +516,7 @@ impl LicenseSeat {
                 self.start_background_tasks();
 
                 #[cfg(feature = "offline")]
-                {
+                if self.offline_policy_is_enabled() {
                     let sdk = self.clone();
                     tokio::spawn(async move {
                         if let Err(error) = sdk.sync_offline_assets().await {
@@ -564,11 +591,14 @@ impl LicenseSeat {
             .as_ref()
             .map(|license| license.device_id.clone())
             .unwrap_or_else(|| self.inner.fingerprint.clone());
+        validate_fingerprint(&device_id)?;
 
         self.emit(Event::new(EventKind::ValidationStart));
 
-        let path = build_license_action_path(product_slug, license_key, "validate");
-        let body = Some(fingerprint_alias_payload(&device_id, false));
+        let path = build_license_action_path(product_slug, "validate");
+        let mut body = fingerprint_alias_payload(&device_id, false);
+        body["license_key"] = serde_json::json!(license_key);
+        let body = Some(body);
 
         let online_result = match self.post::<ValidationResult>(&path, body).await {
             Ok(mut result) => (|| -> Result<ValidationResult> {
@@ -800,8 +830,9 @@ impl LicenseSeat {
 
         self.emit(Event::new(EventKind::DeactivationStart));
 
-        let path = build_license_action_path(product_slug, license_key, "deactivate");
-        let body = fingerprint_alias_payload(&resolved_fingerprint, true);
+        let path = build_license_action_path(product_slug, "deactivate");
+        let mut body = fingerprint_alias_payload(&resolved_fingerprint, true);
+        body["license_key"] = serde_json::json!(license_key);
 
         let outcome = match self.post::<DeactivationResponse>(&path, Some(body)).await {
             Ok(response) => (|| -> Result<()> {
@@ -932,8 +963,9 @@ impl LicenseSeat {
         let _operation_guard =
             OperationGuard::new(&self.inner.current_heartbeat_operation, operation);
 
-        let path = build_license_action_path(product_slug, license_key, "heartbeat");
-        let body = fingerprint_alias_payload(&resolved_fingerprint, true);
+        let path = build_license_action_path(product_slug, "heartbeat");
+        let mut body = fingerprint_alias_payload(&resolved_fingerprint, true);
+        body["license_key"] = serde_json::json!(license_key);
 
         let outcome = match self.post::<HeartbeatResponse>(&path, Some(body)).await {
             Ok(response) => (|| -> Result<HeartbeatResponse> {
@@ -1309,7 +1341,11 @@ impl LicenseSeat {
     /// requires a key pinned in [`Config::signing_public_key`].
     #[cfg(feature = "offline")]
     pub fn cached_signing_key(&self, key_id: &str) -> Option<SigningKeyResponse> {
-        self.inner.cache.get_signing_key(key_id)
+        self.inner
+            .trusted_signing_keys
+            .lock()
+            .ok()
+            .and_then(|keys| keys.get(key_id).cloned())
     }
 
     /// Get the last seen timestamp recorded for clock-tampering protection.
@@ -1536,8 +1572,11 @@ impl LicenseSeat {
         let product_slug = product_slug
             .filter(|slug| !slug.is_empty())
             .unwrap_or(&self.inner.config.product_slug);
-        if product_slug.is_empty() {
-            return Err(Error::Configuration("product_slug is required".into()));
+        validate_product_slug_input(product_slug)?;
+        validate_release_channel(options.channel.as_deref())?;
+        validate_release_platform(options.platform.as_deref())?;
+        if options.limit == Some(0) || options.limit.is_some_and(|limit| limit > 100) {
+            return Err(Error::Configuration("release limit is invalid".into()));
         }
         validate_request_identifier("product_slug", product_slug)?;
         validate_optional_request_identifier("channel", options.channel.as_deref())?;
@@ -1681,16 +1720,23 @@ impl LicenseSeat {
     pub fn start_auto_validation(&self, license_key: &str) {
         self.stop_auto_validation();
 
-        if license_key.is_empty() {
+        if validate_license_key(license_key).is_err() {
             self.emit(Event::with_error(
                 EventKind::SdkError,
-                "license_key is required for auto-validation",
+                "license_key is invalid for auto-validation",
             ));
             return;
         }
 
         let interval = self.inner.config.auto_validate_interval;
         if interval.is_zero() {
+            return;
+        }
+        if interval > MAX_BACKGROUND_INTERVAL {
+            self.emit(Event::with_error(
+                EventKind::SdkError,
+                "auto-validation interval exceeds the supported limit",
+            ));
             return;
         }
 
@@ -1845,16 +1891,23 @@ impl LicenseSeat {
     pub fn start_heartbeat(&self, license_key: &str) {
         self.stop_heartbeat();
 
-        if license_key.is_empty() {
+        if validate_license_key(license_key).is_err() {
             self.emit(Event::with_error(
                 EventKind::SdkError,
-                "license_key is required for heartbeat",
+                "license_key is invalid for heartbeat",
             ));
             return;
         }
 
         let interval = self.inner.config.heartbeat_interval;
         if interval.is_zero() {
+            return;
+        }
+        if interval > MAX_BACKGROUND_INTERVAL {
+            self.emit(Event::with_error(
+                EventKind::SdkError,
+                "heartbeat interval exceeds the supported limit",
+            ));
             return;
         }
 
@@ -1984,11 +2037,25 @@ impl LicenseSeat {
         #[cfg(feature = "offline")]
         let refresh_interval = self.inner.config.offline_token_refresh_interval;
         #[cfg(feature = "offline")]
-        let has_support_tasks = !network_recheck_interval.is_zero() || !refresh_interval.is_zero();
+        let refresh_enabled = self.offline_policy_is_enabled() && !refresh_interval.is_zero();
+        #[cfg(feature = "offline")]
+        let has_support_tasks = !network_recheck_interval.is_zero() || refresh_enabled;
         #[cfg(not(feature = "offline"))]
         let has_support_tasks = !network_recheck_interval.is_zero();
 
         if !has_support_tasks {
+            return;
+        }
+        #[cfg(feature = "offline")]
+        let interval_is_invalid = network_recheck_interval > MAX_BACKGROUND_INTERVAL
+            || refresh_interval > MAX_BACKGROUND_INTERVAL;
+        #[cfg(not(feature = "offline"))]
+        let interval_is_invalid = network_recheck_interval > MAX_BACKGROUND_INTERVAL;
+        if interval_is_invalid {
+            self.emit(Event::with_error(
+                EventKind::SdkError,
+                "background interval exceeds the supported limit",
+            ));
             return;
         }
 
@@ -2395,6 +2462,7 @@ impl LicenseSeat {
         };
         let path = build_license_action_path(product_slug, license_key, "machine-file");
         let body = build_machine_file_request(
+            license_key,
             &fingerprint,
             ttl_days,
             grace_period_days,
@@ -2585,11 +2653,14 @@ impl LicenseSeat {
         license_key: Option<&str>,
         fingerprint: Option<&str>,
     ) -> Result<MachineFileVerificationResult> {
+        let current_license = self.current_license();
         let resolved_license_key = license_key
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
             .or_else(|| {
-                (!machine_file.license_key.is_empty()).then(|| machine_file.license_key.clone())
+                current_license
+                    .as_ref()
+                    .map(|license| license.license_key.clone())
             })
             .or_else(|| self.current_license().map(|license| license.license_key))
             .ok_or_else(|| Error::Configuration("license_key is required".into()))?;
@@ -2741,9 +2812,7 @@ impl LicenseSeat {
     // ========================================================================
 
     fn require_product_slug(&self) -> Result<&str> {
-        if self.inner.config.product_slug.is_empty() {
-            return Err(Error::ProductSlugRequired);
-        }
+        self.inner.config.validate_product_slug()?;
         Ok(&self.inner.config.product_slug)
     }
 
@@ -2947,6 +3016,23 @@ impl LicenseSeat {
         match self.inner.config.offline_fallback_mode {
             OfflineFallbackMode::Always => retryable_server_or_transport,
             OfflineFallbackMode::NetworkOnly => error.is_network_error(),
+        }
+    }
+
+    fn offline_policy_is_enabled(&self) -> bool {
+        (1..=MAX_OFFLINE_DAYS).contains(&self.inner.config.max_offline_days)
+    }
+
+    #[cfg(feature = "offline")]
+    fn require_offline_policy_enabled(&self) -> Result<()> {
+        match self.inner.config.max_offline_days {
+            0 => Err(Error::Configuration(
+                "offline validation is disabled by local policy".into(),
+            )),
+            days if days > MAX_OFFLINE_DAYS => Err(Error::Configuration(
+                "max_offline_days exceeds the supported limit".into(),
+            )),
+            _ => Ok(()),
         }
     }
 
@@ -3618,6 +3704,9 @@ impl LicenseSeat {
                         self.set_online(status < 500);
                         return Err(error);
                     }
+                    if !error.is_network_error() && status != 429 {
+                        return Err(error);
+                    }
 
                     last_error = Some(error);
                 }
@@ -4024,11 +4113,11 @@ fn parse_error_response_text(
         return (None, "Unknown error".into(), None);
     }
 
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+    if let Ok(json) = crate::strict_json::parse(trimmed.as_bytes()) {
         return parse_error_response(&json);
     }
 
-    (None, trimmed.to_string(), None)
+    (None, "Request failed".into(), None)
 }
 
 fn sanitize_api_error_message(message: &str) -> String {
@@ -4114,46 +4203,81 @@ fn parse_error_response(
 ) {
     if let Some(errors) = body.get("errors").and_then(|value| value.as_array()) {
         if let Some(error) = errors.first().and_then(|value| value.as_object()) {
-            let code = error.get("code").and_then(|c| c.as_str()).map(String::from);
+            let code = error
+                .get("code")
+                .and_then(|c| c.as_str())
+                .and_then(sanitize_error_code);
             let message = error
                 .get("detail")
                 .or_else(|| error.get("title"))
                 .and_then(|m| m.as_str())
-                .unwrap_or("Unknown error")
-                .to_string();
+                .and_then(sanitize_error_message)
+                .unwrap_or_else(|| "Request failed".into());
             let details = error
                 .iter()
                 .filter(|(key, _)| !matches!(key.as_str(), "code" | "title" | "detail"))
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect::<HashMap<_, _>>();
-            return (code, message, (!details.is_empty()).then_some(details));
+            return (code, message, sanitize_error_details(details));
         }
     }
 
     // Try new nested format: { "error": { "code": "...", "message": "...", "details": {...} } }
     if let Some(error) = body.get("error").and_then(|e| e.as_object()) {
-        let code = error.get("code").and_then(|c| c.as_str()).map(String::from);
+        let code = error
+            .get("code")
+            .and_then(|c| c.as_str())
+            .and_then(sanitize_error_code);
         let message = error
             .get("message")
             .and_then(|m| m.as_str())
-            .unwrap_or("Unknown error")
-            .to_string();
+            .and_then(sanitize_error_message)
+            .unwrap_or_else(|| "Request failed".into());
         let details = error.get("details").and_then(|d| {
             d.as_object()
                 .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .and_then(sanitize_error_details)
         });
         return (code, message, details);
     }
 
     // Fallback: flat format
-    let code = body.get("code").and_then(|c| c.as_str()).map(String::from);
+    let code = body
+        .get("code")
+        .and_then(|c| c.as_str())
+        .and_then(sanitize_error_code);
     let message = body
         .get("message")
         .and_then(|m| m.as_str())
-        .unwrap_or("Unknown error")
-        .to_string();
+        .and_then(sanitize_error_message)
+        .unwrap_or_else(|| "Request failed".into());
 
     (code, message, None)
+}
+
+fn sanitize_error_code(value: &str) -> Option<String> {
+    safe_error_code(value).then(|| value.to_string())
+}
+
+fn sanitize_error_message(value: &str) -> Option<String> {
+    let value = value.trim();
+    safe_text(value, 1, MAX_ERROR_MESSAGE_BYTES).then(|| value.to_string())
+}
+
+fn sanitize_error_details(
+    details: HashMap<String, serde_json::Value>,
+) -> Option<HashMap<String, serde_json::Value>> {
+    if details.is_empty()
+        || details.len() > 64
+        || details.keys().any(|key| !safe_text(key, 1, 100))
+        || serde_json::to_vec(&details)
+            .map(|bytes| bytes.len() > MAX_ERROR_DETAILS_BYTES)
+            .unwrap_or(true)
+    {
+        None
+    } else {
+        Some(details)
+    }
 }
 
 fn fingerprint_alias_payload(fingerprint: &str, include_when_empty: bool) -> serde_json::Value {
@@ -4167,7 +4291,11 @@ fn fingerprint_alias_payload(fingerprint: &str, include_when_empty: bool) -> ser
 }
 
 #[cfg(feature = "offline")]
-fn build_offline_token_request(fingerprint: &str, ttl_days: Option<i64>) -> serde_json::Value {
+fn build_offline_token_request(
+    license_key: &str,
+    fingerprint: &str,
+    ttl_days: Option<i64>,
+) -> serde_json::Value {
     let mut body = fingerprint_alias_payload(fingerprint, true);
     if let Some(ttl_days) = ttl_days {
         body["ttl_days"] = serde_json::json!(ttl_days);
@@ -4177,6 +4305,7 @@ fn build_offline_token_request(fingerprint: &str, ttl_days: Option<i64>) -> serd
 
 #[cfg(feature = "offline")]
 fn build_machine_file_request(
+    license_key: &str,
     fingerprint: &str,
     ttl_days: Option<i64>,
     grace_period_days: Option<i64>,
@@ -4316,14 +4445,526 @@ fn cached_license_matches_product(license: &License, product_slug: &str) -> bool
         .is_some_and(|trusted| trusted.product.slug == product_slug)
 }
 
-fn build_license_action_path(product_slug: &str, license_key: &str, action: &str) -> String {
-    build_path(&["products", product_slug, "licenses", license_key, action])
+fn build_license_action_path(product_slug: &str, action: &str) -> String {
+    build_path(&["products", product_slug, "licenses", action])
+}
+
+fn validate_license_key(license_key: &str) -> Result<()> {
+    if license_key.is_empty()
+        || license_key.len() > 512
+        || license_key.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(Error::Configuration("license_key is invalid".into()));
+    }
+    Ok(())
+}
+
+fn validate_optional_text_input(
+    value: Option<&str>,
+    maximum_bytes: usize,
+    name: &str,
+) -> Result<()> {
+    if value.is_some_and(|value| !safe_text(value, 1, maximum_bytes)) {
+        return Err(Error::Configuration(format!("{name} is invalid")));
+    }
+    Ok(())
+}
+
+fn validate_metadata_input(
+    metadata: Option<&HashMap<String, serde_json::Value>>,
+    name: &str,
+) -> Result<()> {
+    if !metadata_within_limits(metadata) {
+        return Err(Error::Configuration(format!("{name} is invalid")));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "offline")]
+fn validate_fingerprint_components(components: &HashMap<String, String>) -> Result<()> {
+    if components.len() > 64
+        || components
+            .iter()
+            .any(|(key, value)| !safe_text(key, 1, 100) || !safe_text(value, 1, 1_024))
+        || serde_json::to_vec(components)
+            .map(|bytes| bytes.len() > MAX_API_REQUEST_BYTES)
+            .unwrap_or(true)
+    {
+        return Err(Error::Configuration(
+            "fingerprint_components are invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_product_slug(product_slug: &str) -> bool {
+    !product_slug.is_empty()
+        && product_slug.len() <= 100
+        && product_slug.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || (byte == b'-' && index > 0 && index + 1 < product_slug.len())
+        })
+        && !product_slug.contains("--")
+}
+
+fn validate_product_slug_input(product_slug: &str) -> Result<()> {
+    if !valid_product_slug(product_slug) {
+        return Err(Error::Configuration("product_slug is invalid".into()));
+    }
+    Ok(())
+}
+
+fn validate_release_channel(channel: Option<&str>) -> Result<()> {
+    if channel.is_some_and(|channel| !matches!(channel, "stable" | "beta" | "alpha")) {
+        return Err(Error::Configuration("release channel is invalid".into()));
+    }
+    Ok(())
+}
+
+fn validate_release_platform(platform: Option<&str>) -> Result<()> {
+    if platform.is_some_and(|platform| !matches!(platform, "macos" | "windows" | "linux" | "any")) {
+        return Err(Error::Configuration("release platform is invalid".into()));
+    }
+    Ok(())
+}
+
+fn validate_release_version(version: &str) -> Result<()> {
+    if !safe_text(version, 1, 255) {
+        return Err(Error::Configuration("version is invalid".into()));
+    }
+    Ok(())
+}
+
+fn validate_cached_license_shape(license: &License) -> Result<()> {
+    validate_license_key(&license.license_key)?;
+    validate_fingerprint(&license.device_id)?;
+    let now = Utc::now();
+    let future_tolerance = chrono::Duration::minutes(5);
+    if license.activation_id.is_empty()
+        || license.activation_id.len() > 255
+        || license
+            .activation_id
+            .bytes()
+            .any(|byte| byte.is_ascii_control())
+        || license.activated_at > now + future_tolerance
+        || license.last_validated > now + future_tolerance
+        || license.last_validated < license.activated_at
+    {
+        return Err(Error::Cache("cached license state is invalid".into()));
+    }
+    Ok(())
+}
+
+fn validate_fingerprint(fingerprint: &str) -> Result<()> {
+    if !(8..=255).contains(&fingerprint.len())
+        || fingerprint.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(Error::Configuration("fingerprint is invalid".into()));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "offline")]
+fn validate_ttl_days(ttl_days: Option<i64>) -> Result<()> {
+    if ttl_days.is_some_and(|days| !(1..=36_600).contains(&days)) {
+        return Err(Error::Configuration("ttl_days is invalid".into()));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "offline")]
+fn validate_grace_period_days(grace_period_days: Option<i64>) -> Result<()> {
+    if grace_period_days.is_some_and(|days| !(0..=30).contains(&days)) {
+        return Err(Error::Configuration("grace_period_days is invalid".into()));
+    }
+    Ok(())
+}
+
+fn license_response_is_currently_active(license: &LicenseResponse) -> bool {
+    let now = Utc::now();
+    license.status == "active"
+        && license.starts_at.is_none_or(|starts_at| starts_at <= now)
+        && license.expires_at.is_none_or(|expires_at| expires_at > now)
+}
+
+#[cfg(feature = "offline")]
+fn validate_key_id(key_id: &str) -> Result<()> {
+    if key_id.is_empty()
+        || key_id.len() > 255
+        || !key_id.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'-' | b'_' | b'.' | b':'))
+        })
+    {
+        return Err(Error::Configuration("key_id is invalid".into()));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "offline")]
+fn signing_key_record(key_id: &str, public_key: &str) -> SigningKeyResponse {
+    SigningKeyResponse {
+        object: "signing_key".into(),
+        key_id: key_id.to_string(),
+        algorithm: "Ed25519".into(),
+        public_key: public_key.to_string(),
+        created_at: None,
+        status: "active".into(),
+    }
+}
+
+fn validate_license_response_identity(
+    license: &LicenseResponse,
+    expected_license_key: &str,
+    expected_product_slug: &str,
+) -> Result<()> {
+    let mut entitlement_keys = std::collections::HashSet::new();
+    if license.object != "license"
+        || !constant_time_equal(&license.key, expected_license_key)
+        || license.product.slug != expected_product_slug
+        || !valid_product_slug(&license.product.slug)
+        || !safe_text(&license.product.name, 1, 255)
+        || !matches!(
+            license.status.as_str(),
+            "pending" | "active" | "suspended" | "revoked" | "expired"
+        )
+        || !matches!(
+            license.mode.as_str(),
+            "hardware_locked" | "floating" | "named_user"
+        )
+        || !safe_text(&license.plan_key, 1, 100)
+        || license.seat_limit == Some(0)
+        || license
+            .starts_at
+            .zip(license.expires_at)
+            .is_some_and(|(starts_at, expires_at)| starts_at >= expires_at)
+        || !metadata_within_limits(license.metadata.as_ref())
+        || license.active_entitlements.len() > 500
+        || license.active_entitlements.iter().any(|entitlement| {
+            !safe_identifier(&entitlement.key, 100)
+                || !entitlement_keys.insert(entitlement.key.as_str())
+                || !metadata_within_limits(entitlement.metadata.as_ref())
+        })
+    {
+        return Err(Error::InvalidResponse(
+            "license identity or schema is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_activation_response(
+    activation: &ActivationResponse,
+    expected_license_key: &str,
+    expected_fingerprint: &str,
+    expected_product_slug: &str,
+) -> Result<()> {
+    let now = Utc::now();
+    if activation.object != "activation"
+        || !constant_time_equal(&activation.license_key, expected_license_key)
+        || !constant_time_equal(&activation.device_id, expected_fingerprint)
+        || !safe_text(&activation.id, 1, 255)
+        || activation.activated_at > now + chrono::Duration::minutes(5)
+        || activation.deactivated_at.is_some()
+        || activation
+            .device_name
+            .as_deref()
+            .is_some_and(|value| !safe_text(value, 1, 255))
+        || activation
+            .ip_address
+            .as_deref()
+            .is_some_and(|value| value.parse::<std::net::IpAddr>().is_err())
+        || !metadata_within_limits(activation.metadata.as_ref())
+    {
+        return Err(Error::InvalidResponse(
+            "activation response identity or schema is invalid".into(),
+        ));
+    }
+    validate_license_response_identity(
+        &activation.license,
+        expected_license_key,
+        expected_product_slug,
+    )?;
+    if !license_response_is_currently_active(&activation.license) {
+        return Err(Error::InvalidResponse(
+            "activation response contained an inactive license".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_validation_response(
+    result: &ValidationResult,
+    expected_license_key: &str,
+    expected_fingerprint: &str,
+    expected_product_slug: &str,
+) -> Result<()> {
+    if result.object != "validation_result"
+        || result
+            .code
+            .as_deref()
+            .is_some_and(|value| !safe_error_code(value))
+        || result
+            .message
+            .as_deref()
+            .is_some_and(|value| !safe_text(value, 1, MAX_ERROR_MESSAGE_BYTES))
+        || result.warnings.as_ref().is_some_and(|warnings| {
+            warnings.len() > 32
+                || warnings.iter().any(|warning| {
+                    !safe_error_code(&warning.code)
+                        || !safe_text(&warning.message, 1, MAX_ERROR_MESSAGE_BYTES)
+                })
+        })
+    {
+        return Err(Error::InvalidResponse(
+            "validation response schema is invalid".into(),
+        ));
+    }
+
+    validate_license_response_identity(
+        &result.license,
+        expected_license_key,
+        expected_product_slug,
+    )?;
+    if result.valid && !license_response_is_currently_active(&result.license) {
+        return Err(Error::InvalidResponse(
+            "valid validation response contained an inactive license".into(),
+        ));
+    }
+
+    let validate_activation = |activation: &ActivationNested| {
+        let now = Utc::now();
+        (activation.object.is_empty() || activation.object == "activation")
+            && safe_text(&activation.id, 1, 255)
+            && constant_time_equal(&activation.license_key, expected_license_key)
+            && constant_time_equal(&activation.device_id, expected_fingerprint)
+            && activation.activated_at <= now + chrono::Duration::minutes(5)
+            && (!result.valid || activation.deactivated_at.is_none())
+            && activation
+                .device_name
+                .as_deref()
+                .is_none_or(|value| safe_text(value, 1, 255))
+            && activation
+                .ip_address
+                .as_deref()
+                .is_none_or(|value| value.parse::<std::net::IpAddr>().is_ok())
+            && metadata_within_limits(activation.metadata.as_ref())
+    };
+    if result.activation.as_ref().is_none_or(validate_activation)
+        && (!result.valid || result.activation.is_some())
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidResponse(
+            "validation activation identity or schema is invalid".into(),
+        ))
+    }
+}
+
+fn validate_deactivation_response(
+    response: &DeactivationResponse,
+    expected_activation_id: Option<&str>,
+) -> Result<()> {
+    if response.object != "deactivation"
+        || !safe_text(&response.activation_id, 1, 255)
+        || expected_activation_id
+            .is_some_and(|expected| !constant_time_equal(&response.activation_id, expected))
+        || response.deactivated_at > Utc::now() + chrono::Duration::minutes(5)
+    {
+        return Err(Error::InvalidResponse(
+            "deactivation response identity or schema is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_heartbeat_response(
+    response: &HeartbeatResponse,
+    expected_license_key: &str,
+    expected_product_slug: &str,
+) -> Result<()> {
+    if response.object != "heartbeat"
+        || response.received_at > Utc::now() + chrono::Duration::minutes(5)
+    {
+        return Err(Error::InvalidResponse(
+            "heartbeat response schema is invalid".into(),
+        ));
+    }
+    validate_license_response_identity(
+        &response.license,
+        expected_license_key,
+        expected_product_slug,
+    )?;
+    if !license_response_is_currently_active(&response.license) {
+        return Err(Error::InvalidResponse(
+            "heartbeat response contained an inactive license".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_health_response(response: &HealthResponse) -> Result<()> {
+    if response.object != "health"
+        || response.status != "healthy"
+        || !safe_text(&response.api_version, 1, 100)
+        || response.timestamp > Utc::now() + chrono::Duration::minutes(5)
+    {
+        return Err(Error::InvalidResponse(
+            "health response schema is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_release_response(release: &Release, expected_product_slug: &str) -> Result<()> {
+    if release.object != "release"
+        || !safe_text(&release.version, 1, 255)
+        || !matches!(release.channel.as_str(), "stable" | "beta" | "alpha")
+        || !matches!(
+            release.platform.as_str(),
+            "macos" | "windows" | "linux" | "any"
+        )
+        || release.product_slug != expected_product_slug
+        || release.published_at.is_none()
+        || release
+            .published_at
+            .is_some_and(|published_at| published_at > Utc::now() + chrono::Duration::minutes(5))
+    {
+        return Err(Error::InvalidResponse(
+            "release response identity or schema is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_release_list_response(
+    releases: &ReleaseList,
+    expected_product_slug: &str,
+) -> Result<()> {
+    if releases.object != "list"
+        || releases.data.len() > 100
+        || releases
+            .next_cursor
+            .as_deref()
+            .is_some_and(|cursor| !safe_text(cursor, 1, 1_024))
+    {
+        return Err(Error::InvalidResponse(
+            "release list response schema is invalid".into(),
+        ));
+    }
+    for release in &releases.data {
+        validate_release_response(release, expected_product_slug)?;
+    }
+    Ok(())
+}
+
+fn validate_download_token_response(token: &DownloadToken) -> Result<()> {
+    let now = Utc::now();
+    if token.object != "download_token"
+        || !safe_text(&token.token, 16, 32 * 1024)
+        || token.expires_at.is_none_or(|expires_at| {
+            expires_at <= now || expires_at > now + chrono::Duration::days(30)
+        })
+    {
+        return Err(Error::InvalidResponse(
+            "download-token response schema is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn safe_text(value: &str, minimum_bytes: usize, maximum_bytes: usize) -> bool {
+    (minimum_bytes..=maximum_bytes).contains(&value.len())
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn safe_identifier(value: &str, maximum_bytes: usize) -> bool {
+    safe_text(value, 1, maximum_bytes)
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || (index > 0 && matches!(byte, b'-' | b'_'))
+        })
+}
+
+fn safe_error_code(value: &str) -> bool {
+    safe_text(value, 1, 100)
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'-' | b'_' | b'.' | b':'))
+        })
+}
+
+fn metadata_within_limits(metadata: Option<&HashMap<String, serde_json::Value>>) -> bool {
+    let Some(metadata) = metadata else {
+        return true;
+    };
+    if metadata.len() > MAX_JSON_NODES
+        || serde_json::to_vec(metadata)
+            .map(|bytes| bytes.len() > MAX_RESPONSE_METADATA_BYTES)
+            .unwrap_or(true)
+    {
+        return false;
+    }
+    let mut nodes = 0;
+    json_object_within_limits(metadata, 0, &mut nodes)
+}
+
+#[cfg(feature = "offline")]
+fn json_map_contains_only(
+    object: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+) -> bool {
+    object.keys().all(|key| allowed.contains(&key.as_str()))
+}
+
+fn json_object_within_limits(
+    object: &HashMap<String, serde_json::Value>,
+    depth: usize,
+    nodes: &mut usize,
+) -> bool {
+    if depth > MAX_JSON_DEPTH {
+        return false;
+    }
+    object.iter().all(|(key, value)| {
+        safe_text(key, 0, 256) && json_value_within_limits(value, depth + 1, nodes)
+    })
+}
+
+fn json_value_within_limits(value: &serde_json::Value, depth: usize, nodes: &mut usize) -> bool {
+    *nodes = nodes.saturating_add(1);
+    if *nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH {
+        return false;
+    }
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+        serde_json::Value::String(value) => value.len() <= 64 * 1024,
+        serde_json::Value::Array(values) => values
+            .iter()
+            .all(|value| json_value_within_limits(value, depth + 1, nodes)),
+        serde_json::Value::Object(object) => object.iter().all(|(key, value)| {
+            safe_text(key, 0, 256) && json_value_within_limits(value, depth + 1, nodes)
+        }),
+    }
+}
+
+fn constant_time_equal(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
 }
 
 fn build_path(segments: &[&str]) -> String {
-    let mut url = url::Url::parse("https://licenseseat.invalid").unwrap();
+    let Ok(mut url) = url::Url::parse("https://licenseseat.invalid") else {
+        return String::new();
+    };
     {
-        let mut path_segments = url.path_segments_mut().unwrap();
+        let Ok(mut path_segments) = url.path_segments_mut() else {
+            return String::new();
+        };
         path_segments.clear();
         for segment in segments {
             path_segments.push(segment);

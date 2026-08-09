@@ -6,6 +6,16 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+
+#[derive(Clone, Copy)]
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
 
 // ============================================================================
 // API Response Types
@@ -21,7 +31,7 @@ pub struct Product {
 }
 
 /// Entitlement (feature flag) attached to a license.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entitlement {
     /// Unique entitlement key.
     pub key: String,
@@ -34,7 +44,7 @@ pub struct Entitlement {
 }
 
 /// License object as returned by the API.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct LicenseResponse {
     /// Object type (always "license").
     pub object: String,
@@ -67,7 +77,7 @@ pub struct LicenseResponse {
 }
 
 /// Activation response from the API.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivationResponse {
     /// Object type (always "activation").
     pub object: String,
@@ -117,7 +127,7 @@ pub struct ValidationWarning {
 }
 
 /// Nested activation in validation response (avoids circular reference).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivationNested {
     /// Object type (optional on nested activation payloads).
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -146,7 +156,7 @@ pub struct ActivationNested {
 }
 
 /// Validation result from the API or local offline verification.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValidationResult {
     /// Object type (always "validation_result").
     pub object: String,
@@ -232,7 +242,7 @@ pub struct ReleaseList {
 }
 
 /// Download-token response returned by the releases API.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadToken {
     /// Object type (always "download_token").
     #[serde(default)]
@@ -249,7 +259,7 @@ pub struct DownloadToken {
 // ============================================================================
 
 /// Cached license data used by the SDK.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct License {
     /// The license key.
     pub license_key: String,
@@ -445,7 +455,7 @@ pub struct LicenseStateSnapshot {
 }
 
 /// Details for an active license.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct LicenseStatusDetails {
     /// The license key.
     pub license: String,
@@ -523,7 +533,8 @@ impl Default for RestoreResult {
 // ============================================================================
 
 /// Offline token response from the API.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OfflineTokenResponse {
     /// Object type (always "offline_token").
     pub object: String,
@@ -536,7 +547,8 @@ pub struct OfflineTokenResponse {
 }
 
 /// Offline token payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OfflineTokenPayload {
     /// Token schema version.
     pub schema_version: u32,
@@ -555,6 +567,7 @@ pub struct OfflineTokenPayload {
     #[serde(
         rename = "fingerprint",
         default,
+        rename = "fingerprint",
         skip_serializing_if = "Option::is_none",
         alias = "device_id",
         alias = "device_fingerprint"
@@ -580,6 +593,7 @@ pub struct OfflineTokenPayload {
 
 /// Entitlement in offline token (uses Unix timestamps).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OfflineEntitlement {
     /// Entitlement key.
     pub key: String,
@@ -589,7 +603,8 @@ pub struct OfflineEntitlement {
 }
 
 /// Offline token signature block.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OfflineTokenSignature {
     /// Signature algorithm (e.g., "Ed25519").
     pub algorithm: String,
@@ -601,7 +616,8 @@ pub struct OfflineTokenSignature {
 }
 
 /// Signing key from the API.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SigningKeyResponse {
     /// Object type (always "signing_key").
     pub object: String,
@@ -620,7 +636,7 @@ pub struct SigningKeyResponse {
 }
 
 /// Cached machine-file metadata and certificate.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct MachineFile {
     /// PEM-like certificate returned by the API.
     pub certificate: String,
@@ -659,7 +675,7 @@ impl Default for MachineFile {
 }
 
 /// Decrypted machine-file payload used for offline validation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct MachineFilePayload {
     /// Payload schema version.
     #[serde(default)]
@@ -769,4 +785,272 @@ pub struct MachineFileVerificationResult {
 
 fn default_machine_file_algorithm() -> String {
     "aes-256-gcm+ed25519".to_string()
+}
+
+impl fmt::Debug for Entitlement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Entitlement")
+            .field("key", &self.key)
+            .field("expires_at", &self.expires_at)
+            .field("metadata", &Redacted)
+            .finish()
+    }
+}
+
+impl fmt::Debug for LicenseResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LicenseResponse")
+            .field("object", &self.object)
+            .field("key", &Redacted)
+            .field("status", &self.status)
+            .field("starts_at", &self.starts_at)
+            .field("expires_at", &self.expires_at)
+            .field("mode", &self.mode)
+            .field("plan_key", &self.plan_key)
+            .field("seat_limit", &self.seat_limit)
+            .field("active_seats", &self.active_seats)
+            .field("active_entitlements", &self.active_entitlements)
+            .field("metadata", &Redacted)
+            .field("product", &self.product)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ActivationResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActivationResponse")
+            .field("object", &self.object)
+            .field("id", &Redacted)
+            .field("device_id", &Redacted)
+            .field("device_name", &Redacted)
+            .field("license_key", &Redacted)
+            .field("activated_at", &self.activated_at)
+            .field("deactivated_at", &self.deactivated_at)
+            .field("ip_address", &Redacted)
+            .field("metadata", &Redacted)
+            .field("license", &self.license)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ActivationNested {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActivationNested")
+            .field("object", &self.object)
+            .field("id", &Redacted)
+            .field("device_id", &Redacted)
+            .field("device_name", &Redacted)
+            .field("license_key", &Redacted)
+            .field("activated_at", &self.activated_at)
+            .field("deactivated_at", &self.deactivated_at)
+            .field("ip_address", &Redacted)
+            .field("metadata", &Redacted)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ValidationResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ValidationResult")
+            .field("object", &self.object)
+            .field("valid", &self.valid)
+            .field("code", &self.code)
+            .field("message", &self.message.as_ref().map(|_| Redacted))
+            .field("warnings", &self.warnings)
+            .field("license", &self.license)
+            .field("activation", &self.activation)
+            .field("offline", &self.offline)
+            .finish()
+    }
+}
+
+impl fmt::Debug for DownloadToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DownloadToken")
+            .field("object", &self.object)
+            .field("token", &Redacted)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl fmt::Debug for License {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("License")
+            .field("license_key", &Redacted)
+            .field("device_id", &Redacted)
+            .field("activation_id", &Redacted)
+            .field("activated_at", &self.activated_at)
+            .field("last_validated", &self.last_validated)
+            .field("trusted_license", &self.trusted_license)
+            .field("validation", &self.validation)
+            .finish()
+    }
+}
+
+impl fmt::Debug for LicenseStatusDetails {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LicenseStatusDetails")
+            .field("license", &Redacted)
+            .field("device", &Redacted)
+            .field("activated_at", &self.activated_at)
+            .field("last_validated", &self.last_validated)
+            .field("entitlements", &self.entitlements)
+            .finish()
+    }
+}
+
+impl fmt::Debug for OfflineTokenResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OfflineTokenResponse")
+            .field("object", &self.object)
+            .field("token", &self.token)
+            .field("signature", &self.signature)
+            .field("canonical", &Redacted)
+            .finish()
+    }
+}
+
+impl fmt::Debug for OfflineTokenPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OfflineTokenPayload")
+            .field("schema_version", &self.schema_version)
+            .field("license_key", &Redacted)
+            .field("product_slug", &self.product_slug)
+            .field("plan_key", &self.plan_key)
+            .field("mode", &self.mode)
+            .field("seat_limit", &self.seat_limit)
+            .field("device_id", &Redacted)
+            .field("iat", &self.iat)
+            .field("exp", &self.exp)
+            .field("nbf", &self.nbf)
+            .field("license_expires_at", &self.license_expires_at)
+            .field("kid", &self.kid)
+            .field("entitlements", &self.entitlements)
+            .field("metadata", &Redacted)
+            .finish()
+    }
+}
+
+impl fmt::Debug for OfflineTokenSignature {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OfflineTokenSignature")
+            .field("algorithm", &self.algorithm)
+            .field("key_id", &self.key_id)
+            .field("value", &Redacted)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SigningKeyResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SigningKeyResponse")
+            .field("object", &self.object)
+            .field("key_id", &self.key_id)
+            .field("algorithm", &self.algorithm)
+            .field("public_key", &Redacted)
+            .field("created_at", &self.created_at)
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+impl fmt::Debug for MachineFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MachineFile")
+            .field("certificate", &Redacted)
+            .field("algorithm", &self.algorithm)
+            .field("ttl", &self.ttl)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .field("license_key", &Redacted)
+            .field("fingerprint", &Redacted)
+            .finish()
+    }
+}
+
+impl fmt::Debug for MachineFilePayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MachineFilePayload")
+            .field("schema_version", &self.schema_version)
+            .field("issued", &self.issued)
+            .field("iat", &self.iat)
+            .field("expiry", &self.expiry)
+            .field("exp", &self.exp)
+            .field("nbf", &self.nbf)
+            .field("ttl", &self.ttl)
+            .field("grace_period", &self.grace_period)
+            .field("license_key", &Redacted)
+            .field("product_slug", &self.product_slug)
+            .field("license_expires_at", &self.license_expires_at)
+            .field("key_id", &self.key_id)
+            .field("sdk_version", &self.sdk_version)
+            .field("machine_id", &Redacted)
+            .field("fingerprint", &Redacted)
+            .field("fingerprint_components", &Redacted)
+            .field("device_name", &Redacted)
+            .field("platform", &self.platform)
+            .field("created_at", &self.created_at)
+            .field("metadata", &Redacted)
+            .field("license", &self.license)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    const SECRET: &str = "LS-SECRET-LICENSE-KEY";
+
+    #[test]
+    fn sensitive_model_debug_output_is_redacted() {
+        let now = Utc::now();
+        let license = License {
+            license_key: SECRET.into(),
+            device_id: "secret-fingerprint".into(),
+            activation_id: "secret-activation".into(),
+            activated_at: now,
+            last_validated: now,
+            trusted_license: None,
+            validation: None,
+        };
+        let machine_file = MachineFile {
+            certificate: "secret-certificate".into(),
+            license_key: SECRET.into(),
+            fingerprint: "secret-fingerprint".into(),
+            ..Default::default()
+        };
+        let download_token = DownloadToken {
+            object: "download_token".into(),
+            token: "secret-download-token".into(),
+            expires_at: Some(now),
+        };
+
+        let output = format!("{license:?} {machine_file:?} {download_token:?}");
+        for secret in [
+            SECRET,
+            "secret-fingerprint",
+            "secret-activation",
+            "secret-certificate",
+            "secret-download-token",
+        ] {
+            assert!(!output.contains(secret));
+        }
+        assert!(output.contains("<redacted>"));
+    }
 }

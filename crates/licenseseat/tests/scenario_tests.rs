@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use wiremock::matchers::{method, path_regex};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 static TEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -32,6 +32,7 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
+        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
         device_identifier: Some("device-123".into()),
@@ -216,7 +217,7 @@ async fn test_scenario_clean_deactivation() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/deactivate"))
+        .and(path_regex(r"/products/.*/licenses/deactivate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(deactivation_response()))
         .mount(&server)
         .await;
@@ -249,7 +250,7 @@ async fn test_scenario_deactivate_already_deactivated() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/deactivate"))
+        .and(path_regex(r"/products/.*/licenses/deactivate"))
         .respond_with(ResponseTemplate::new(422).set_body_json(json!({
             "error": {
                 "code": "already_deactivated",
@@ -400,7 +401,7 @@ async fn test_scenario_temporary_network_failure() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(503).set_body_json(json!({
             "error": {"message": "Service temporarily unavailable"}
         })))
@@ -550,16 +551,23 @@ async fn test_scenario_multiple_sdk_instances_same_config() {
     let config = test_config(&server.uri());
 
     let sdk1 = LicenseSeat::new(config.clone());
-    let sdk2 = LicenseSeat::new(config);
+    let sdk2 = LicenseSeat::new(config.clone());
 
     // Activate with first instance
     sdk1.activate("SHARED-KEY").await.unwrap();
 
-    // Second instance should see the cached license
-    // (since they share the same storage prefix)
-    let license = sdk2.current_license();
-    assert!(license.is_some());
-    assert_eq!(license.unwrap().license_key, "SHARED-KEY");
+    // An already-running instance must not silently reload mutable on-disk
+    // state written by another process.
+    assert!(sdk2.current_license().is_none());
+
+    // A new process may recover activation identity from disk, but starts in a
+    // pending state until it obtains fresh online or signed offline proof.
+    let sdk3 = LicenseSeat::new(config);
+    let license = sdk3
+        .current_license()
+        .expect("activation identity recovered");
+    assert_eq!(license.license_key, "SHARED-KEY");
+    assert!(license.validation.is_none());
 }
 
 #[tokio::test]

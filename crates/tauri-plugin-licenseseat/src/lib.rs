@@ -294,6 +294,9 @@ fn build_plugin<R: Runtime>(config_override: Option<PluginConfig>) -> TauriPlugi
                 app_version,
                 app_build,
             };
+            sdk_config.validate().map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+            })?;
 
             let sdk = licenseseat::LicenseSeat::try_new(sdk_config)?;
             if config.emit_frontend_events.unwrap_or(true) {

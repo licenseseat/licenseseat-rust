@@ -189,6 +189,155 @@ pub(crate) fn offline_token_authorization_deadline(
     authorization_deadline(token.token.iat, token.token.exp, 0, max_offline_days)
 }
 
+fn validate_offline_token_structure(
+    token: &OfflineTokenResponse,
+    signing_key: &SigningKeyResponse,
+) -> Result<()> {
+    let payload = &token.token;
+    if token.object != "offline_token"
+        || token.signature.algorithm != "Ed25519"
+        || signing_key.object != "signing_key"
+        || signing_key.algorithm != "Ed25519"
+        || signing_key.status != "active"
+        || !safe_key_id(&payload.kid)
+        || !constant_time_equal(&payload.kid, &token.signature.key_id)
+        || !constant_time_equal(&payload.kid, &signing_key.key_id)
+        || payload.schema_version != 1
+        || !safe_text(&payload.license_key, MAX_LICENSE_KEY_BYTES, 1)
+        || !safe_text(&payload.product_slug, MAX_IDENTITY_BYTES, 1)
+        || !safe_text(&payload.plan_key, MAX_IDENTITY_BYTES, 1)
+        || !matches!(
+            payload.mode.as_str(),
+            "hardware_locked" | "floating" | "named_user"
+        )
+        || payload
+            .device_id
+            .as_deref()
+            .is_none_or(|fingerprint| !safe_text(fingerprint, MAX_IDENTITY_BYTES, 8))
+        || payload.iat <= 0
+        || payload.iat > payload.nbf
+        || payload.nbf > payload.exp
+        || payload
+            .exp
+            .checked_sub(payload.iat)
+            .is_none_or(|lifetime| lifetime > MAX_TOKEN_LIFETIME_SECONDS)
+        || payload
+            .license_expires_at
+            .is_some_and(|expires_at| expires_at <= payload.iat)
+        || payload.seat_limit == Some(0)
+        || payload.entitlements.len() > MAX_ENTITLEMENTS
+        || payload
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| !safe_metadata_map(metadata))
+        || token.canonical.len() > MAX_CANONICAL_BYTES
+        || token.signature.value.len() > 128
+    {
+        return Err(Error::OfflineVerificationFailed(
+            "Invalid offline token structure".into(),
+        ));
+    }
+
+    let mut entitlement_keys = std::collections::HashSet::new();
+    for entitlement in &payload.entitlements {
+        if !safe_entitlement_key(&entitlement.key)
+            || entitlement
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= payload.iat)
+            || !entitlement_keys.insert(entitlement.key.as_str())
+        {
+            return Err(Error::OfflineVerificationFailed(
+                "Invalid offline token entitlements".into(),
+            ));
+        }
+    }
+
+    let signed_value = crate::strict_json::parse(token.canonical.as_bytes())
+        .map_err(|_| Error::OfflineVerificationFailed("Invalid canonical token payload".into()))?;
+    let signed_payload: crate::models::OfflineTokenPayload = serde_json::from_value(signed_value)
+        .map_err(|_| {
+        Error::OfflineVerificationFailed("Invalid canonical token payload".into())
+    })?;
+    if signed_payload != *payload {
+        return Err(Error::OfflineVerificationFailed(
+            "Signed payload does not match decoded token claims".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn safe_text(value: &str, maximum_bytes: usize, minimum_bytes: usize) -> bool {
+    value.len() >= minimum_bytes
+        && value.len() <= maximum_bytes
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn safe_key_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'-' | b'_' | b'.' | b':'))
+        })
+}
+
+fn safe_entitlement_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || (index > 0 && matches!(byte, b'-' | b'_'))
+        })
+}
+
+fn contains_only_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+) -> bool {
+    object.keys().all(|key| allowed.contains(&key.as_str()))
+}
+
+fn safe_json_metadata(value: &serde_json::Value) -> bool {
+    if serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > MAX_METADATA_BYTES) {
+        return false;
+    }
+
+    fn visit(value: &serde_json::Value, depth: usize, nodes: &mut usize) -> bool {
+        *nodes = nodes.saturating_add(1);
+        if depth > MAX_JSON_DEPTH || *nodes > MAX_JSON_NODES {
+            return false;
+        }
+        match value {
+            serde_json::Value::String(value) => value.len() <= MAX_JSON_STRING_BYTES,
+            serde_json::Value::Array(values) => {
+                values.iter().all(|value| visit(value, depth + 1, nodes))
+            }
+            serde_json::Value::Object(values) => {
+                values.len() <= MAX_METADATA_ENTRIES
+                    && values.keys().all(|key| safe_text(key, 255, 1))
+                    && values.values().all(|value| visit(value, depth + 1, nodes))
+            }
+            _ => true,
+        }
+    }
+
+    visit(value, 0, &mut 0)
+}
+
+fn safe_metadata_map(metadata: &std::collections::HashMap<String, serde_json::Value>) -> bool {
+    if metadata.len() > MAX_METADATA_ENTRIES {
+        return false;
+    }
+    let value = serde_json::Value::Object(
+        metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    safe_json_metadata(&value)
+}
+
 /// Verify and decrypt a machine file.
 pub fn verify_machine_file(
     machine_file: &MachineFile,
@@ -199,10 +348,10 @@ pub fn verify_machine_file(
     max_offline_days: u32,
     max_clock_skew_seconds: i64,
 ) -> Result<MachineFilePayload> {
-    if license_key.is_empty() {
+    if !safe_text(license_key, MAX_LICENSE_KEY_BYTES, 1) {
         return Err(Error::Configuration("license_key is required".into()));
     }
-    if fingerprint.is_empty() {
+    if !safe_text(fingerprint, MAX_IDENTITY_BYTES, 8) {
         return Err(Error::Configuration("fingerprint is required".into()));
     }
     if public_key_b64.is_empty() {
@@ -268,10 +417,18 @@ pub fn verify_machine_file(
         ));
     }
 
+    if ciphertext_part.len() > MAX_ENCRYPTED_TEXT_BYTES
+        || nonce_part.len() > 32
+        || tag_part.len() > 32
+    {
+        return Err(Error::OfflineVerificationFailed(
+            "Invalid encrypted machine-file payload".into(),
+        ));
+    }
     let ciphertext = decode_base64url(ciphertext_part)?;
     let nonce = decode_base64url(nonce_part)?;
     let tag = decode_base64url(tag_part)?;
-    if nonce.len() != 12 || tag.len() != 16 {
+    if ciphertext.len() > MAX_CIPHERTEXT_BYTES || nonce.len() != 12 || tag.len() != 16 {
         return Err(Error::OfflineVerificationFailed(
             "Invalid encrypted machine-file payload".into(),
         ));
@@ -286,8 +443,15 @@ pub fn verify_machine_file(
     let plaintext = cipher
         .decrypt(nonce, combined.as_ref())
         .map_err(|_| Error::OfflineVerificationFailed("DECRYPTION_FAILED".into()))?;
+    if plaintext.len() > MAX_CIPHERTEXT_BYTES {
+        return Err(Error::OfflineVerificationFailed(
+            "Decrypted machine-file payload is too large".into(),
+        ));
+    }
 
-    let payload_json: serde_json::Value = serde_json::from_slice(&plaintext)?;
+    let payload_json =
+        crate::strict_json::parse(&plaintext).map_err(|_| invalid_machine_payload())?;
+    validate_machine_file_payload(&payload_json, &envelope.kid, license_key, fingerprint)?;
     let payload = parse_machine_file_payload(&payload_json)?;
     let now = chrono::Utc::now().timestamp();
     let skew = max_clock_skew_seconds.max(0);
@@ -449,7 +613,7 @@ pub(crate) fn machine_file_authorization_deadline(
 }
 
 fn parse_machine_file_envelope(certificate: &str) -> Result<ParsedMachineFileEnvelope> {
-    if certificate.is_empty() {
+    if certificate.is_empty() || certificate.len() > MAX_CERTIFICATE_BYTES {
         return Err(Error::OfflineVerificationFailed(
             "Machine file certificate is empty".into(),
         ));
@@ -479,7 +643,12 @@ fn parse_machine_file_envelope(certificate: &str) -> Result<ParsedMachineFileEnv
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(cleaned)
         .map_err(|_| Error::OfflineVerificationFailed("Invalid machine file encoding".into()))?;
-    let envelope: serde_json::Value = serde_json::from_slice(&decoded)?;
+    if decoded.len() > MAX_ENCRYPTED_TEXT_BYTES {
+        return Err(Error::OfflineVerificationFailed(
+            "Invalid machine file format".into(),
+        ));
+    }
+    let envelope: ParsedMachineFileEnvelope = serde_json::from_slice(&decoded)?;
 
     let enc = envelope
         .get("enc")

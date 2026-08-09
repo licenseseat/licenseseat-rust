@@ -1,6 +1,7 @@
 //! Plugin configuration from tauri.conf.json.
 
 use serde::Deserialize;
+use std::fmt;
 
 /// Plugin configuration read from tauri.conf.json.
 ///
