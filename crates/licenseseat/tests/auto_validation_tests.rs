@@ -26,6 +26,7 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
+        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
         auto_validate_interval: Duration::from_secs(0), // Disabled by default
@@ -90,7 +91,17 @@ fn validation_response() -> serde_json::Value {
                 "name": "Test App"
             }
         },
-        "activation": null
+        "activation": {
+            "object": "activation",
+            "id": "act-12345-uuid",
+            "device_id": "device-123",
+            "device_name": "Test Device",
+            "license_key": "TEST-KEY",
+            "activated_at": "2025-01-01T00:00:00Z",
+            "deactivated_at": null,
+            "ip_address": "127.0.0.1",
+            "metadata": null
+        }
     })
 }
 
@@ -127,13 +138,13 @@ async fn test_validation_updates_last_validated() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(validation_response()))
         .mount(&server)
         .await;
@@ -163,13 +174,13 @@ async fn test_validation_stores_result() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(validation_response()))
         .mount(&server)
         .await;
@@ -241,13 +252,13 @@ async fn test_validation_emits_start_event() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(validation_response()))
         .mount(&server)
         .await;
@@ -279,13 +290,13 @@ async fn test_validation_emits_success_event() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(validation_response()))
         .mount(&server)
         .await;
@@ -317,14 +328,14 @@ async fn test_validation_emits_error_event_on_network_failure() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     // Make validation fail
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(500).set_body_json(json!({
             "error": {"message": "Internal server error"}
         })))
@@ -365,13 +376,13 @@ async fn test_heartbeat_emits_success_event() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/heartbeat"))
+        .and(path_regex(r"/products/.*/licenses/heartbeat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(heartbeat_response()))
         .mount(&server)
         .await;
@@ -403,13 +414,13 @@ async fn test_heartbeat_emits_error_event() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/heartbeat"))
+        .and(path_regex(r"/products/.*/licenses/heartbeat"))
         .respond_with(ResponseTemplate::new(500).set_body_json(json!({
             "error": {"message": "Server error"}
         })))
@@ -447,13 +458,13 @@ async fn test_support_tasks_do_not_duplicate_after_restart() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/machine-file"))
+        .and(path_regex(r"/products/.*/licenses/machine-file"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "data": {
                 "type": "machine-files",
@@ -476,6 +487,7 @@ async fn test_support_tasks_do_not_duplicate_after_restart() {
     let mut config = test_config(&server.uri());
     config.network_recheck_interval = Duration::ZERO;
     config.offline_token_refresh_interval = Duration::from_millis(120);
+    config.max_offline_days = 7;
 
     let sdk = LicenseSeat::new(config);
     sdk.activate("TEST-KEY").await.unwrap();
@@ -486,17 +498,100 @@ async fn test_support_tasks_do_not_duplicate_after_restart() {
     sdk.stop_background_tasks();
     sdk.start_background_tasks();
 
-    tokio::time::sleep(Duration::from_millis(170)).await;
-
-    let requests = server.received_requests().await.unwrap();
-    let machine_file_requests = requests
-        .iter()
-        .filter(|request| request.url.path().contains("/machine-file"))
-        .count();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let machine_file_requests = loop {
+        let requests = server.received_requests().await.unwrap();
+        let count = requests
+            .iter()
+            .filter(|request| request.url.path().contains("/machine-file"))
+            .count();
+        if count >= 2 || tokio::time::Instant::now() >= deadline {
+            break count;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
 
     // One request comes from activation-time sync_offline_assets(). After the
     // restart there should only be one refresh-loop request, not two.
     assert_eq!(machine_file_requests, 2);
+
+    // A duplicate old loop would fire at the same cadence as the replacement.
+    // Check shortly after the first refresh, before either valid loop's next tick.
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path().contains("/machine-file"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn revoked_auto_validation_does_not_send_a_followup_heartbeat() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "validation_result",
+            "valid": false,
+            "code": "license_revoked",
+            "message": "License has been revoked",
+            "warnings": null,
+            "license": {
+                "object": "license",
+                "key": "TEST-KEY",
+                "status": "revoked",
+                "starts_at": null,
+                "expires_at": null,
+                "mode": "hardware_locked",
+                "plan_key": "pro",
+                "seat_limit": 5,
+                "active_seats": 0,
+                "active_entitlements": [],
+                "metadata": null,
+                "product": { "slug": "test-product", "name": "Test App" }
+            },
+            "activation": null
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    config.auto_validate_interval = Duration::from_millis(40);
+    config.heartbeat_interval = Duration::ZERO;
+    config.network_recheck_interval = Duration::ZERO;
+    #[cfg(feature = "offline")]
+    {
+        config.offline_token_refresh_interval = Duration::ZERO;
+    }
+    let sdk = LicenseSeat::new(config);
+    sdk.activate("TEST-KEY").await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while sdk.current_license().is_some() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.url.path().ends_with("/validate"))
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.url.path().ends_with("/heartbeat"))
+    );
+    assert!(sdk.current_license().is_none());
 }
 
 // ============================================================================
@@ -508,13 +603,13 @@ async fn test_multiple_validations_update_timestamp() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(validation_response()))
         .mount(&server)
         .await;
@@ -543,14 +638,14 @@ async fn test_validation_failed_emits_event() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     // Return invalid validation
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "object": "validation_result",
             "valid": false,
@@ -612,13 +707,13 @@ async fn test_heartbeat_returns_response() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/heartbeat"))
+        .and(path_regex(r"/products/.*/licenses/heartbeat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(heartbeat_response()))
         .mount(&server)
         .await;
@@ -641,13 +736,13 @@ async fn test_validation_updates_last_validated_timestamp() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(validation_response()))
         .mount(&server)
         .await;

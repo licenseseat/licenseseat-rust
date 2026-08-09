@@ -6,9 +6,41 @@
 
 use serde_json::json;
 
+#[cfg(feature = "offline")]
+use licenseseat::{Config, LicenseSeat, OfflineTokenResponse};
+
 // ============================================================================
 // Offline Token Model Tests (No feature gate - just JSON structure tests)
 // ============================================================================
+
+#[cfg(feature = "offline")]
+#[test]
+fn test_ruby_signed_cross_language_fixture_verifies() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/ruby_signed_offline_token.json"))
+            .expect("cross-language fixture must be valid JSON");
+    let public_key = fixture["public_key"]
+        .as_str()
+        .expect("fixture public key")
+        .to_string();
+    let token: OfflineTokenResponse = serde_json::from_value(fixture["offline_token"].clone())
+        .expect("fixture offline token must match the public contract");
+
+    let config = Config {
+        product_slug: token.token.product_slug.clone(),
+        device_identifier: token.token.device_id.clone(),
+        signing_public_key: Some(public_key.clone()),
+        signing_key_id: Some(token.token.kid.clone()),
+        storage_prefix: format!("cross_language_fixture_{}_", std::process::id()),
+        ..Default::default()
+    };
+    let sdk = LicenseSeat::new(config);
+
+    assert!(
+        sdk.verify_offline_token(&token, Some(&public_key))
+            .expect("Ruby-signed fixture must verify in Rust")
+    );
+}
 
 #[test]
 fn test_offline_entitlement_serialization() {

@@ -1,16 +1,13 @@
 ## Default Permission
 
-Default permissions for LicenseSeat plugin
+Least-privilege permissions for normal end-user license lifecycle operations
 
 #### This default permission set includes the following:
 
 - `allow-activate`
-- `allow-validate-key`
 - `allow-validate`
 - `allow-deactivate`
-- `allow-deactivate-key`
 - `allow-heartbeat`
-- `allow-heartbeat-key`
 - `allow-get-status`
 - `allow-get-client-status`
 - `allow-is-online`
@@ -22,17 +19,8 @@ Default permissions for LicenseSeat plugin
 - `allow-has-entitlement`
 - `allow-get-license`
 - `allow-get-state`
-- `allow-get-admin-snapshot`
 - `allow-get-latest-release`
 - `allow-list-releases`
-- `allow-generate-download-token`
-- `allow-generate-offline-token`
-- `allow-verify-offline-token`
-- `allow-checkout-machine-file`
-- `allow-fetch-signing-key`
-- `allow-sync-offline-assets`
-- `allow-verify-machine-file`
-- `allow-reset`
 
 ## Permission Table
 

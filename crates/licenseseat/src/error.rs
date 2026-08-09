@@ -45,6 +45,10 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// A successful HTTP response violated the authenticated API contract.
+    #[error("invalid API response: {0}")]
+    InvalidResponse(String),
+
     /// Cryptographic verification failed (offline validation).
     #[cfg(feature = "offline")]
     #[error("crypto error: {0}")]

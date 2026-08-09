@@ -1,6 +1,7 @@
 //! Plugin configuration from tauri.conf.json.
 
 use serde::Deserialize;
+use std::fmt;
 
 /// Plugin configuration read from tauri.conf.json.
 ///
@@ -19,7 +20,7 @@ use serde::Deserialize;
 ///   }
 /// }
 /// ```
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginConfig {
     /// Your publishable LicenseSeat API key (`pk_*`, required).
@@ -124,4 +125,37 @@ pub struct PluginConfig {
     /// App build (for telemetry).
     #[serde(default)]
     pub app_build: Option<String>,
+}
+
+impl fmt::Debug for PluginConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PluginConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("product_slug", &self.product_slug)
+            .field("api_base_url", &self.api_base_url)
+            .field("storage_prefix_configured", &self.storage_prefix.is_some())
+            .field("storage_path_configured", &self.storage_path.is_some())
+            .field(
+                "device_identifier_configured",
+                &self.device_identifier.is_some(),
+            )
+            .field(
+                "signing_public_key_configured",
+                &self.signing_public_key.is_some(),
+            )
+            .field("signing_key_id", &self.signing_key_id)
+            .field("auto_validate_interval", &self.auto_validate_interval)
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("network_recheck_interval", &self.network_recheck_interval)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("verify_ssl", &self.verify_ssl)
+            .field("offline_fallback_mode", &self.offline_fallback_mode)
+            .field("max_offline_days", &self.max_offline_days)
+            .field("telemetry_enabled", &self.telemetry_enabled)
+            .field("debug", &self.debug)
+            .field("app_version", &self.app_version)
+            .field("app_build", &self.app_build)
+            .finish()
+    }
 }

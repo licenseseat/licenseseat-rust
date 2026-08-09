@@ -353,7 +353,11 @@ export interface LicenseSeatAdminSnapshot {
 }
 
 /** Event payloads emitted by the Tauri plugin */
-export type LicenseSeatEventPayload = License | ValidationResult | string | null;
+export type LicenseSeatEventPayload =
+  | { activatedAt: string }
+  | { valid: boolean; code: string | null; offline: boolean }
+  | string
+  | null;
 
 /** Stable Tauri event names emitted by the plugin */
 export const LICENSESEAT_EVENTS = {

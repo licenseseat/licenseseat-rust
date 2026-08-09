@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use wiremock::matchers::{method, path_regex};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 static TEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -27,6 +27,7 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
+        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
         auto_validate_interval: Duration::from_secs(0),
@@ -36,20 +37,27 @@ fn test_config(base_url: &str) -> Config {
     }
 }
 
-fn activation_response() -> serde_json::Value {
+fn request_license_key(request: &Request) -> String {
+    serde_json::from_slice::<serde_json::Value>(&request.body)
+        .ok()
+        .and_then(|body| body.get("license_key")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "missing-license-key".to_owned())
+}
+
+fn activation_response(license_key: &str) -> serde_json::Value {
     json!({
         "object": "activation",
         "id": "act-12345-uuid",
         "device_id": "device-123",
         "device_name": "Test Device",
-        "license_key": "TEST-KEY",
+        "license_key": license_key,
         "activated_at": "2025-01-01T00:00:00Z",
         "deactivated_at": null,
         "ip_address": "127.0.0.1",
         "metadata": null,
         "license": {
             "object": "license",
-            "key": "TEST-KEY",
+            "key": license_key,
             "status": "active",
             "starts_at": null,
             "expires_at": null,
@@ -67,7 +75,7 @@ fn activation_response() -> serde_json::Value {
     })
 }
 
-fn validation_response() -> serde_json::Value {
+fn validation_response(license_key: &str) -> serde_json::Value {
     json!({
         "object": "validation_result",
         "valid": true,
@@ -76,7 +84,7 @@ fn validation_response() -> serde_json::Value {
         "warnings": null,
         "license": {
             "object": "license",
-            "key": "TEST-KEY",
+            "key": license_key,
             "status": "active",
             "starts_at": null,
             "expires_at": null,
@@ -91,17 +99,27 @@ fn validation_response() -> serde_json::Value {
                 "name": "Test App"
             }
         },
-        "activation": null
+        "activation": {
+            "object": "activation",
+            "id": "act-12345-uuid",
+            "device_id": "device-123",
+            "device_name": "Test Device",
+            "license_key": license_key,
+            "activated_at": "2025-01-01T00:00:00Z",
+            "deactivated_at": null,
+            "ip_address": "127.0.0.1",
+            "metadata": null
+        }
     })
 }
 
-fn heartbeat_response() -> serde_json::Value {
+fn heartbeat_response(license_key: &str) -> serde_json::Value {
     json!({
         "object": "heartbeat",
         "received_at": "2025-01-01T00:00:00Z",
         "license": {
             "object": "license",
-            "key": "TEST-KEY",
+            "key": license_key,
             "status": "active",
             "starts_at": null,
             "expires_at": null,
@@ -119,6 +137,21 @@ fn heartbeat_response() -> serde_json::Value {
     })
 }
 
+fn activation_responder(request: &Request) -> ResponseTemplate {
+    let license_key = request_license_key(request);
+    ResponseTemplate::new(201).set_body_json(activation_response(&license_key))
+}
+
+fn validation_responder(request: &Request) -> ResponseTemplate {
+    let license_key = request_license_key(request);
+    ResponseTemplate::new(200).set_body_json(validation_response(&license_key))
+}
+
+fn heartbeat_responder(request: &Request) -> ResponseTemplate {
+    let license_key = request_license_key(request);
+    ResponseTemplate::new(200).set_body_json(heartbeat_response(&license_key))
+}
+
 // ============================================================================
 // Concurrent API Calls Tests
 // ============================================================================
@@ -128,14 +161,14 @@ async fn test_concurrent_validations() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(activation_responder)
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(validation_response()))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(validation_responder)
         .mount(&server)
         .await;
 
@@ -162,14 +195,14 @@ async fn test_concurrent_heartbeats() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(activation_responder)
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/heartbeat"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(heartbeat_response()))
+        .and(path_regex(r"/products/.*/licenses/heartbeat"))
+        .respond_with(heartbeat_responder)
         .mount(&server)
         .await;
 
@@ -195,14 +228,14 @@ async fn test_concurrent_status_checks() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(activation_responder)
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(validation_response()))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(validation_responder)
         .mount(&server)
         .await;
 
@@ -238,20 +271,20 @@ async fn test_concurrent_entitlement_checks() {
     ];
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "object": "activation",
             "id": "act-12345-uuid",
             "device_id": "device-123",
             "device_name": "Test Device",
-            "license_key": "TEST-KEY",
+            "license_key": "ENTITLEMENT-KEY",
             "activated_at": "2025-01-01T00:00:00Z",
             "deactivated_at": null,
             "ip_address": "127.0.0.1",
             "metadata": null,
             "license": {
                 "object": "license",
-                "key": "TEST-KEY",
+                "key": "ENTITLEMENT-KEY",
                 "status": "active",
                 "starts_at": null,
                 "expires_at": null,
@@ -271,7 +304,7 @@ async fn test_concurrent_entitlement_checks() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "object": "validation_result",
             "valid": true,
@@ -280,7 +313,7 @@ async fn test_concurrent_entitlement_checks() {
             "warnings": null,
             "license": {
                 "object": "license",
-                "key": "TEST-KEY",
+                "key": "ENTITLEMENT-KEY",
                 "status": "active",
                 "starts_at": null,
                 "expires_at": null,
@@ -299,7 +332,17 @@ async fn test_concurrent_entitlement_checks() {
                     "name": "Test App"
                 }
             },
-            "activation": null
+            "activation": {
+                "object": "activation",
+                "id": "act-12345-uuid",
+                "device_id": "device-123",
+                "device_name": "Test Device",
+                "license_key": "ENTITLEMENT-KEY",
+                "activated_at": "2025-01-01T00:00:00Z",
+                "deactivated_at": null,
+                "ip_address": "127.0.0.1",
+                "metadata": null
+            }
         })))
         .mount(&server)
         .await;
@@ -334,8 +377,8 @@ async fn test_concurrent_event_subscriptions() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(activation_responder)
         .mount(&server)
         .await;
 
@@ -382,14 +425,14 @@ async fn test_sdk_clone_shares_state() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(activation_responder)
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(validation_response()))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(validation_responder)
         .mount(&server)
         .await;
 
@@ -418,20 +461,20 @@ async fn test_sdk_clone_concurrent_operations() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(activation_responder)
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(validation_response()))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(validation_responder)
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/heartbeat"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(heartbeat_response()))
+        .and(path_regex(r"/products/.*/licenses/heartbeat"))
+        .respond_with(heartbeat_responder)
         .mount(&server)
         .await;
 
@@ -473,14 +516,14 @@ async fn test_no_race_on_status() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(activation_responder)
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(validation_response()))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(validation_responder)
         .mount(&server)
         .await;
 
@@ -518,14 +561,14 @@ async fn test_high_concurrency_stress() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(activation_responder)
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(validation_response()))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(validation_responder)
         .mount(&server)
         .await;
 
@@ -562,8 +605,8 @@ async fn test_multiple_independent_instances() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response()))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(activation_responder)
         .mount(&server)
         .await;
 

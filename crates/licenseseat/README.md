@@ -256,8 +256,12 @@ let sdk = LicenseSeat::new(config);
 
 | Mode | Behavior |
 |------|----------|
-| `NetworkOnly` | Always require network. Fail if offline. (Default) |
-| `Always` | Try online first, then fall back to a cached machine file or legacy offline token |
+| `NetworkOnly` | Fall back only for network/timeout/5xx failures; never for business-rule failures. (Default) |
+| `Always` | Try online first, then fall back after any non-business failure |
+
+Offline authority is disabled unless `max_offline_days` is set to a positive value. A value of
+`0` prevents automatic artifact fetching, refresh, and cached-artifact authorization regardless of
+the fallback mode.
 
 ### How It Works
 
@@ -424,7 +428,7 @@ let sdk = LicenseSeat::new(config);
 | `auto_validate_interval` | `Duration` | 1 hour | Background validation interval |
 | `heartbeat_interval` | `Duration` | 5 minutes | Heartbeat interval |
 | `offline_fallback_mode` | `OfflineFallbackMode` | `NetworkOnly` | Offline validation behavior |
-| `max_offline_days` | `u32` | `0` | Grace period for offline mode (days) |
+| `max_offline_days` | `u32` | `0` | Grace period in days; `0` disables offline authority |
 | `telemetry_enabled` | `bool` | `true` | Send device telemetry |
 | `app_version` | `Option<String>` | `None` | Your app version (for analytics) |
 | `debug` | `bool` | `false` | Enable debug logging |

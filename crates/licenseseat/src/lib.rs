@@ -63,6 +63,7 @@ mod device;
 mod error;
 mod events;
 mod models;
+mod strict_json;
 mod telemetry;
 
 #[cfg(feature = "offline")]

@@ -75,16 +75,32 @@ use tauri::{
 pub use config::PluginConfig;
 pub use error::{Error, Result};
 
-fn resolve_env_placeholder(value: String) -> String {
+fn resolve_env_placeholder(value: String) -> std::io::Result<String> {
     if let Some(name) = value.strip_prefix('$') {
-        std::env::var(name).unwrap_or(value)
+        if name.is_empty()
+            || name.len() > 128
+            || !name.bytes().enumerate().all(|(index, byte)| {
+                byte.is_ascii_uppercase() || byte == b'_' || (index > 0 && byte.is_ascii_digit())
+            })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "LicenseSeat environment placeholder is invalid",
+            ));
+        }
+        std::env::var(name).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "LicenseSeat environment placeholder is unresolved",
+            )
+        })
     } else {
-        value
+        Ok(value)
     }
 }
 
-fn resolve_optional_env_placeholder(value: Option<String>) -> Option<String> {
-    value.map(resolve_env_placeholder)
+fn resolve_optional_env_placeholder(value: Option<String>) -> std::io::Result<Option<String>> {
+    value.map(resolve_env_placeholder).transpose()
 }
 
 /// Initialize the LicenseSeat plugin.
@@ -103,35 +119,51 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
     Builder::<R, PluginConfig>::new("licenseseat")
         .setup(|app, api| {
             let config = api.config().clone();
-            let api_key = resolve_env_placeholder(config.api_key.clone());
-            let product_slug = resolve_env_placeholder(config.product_slug.clone());
-            let api_base_url = resolve_optional_env_placeholder(config.api_base_url.clone());
-            let storage_prefix = resolve_optional_env_placeholder(config.storage_prefix.clone());
-            let storage_path = resolve_optional_env_placeholder(config.storage_path.clone());
+            let api_key = resolve_env_placeholder(config.api_key.clone())?;
+            if !api_key.starts_with("pk_") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "LicenseSeat Tauri applications require a pk_ publishable API key",
+                )
+                .into());
+            }
+            let product_slug = resolve_env_placeholder(config.product_slug.clone())?;
+            let api_base_url = resolve_optional_env_placeholder(config.api_base_url.clone())?;
+            let storage_prefix = resolve_optional_env_placeholder(config.storage_prefix.clone())?;
+            let storage_path = resolve_optional_env_placeholder(config.storage_path.clone())?;
             let device_identifier =
-                resolve_optional_env_placeholder(config.device_identifier.clone());
+                resolve_optional_env_placeholder(config.device_identifier.clone())?;
             let signing_public_key =
-                resolve_optional_env_placeholder(config.signing_public_key.clone());
-            let signing_key_id = resolve_optional_env_placeholder(config.signing_key_id.clone());
+                resolve_optional_env_placeholder(config.signing_public_key.clone())?;
+            let signing_key_id = resolve_optional_env_placeholder(config.signing_key_id.clone())?;
             let app_version = resolve_optional_env_placeholder(
                 config
                     .app_version
                     .clone()
                     .or_else(|| Some(app.package_info().version.to_string())),
-            );
+            )?;
             let app_build = resolve_optional_env_placeholder(
                 config
                     .app_build
                     .clone()
                     .or_else(|| Some(app.package_info().name.clone())),
-            );
+            )?;
 
             let offline_fallback_mode = match config.offline_fallback_mode.as_deref() {
                 Some("always")
                 | Some("allow_offline")
                 | Some("offline_first")
                 | Some("offlineFirst") => licenseseat::OfflineFallbackMode::Always,
-                _ => licenseseat::OfflineFallbackMode::NetworkOnly,
+                None | Some("networkOnly") | Some("network_only") => {
+                    licenseseat::OfflineFallbackMode::NetworkOnly
+                }
+                Some(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "LicenseSeat offline fallback mode is invalid",
+                    )
+                    .into());
+                }
             };
 
             // Convert plugin config to SDK config
@@ -170,6 +202,9 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 app_build,
                 ..Default::default()
             };
+            sdk_config.validate().map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+            })?;
 
             // Create the SDK instance and manage it
             app.manage(sdk_config);
@@ -223,4 +258,42 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             commands::reset,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_configuration_values_are_preserved() {
+        assert_eq!(
+            resolve_env_placeholder("pk_test_public".into()).unwrap(),
+            "pk_test_public"
+        );
+        assert_eq!(
+            resolve_optional_env_placeholder(Some("my-product".into())).unwrap(),
+            Some("my-product".into())
+        );
+    }
+
+    #[test]
+    fn malformed_environment_placeholders_are_rejected() {
+        assert!(resolve_env_placeholder("$".into()).is_err());
+        assert!(resolve_env_placeholder("$lowercase".into()).is_err());
+        assert!(resolve_env_placeholder("$NAME/EXTRA".into()).is_err());
+    }
+
+    #[test]
+    fn plugin_config_debug_redacts_key_material() {
+        let config = PluginConfig {
+            api_key: "pk_live_do-not-print".into(),
+            signing_public_key: Some("public-key-material".into()),
+            ..Default::default()
+        };
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains("pk_live_do-not-print"));
+        assert!(!debug.contains("public-key-material"));
+        assert!(debug.contains("[REDACTED]"));
+    }
 }

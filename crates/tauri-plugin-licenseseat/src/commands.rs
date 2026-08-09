@@ -9,6 +9,7 @@ use licenseseat::{
     RestoreResult, SigningKeyResponse, ValidationResult,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::State;
@@ -518,6 +519,7 @@ pub struct MachineFilePayloadResponse {
     pub ttl: i64,
     pub grace_period: i64,
     pub license_key: String,
+    pub product_slug: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub license_expires_at: Option<i64>,
     pub key_id: String,
@@ -547,6 +549,7 @@ impl From<MachineFilePayload> for MachineFilePayloadResponse {
             ttl: payload.ttl,
             grace_period: payload.grace_period,
             license_key: payload.license_key,
+            product_slug: payload.product_slug,
             license_expires_at: payload.license_expires_at,
             key_id: payload.key_id,
             sdk_version: payload.sdk_version,
@@ -846,13 +849,28 @@ fn cache_dir_for_config(config: &licenseseat::Config) -> Option<PathBuf> {
     config
         .storage_path
         .clone()
-        .or_else(|| dirs::cache_dir().map(|dir| dir.join("licenseseat")))
+        .or_else(|| dirs::data_local_dir().map(|dir| dir.join("licenseseat")))
 }
 
 fn cache_path_for_key(config: &licenseseat::Config, key: &str) -> Option<String> {
+    let namespace = digest_hex(config.storage_prefix.as_bytes());
+    let key_digest = digest_hex(key.as_bytes());
     cache_dir_for_config(config)
-        .map(|dir| dir.join(format!("{}{}.json", config.storage_prefix, key)))
+        .map(|dir| {
+            dir.join(format!(
+                "v2-{}-{}.json",
+                &namespace[..32],
+                &key_digest[..32]
+            ))
+        })
         .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn digest_hex(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn build_admin_config_response(config: &licenseseat::Config) -> AdminConfigResponse {
@@ -863,7 +881,7 @@ fn build_admin_config_response(config: &licenseseat::Config) -> AdminConfigRespo
 
     AdminConfigResponse {
         api_base_url: config.api_base_url.clone(),
-        api_key: config.api_key.clone(),
+        api_key: "[REDACTED]".into(),
         product_slug: config.product_slug.clone(),
         storage_prefix: config.storage_prefix.clone(),
         storage_path: config
@@ -891,22 +909,16 @@ fn build_admin_config_response(config: &licenseseat::Config) -> AdminConfigRespo
 
 fn build_admin_cache_paths_response(
     config: &licenseseat::Config,
-    signing_key_id: Option<&str>,
+    _signing_key_id: Option<&str>,
 ) -> AdminCachePathsResponse {
     AdminCachePathsResponse {
         cache_dir: cache_dir_for_config(config).map(|value| value.to_string_lossy().into_owned()),
         license_path: cache_path_for_key(config, "license"),
-        license_snapshot_path: cache_path_for_key(config, "license_snapshot"),
+        license_snapshot_path: None,
         machine_file_path: cache_path_for_key(config, "machine_file"),
         offline_token_path: cache_path_for_key(config, "offline_token"),
         last_seen_timestamp_path: cache_path_for_key(config, "last_seen_ts"),
-        signing_key_path: signing_key_id.and_then(|value| {
-            if value.is_empty() {
-                None
-            } else {
-                cache_path_for_key(config, &format!("signing_key_{value}"))
-            }
-        }),
+        signing_key_path: None,
     }
 }
 
@@ -1424,15 +1436,16 @@ pub fn reset(sdk: State<'_, licenseseat::LicenseSeat>) {
 
 pub(crate) fn event_payload_to_json(data: Option<EventData>) -> serde_json::Value {
     match data {
-        Some(EventData::License(license)) => {
-            serde_json::to_value(LicenseResponse::from(*license)).unwrap_or(serde_json::Value::Null)
-        }
-        Some(EventData::Validation(result)) => {
-            serde_json::to_value(ValidationResultResponse::from(*result))
-                .unwrap_or(serde_json::Value::Null)
-        }
-        Some(EventData::Error(error)) | Some(EventData::Message(error)) => {
-            serde_json::Value::String(error)
+        Some(EventData::License(license)) => serde_json::json!({
+            "activatedAt": license.activated_at.to_rfc3339()
+        }),
+        Some(EventData::Validation(result)) => serde_json::json!({
+            "valid": result.valid,
+            "code": result.code,
+            "offline": result.offline
+        }),
+        Some(EventData::Error(_)) | Some(EventData::Message(_)) => {
+            serde_json::Value::String("LicenseSeat operation failed".into())
         }
         Some(EventData::NextRunAt(next_run_at)) => {
             serde_json::Value::String(next_run_at.to_rfc3339())
@@ -1579,7 +1592,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validation_event_payload_is_structured() {
+    fn test_validation_event_payload_excludes_sensitive_state() {
         let payload =
             event_payload_to_json(Some(EventData::Validation(Box::new(ValidationResult {
                 object: "validation_result".into(),
@@ -1612,8 +1625,12 @@ mod tests {
             }))));
 
         assert_eq!(payload["valid"], json!(false));
-        assert_eq!(payload["license"]["planKey"], json!("pro"));
-        assert_eq!(payload["message"], json!("License is invalid"));
+        assert_eq!(payload["code"], json!("license_invalid"));
+        assert_eq!(payload["offline"], json!(false));
+        let serialized = payload.to_string();
+        assert!(!serialized.contains("TEST-KEY"));
+        assert!(!serialized.contains("License is invalid"));
+        assert!(!serialized.contains("pro"));
     }
 
     #[test]
@@ -1641,7 +1658,7 @@ mod tests {
     }
 
     #[test]
-    fn test_state_response_for_cached_license_exposes_entitlements() {
+    fn test_state_response_does_not_trust_cached_validation_after_restart() {
         let storage_path = unique_storage_path("licenseseat-plugin-state-populated-test");
         let config = Config::new("pk_test_123", "demo-product")
             .with_storage_path(storage_path.clone())
@@ -1661,13 +1678,12 @@ mod tests {
         let sdk = licenseseat::LicenseSeat::new(config);
         let state = map_state_response(&sdk);
 
-        assert_eq!(state.client_status, "active");
+        assert_eq!(state.client_status, "pending");
         assert!(state.is_activated);
-        assert!(state.is_valid);
-        assert_eq!(state.plan_key.as_deref(), Some("pro"));
-        assert_eq!(state.license_mode.as_deref(), Some("hardware_locked"));
-        assert_eq!(state.entitlements.len(), 1);
-        assert_eq!(state.entitlements[0].key, "pro");
+        assert!(!state.is_valid);
+        assert!(state.plan_key.is_none());
+        assert!(state.license_mode.is_none());
+        assert!(state.entitlements.is_empty());
         assert_eq!(
             state.license.as_ref().map(|value| value.device_id.as_str()),
             Some("device-123")
@@ -1684,7 +1700,7 @@ mod tests {
 
         let snapshot = map_admin_snapshot_response(&sdk, &config);
 
-        assert_eq!(snapshot.config.api_key, "pk_test_123");
+        assert_eq!(snapshot.config.api_key, "[REDACTED]");
         assert_eq!(snapshot.config.product_slug, "demo-product");
         assert_eq!(
             snapshot.cache_paths.cache_dir,
@@ -1802,32 +1818,17 @@ mod tests {
                 .map(|value| value.license_key.as_str()),
             Some("TEST-KEY")
         );
-        assert_eq!(
-            snapshot
-                .trusted_license
-                .as_ref()
-                .map(|value| value.plan_key.as_str()),
-            Some("pro")
-        );
-        assert_eq!(
-            snapshot.trusted_license_source.as_deref(),
-            Some("cached_license")
-        );
+        assert!(snapshot.trusted_license.is_none());
+        assert!(snapshot.trusted_license_source.is_none());
         assert!(snapshot.machine_file_verification.is_some());
         assert_eq!(snapshot.signing_key_id.as_deref(), Some("kid_123"));
-        assert_eq!(
-            snapshot
-                .signing_key
-                .as_ref()
-                .map(|value| value.key_id.as_str()),
-            Some("kid_123")
-        );
-        assert!(snapshot.cache_paths.license_snapshot_path.is_some());
-        assert!(snapshot.cache_paths.signing_key_path.is_some());
+        assert!(snapshot.signing_key.is_none());
+        assert!(snapshot.cache_paths.license_snapshot_path.is_none());
+        assert!(snapshot.cache_paths.signing_key_path.is_none());
     }
 
     #[test]
-    fn test_admin_snapshot_prefers_snapshot_file_for_trusted_license() {
+    fn test_admin_snapshot_does_not_trust_persisted_snapshot_file() {
         let storage_path = unique_storage_path("licenseseat-plugin-admin-snapshot-source-test");
         let config = Config::new("pk_test_123", "demo-product")
             .with_storage_path(storage_path.clone())
@@ -1876,16 +1877,7 @@ mod tests {
         let sdk = licenseseat::LicenseSeat::new(config.clone());
         let snapshot = map_admin_snapshot_response(&sdk, &config);
 
-        assert_eq!(
-            snapshot
-                .trusted_license
-                .as_ref()
-                .map(|value| value.plan_key.as_str()),
-            Some("enterprise")
-        );
-        assert_eq!(
-            snapshot.trusted_license_source.as_deref(),
-            Some("snapshot_file")
-        );
+        assert!(snapshot.trusted_license.is_none());
+        assert!(snapshot.trusted_license_source.is_none());
     }
 }

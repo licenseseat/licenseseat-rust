@@ -84,6 +84,9 @@ enum ScenarioResult {
     Fail,
 }
 
+type ScenarioFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ScenarioResult> + Send>>;
+type Scenario = (u32, &'static str, fn(TestContext) -> ScenarioFuture);
+
 impl ScenarioResult {
     fn symbol(&self) -> &'static str {
         match self {
@@ -165,13 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_scenario: Option<u32> = env::var("RUN_SCENARIO").ok().and_then(|s| s.parse().ok());
 
     // Define scenarios
-    let scenarios: &[(
-        u32,
-        &str,
-        fn(
-            TestContext,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ScenarioResult> + Send>>,
-    )] = &[
+    let scenarios: &[Scenario] = &[
         (1, "Activation with telemetry", |ctx| {
             Box::pin(scenario_1_activation_telemetry(ctx))
         }),

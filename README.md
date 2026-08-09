@@ -101,6 +101,8 @@ Use your `pk_*` publishable API key here. Do not embed `sk_*` secret keys in cli
 }
 ```
 
+`licenseseat:default` is a least-privilege end-user set. Admin diagnostics, arbitrary-key operations, offline artifact/key helpers, download-token generation, and reset require explicit command permissions.
+
 **5. Use in your frontend:**
 
 ```typescript
@@ -236,8 +238,12 @@ let config = Config {
 
 | Mode | Description |
 |------|-------------|
-| `NetworkOnly` | Always require network validation (default) |
-| `Always` | Fall back to cached machine files, then legacy offline tokens if explicitly enabled |
+| `NetworkOnly` | Fall back only for network/timeout/5xx failures; never for business-rule failures (default) |
+| `Always` | Try cached machine files after any non-business failure, then legacy tokens if explicitly enabled |
+
+Offline authority is disabled unless `max_offline_days` is positive. A value of `0` prevents
+automatic artifact fetching, refresh, and cached-artifact authorization regardless of fallback
+mode.
 
 ## Heartbeat & Seat Tracking
 
@@ -306,7 +312,7 @@ tokio::spawn(async move {
 | `offline_fallback_mode` | `OfflineFallbackMode` | `NetworkOnly` | Offline validation behavior |
 | `offline_token_refresh_interval` | `Duration` | 72 hours | Offline artifact refresh interval |
 | `enable_legacy_offline_tokens` | `bool` | `false` | Allow legacy offline-token fallback after machine-file sync fails |
-| `max_offline_days` | `u32` | `0` | Grace period for offline mode |
+| `max_offline_days` | `u32` | `0` | Grace period in days; `0` disables offline authority |
 | `device_identifier` | `Option<String>` | `None` | Override the canonical device fingerprint |
 | `signing_public_key` | `Option<String>` | `None` | Optional pinned public key for offline verification |
 | `telemetry_enabled` | `bool` | `true` | Send device telemetry |

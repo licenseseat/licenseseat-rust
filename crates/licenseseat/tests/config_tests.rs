@@ -44,9 +44,9 @@ fn test_config_default_values() {
 
 #[test]
 fn test_config_new_with_required_fields() {
-    let config = Config::new("sk_live_test123", "my-product");
+    let config = Config::new("pk_live_test123", "my-product");
 
-    assert_eq!(config.api_key, "sk_live_test123");
+    assert_eq!(config.api_key, "pk_live_test123");
     assert_eq!(config.product_slug, "my-product");
     // Other values should be defaults
     assert_eq!(config.api_base_url, "https://licenseseat.com/api/v1");
@@ -387,7 +387,7 @@ fn test_config_very_long_intervals() {
 #[test]
 fn test_config_development_setup() {
     let config = Config {
-        api_key: "sk_test_development".into(),
+        api_key: "pk_test_development".into(),
         product_slug: "my-app-dev".into(),
         api_base_url: "http://localhost:3000/api/v1".into(),
         debug: true,
@@ -404,7 +404,7 @@ fn test_config_development_setup() {
 #[test]
 fn test_config_production_setup() {
     let config = Config {
-        api_key: "sk_live_production_key".into(),
+        api_key: "pk_live_production_key".into(),
         product_slug: "my-app".into(),
         debug: false,
         telemetry_enabled: true,
@@ -418,13 +418,13 @@ fn test_config_production_setup() {
 
     assert!(!config.debug);
     assert!(config.telemetry_enabled);
-    assert!(config.api_key.starts_with("sk_live"));
+    assert!(config.api_key.starts_with("pk_live"));
 }
 
 #[test]
 fn test_config_offline_first_setup() {
     let config = Config {
-        api_key: "sk_live_key".into(),
+        api_key: "pk_live_key".into(),
         product_slug: "offline-app".into(),
         offline_fallback_mode: OfflineFallbackMode::Always,
         max_offline_days: 14,
@@ -435,4 +435,30 @@ fn test_config_offline_first_setup() {
 
     assert_eq!(config.offline_fallback_mode, OfflineFallbackMode::Always);
     assert_eq!(config.max_offline_days, 14);
+}
+
+#[test]
+fn test_validate_accepts_safe_complete_configuration() {
+    let config = Config::new("pk_test_public", "my-app");
+
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn test_validate_rejects_insecure_or_ambiguous_configuration() {
+    let mut config = Config::new("pk_test_public", "my-app");
+    config.api_base_url = "https://example.test\\@attacker.test/api/v1".into();
+    assert!(config.validate().is_err());
+
+    let mut config = Config::new("pk_test_public", "my-app");
+    config.signing_public_key = Some("A".repeat(44));
+    assert!(config.validate().is_err());
+
+    let mut config = Config::new("pk_test_public", "my-app");
+    config.auto_validate_interval = Duration::from_secs(367 * 86_400);
+    assert!(config.validate().is_err());
+
+    let mut config = Config::new("pk_test_public", "my-app");
+    config.app_version = Some("1.0\nforged-log-line".into());
+    assert!(config.validate().is_err());
 }

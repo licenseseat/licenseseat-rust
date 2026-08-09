@@ -24,7 +24,7 @@ tracing = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 
 # HTTP
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 # Crypto (for offline validation)
 ed25519-dalek = { version = "2", features = ["rand_core"] }
