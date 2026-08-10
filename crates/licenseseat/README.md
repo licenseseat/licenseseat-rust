@@ -149,10 +149,15 @@ let sdk = LicenseSeat::try_new(Config {
 })?;
 
 sdk.activate("CUSTOMER-LICENSE-KEY").await?;
-sdk.sync_offline_assets().await?;
 # Ok(())
 # }
 ```
+
+A successful activation already starts one one-shot offline-asset sync. Do not
+normally call `sync_offline_assets()` immediately afterward: that starts a
+second, serialized checkout. Use the method later when an explicit refresh or
+retry is intentional. If the application needs to observe initial readiness,
+subscribe to the machine-file/offline-asset events before activation.
 
 ### Trust anchor
 
@@ -183,7 +188,10 @@ Legacy token signatures use standard Base64, matching the Ruby core. Machine-fil
 
 Neither mode permits an older offline artifact to override authentication/configuration failures, ordinary business/client errors, invalid JSON or response identity, or a superseded local operation.
 
-`network_recheck_interval = Duration::ZERO` disables connectivity probing. `offline_token_refresh_interval = Duration::ZERO` disables artifact refresh. The task launcher skips disabled intervals, so zero cannot create a tight loop.
+`network_recheck_interval = Duration::ZERO` disables connectivity probing.
+`offline_token_refresh_interval = Duration::ZERO` disables periodic artifact
+refresh, but not the one-shot sync after activation. The periodic task launcher
+skips disabled intervals, so zero cannot create a tight loop.
 
 ## Configuration reference
 
@@ -205,7 +213,7 @@ Neither mode permits an older offline artifact to override authentication/config
 | `max_retries` | 3 | Retries only retryable availability failures |
 | `retry_delay` | 1 second | Exponential delay is capped |
 | `offline_fallback_mode` | `NetworkOnly` | See policy above |
-| `offline_token_refresh_interval` | 72 hours | Zero disables |
+| `offline_token_refresh_interval` | 72 hours | Zero disables periodic refresh; activation still starts one one-shot sync |
 | `enable_legacy_offline_tokens` | `false` | Machine files remain preferred |
 | `max_offline_days` | 0 | No extra host-age cap; signed expiry still enforced |
 | `max_clock_skew` | 5 minutes | Used by signed time checks |
