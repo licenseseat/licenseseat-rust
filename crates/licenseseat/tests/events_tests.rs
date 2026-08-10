@@ -24,7 +24,6 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
-        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
         device_identifier: Some("device-123".into()),
@@ -259,7 +258,7 @@ async fn validation_auth_failed_event_count(status: u16) -> usize {
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(status).set_body_json(json!({
             "error": {
                 "code": "invalid_api_key",

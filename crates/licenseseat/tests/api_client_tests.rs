@@ -5,7 +5,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use wiremock::matchers::{header, method, path, path_regex};
+use wiremock::matchers::{body_partial_json, header, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -24,7 +24,6 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
-        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
         device_identifier: Some("device-123".into()),
@@ -287,7 +286,7 @@ async fn licensing_requests_never_follow_cross_origin_redirects() {
     let redirect_target = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
             ResponseTemplate::new(307)
                 .append_header("Location", format!("{}/capture", redirect_target.uri())),
@@ -369,7 +368,7 @@ async fn test_401_unauthorized_returns_error() {
 async fn test_retry_on_rate_limit_then_success() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(RateLimitOnce {
             returned_rate_limit: Arc::new(AtomicBool::new(false)),
         })
@@ -387,7 +386,7 @@ async fn test_retry_on_rate_limit_then_success() {
 async fn test_exhausted_server_error_marks_service_unavailable() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(503).set_body_json(json!({
             "error": { "code": "unavailable", "message": "maintenance" }
         })))
@@ -427,7 +426,7 @@ async fn test_success_response_body_is_bounded() {
 async fn test_error_response_body_is_bounded_without_retrying() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(503).set_body_bytes(vec![b'x'; 4 * 1024 * 1024 + 1]))
         .expect(1)
         .mount(&server)
@@ -444,7 +443,8 @@ async fn test_error_response_body_is_bounded_without_retrying() {
 async fn test_api_error_messages_are_safe_and_bounded() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/products/test-product/licenses/HTML-ERROR/activate"))
+        .and(path("/products/test-product/licenses/activate"))
+        .and(body_partial_json(json!({ "license_key": "HTML-ERROR" })))
         .respond_with(
             ResponseTemplate::new(502)
                 .set_body_string("<!doctype html><html><body>proxy internals</body></html>"),
@@ -453,7 +453,8 @@ async fn test_api_error_messages_are_safe_and_bounded() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path("/products/test-product/licenses/LONG-ERROR/activate"))
+        .and(path("/products/test-product/licenses/activate"))
+        .and(body_partial_json(json!({ "license_key": "LONG-ERROR" })))
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({
             "error": {
                 "code": "invalid_request",
@@ -479,14 +480,12 @@ async fn test_api_error_messages_are_safe_and_bounded() {
     assert!(matches!(
         long,
         Error::Api { ref message, .. }
-            if message.chars().count() == 4_096
-                && message.ends_with("...")
-                && !message.contains('\n')
+            if message == "Request failed"
     ));
 }
 
 #[tokio::test]
-async fn test_request_body_is_bounded_before_network_io() {
+async fn test_oversized_request_metadata_is_rejected_before_network_io() {
     let server = MockServer::start().await;
     let sdk = LicenseSeat::try_new(test_config(&server.uri())).unwrap();
     let options = ActivationOptions {
@@ -499,9 +498,7 @@ async fn test_request_body_is_bounded_before_network_io() {
 
     assert!(matches!(
         sdk.activate_with_options("TEST-KEY", options).await,
-        Err(Error::RequestTooLarge {
-            limit_bytes: 1_048_576
-        })
+        Err(Error::Configuration(message)) if message == "metadata is invalid"
     ));
     assert!(server.received_requests().await.unwrap().is_empty());
 }

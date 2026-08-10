@@ -1,6 +1,6 @@
 # Production hardening audit
 
-Date: 2026-07-14
+Date: 2026-08-10
 Audit baseline: `v0.5.3` / `6a34776`
 Scope: Rust core SDK, Tauri 2 Rust plugin, TypeScript bindings, permissions, persistence, offline interoperability, release APIs, documentation, and local release gates
 
@@ -62,6 +62,8 @@ The review assumes an attacker or failure can:
 - return valid JSON for the wrong request identity through a compromised/misconfigured proxy;
 - delay responses so an old request finishes after activation, reset, or deactivation;
 - return HTML, huge bodies, huge structured error messages, or huge outbound metadata;
+- exploit duplicate JSON keys, deeply nested metadata, oversized offline
+  envelopes, long-lived artifacts, or excessive entitlement collections;
 - manipulate the wall clock within or beyond an allowed skew;
 - trigger concurrent restore/bootstrap calls and bursty frontend events;
 - inspect a desktop binary and renderer process;
@@ -198,6 +200,8 @@ Regression proof:
 Resolution enforces:
 
 - exact algorithms and schema versions;
+- exact envelope/object field sets and duplicate-key-free JSON at every trust
+  boundary;
 - bounded certificate/canonical payload sizes;
 - canonical JSON equality for legacy tokens;
 - Ed25519 signatures using the encoding emitted by the Ruby core;
@@ -212,7 +216,10 @@ Resolution enforces:
 - a process-monotonic effective clock that never moves backward, including a
   forward-then-backward wall-clock sequence after verification;
 - embedded license active status/product/time window;
-- denial precedence over older artifacts.
+- denial precedence over older artifacts;
+- bounded identifiers, metadata depth/node/byte counts, entitlement counts,
+  ciphertext/plaintext sizes, PEM line lengths, artifact lifetimes, and grace
+  periods before expensive cryptographic or recursive processing.
 
 Machine-file checkout verifies before persistence. Machine-file restore accepts rich plan/product/entitlement metadata only from the signed embedded license. A valid artifact without that embedded object restores only its signed identity/time contract and no entitlements; unsigned snapshot/cache metadata cannot enrich the grant.
 
@@ -220,14 +227,18 @@ Machine-file checkout verifies before persistence. Machine-file restore accepts 
 
 Resolution:
 
-- app/product-scoped directories and filenames;
+- app/product-scoped directories and opaque `v2_<sha256>` filenames/lock names
+  that do not disclose the product slug;
 - strict cache-key/signing-key-ID path validation;
-- no symlink reads or symlinked storage root;
+- no symlink reads or symlinked storage root, plus Windows reparse-point-aware
+  opens that reject alternate path traversal before following it;
 - private permissions where supported;
 - 4 MiB maximum file reads;
 - serialization before replacement;
 - temporary file in the destination directory, flush/sync, rename, and private mode;
 - corrupt current-format files do not resurrect an older legacy grant;
+- legacy files are adopted transactionally by writing the hardened copy first
+  and deleting the old file only after the new commit succeeds;
 - corrupt, substituted, oversized, or unreadable startup license state is an
   initialization error rather than an absent activation;
 - cache transactions use a durable per-prefix advisory lock across processes;
@@ -377,6 +388,7 @@ These changes are security-significant and should be called out even when the Ru
 | `PluginConfig` was `app.manage`d and readable from Tauri state | Only the core SDK handle is managed |
 | `activateAndGetState` issued an extra validation request | Returns the activation plus one `getState()` snapshot; the activation response is already the validated grant |
 | `clear()`/reset deleted the clock-rollback watermark, and offline verification was its only writer | `last_seen_ts` survives clear/reset like the installation identifier; authoritative online successes (activation, validation, heartbeat) re-anchor it and may lower it, while offline verification still only ratchets it forward |
+| Product slugs appeared in cache and lock filenames | Cache and lock names use an opaque SHA-256 namespace; legacy files are migrated one way after a successful hardened write |
 
 Migration guidance:
 
@@ -388,9 +400,14 @@ Migration guidance:
    entitlements; configure issuance to include the signed license object when
    offline feature grants are required.
 5. Review Tauri capability sets and remove broad renderer permissions.
-6. If legacy hardware correlation is required, opt in intentionally and update privacy disclosure.
-7. Use canonical fallback values `networkOnly` or `always`.
-8. Add wildcard arms when matching `Error`, `EntitlementReason`,
+6. Before the first 0.6 launch, stop every process using a pre-0.6 SDK against
+   the same storage directory. Old and new versions intentionally have
+   different lock names, so concurrent migration is unsupported. After the
+   hardened copy commits, its legacy source is removed; do not roll the
+   authorization cache back to a pre-0.6 binary.
+7. If legacy hardware correlation is required, opt in intentionally and update privacy disclosure.
+8. Use canonical fallback values `networkOnly` or `always`.
+9. Add wildcard arms when matching `Error`, `EntitlementReason`,
    `LicenseStatus`, `ClientStatus`, `TrustedLicenseSource`, `EventKind`,
    `EventData`, or `OfflineFallbackMode`; these are non-exhaustive to avoid
    repeating this source break for future additions.
@@ -422,6 +439,15 @@ The workspace suite covers:
   Windows cache/atomic-replacement paths;
 - Rust doc tests and package contents.
 
+The instrumented 2026-08-10 workspace run executed all 392 Rust tests and
+reported 78.71% aggregate line coverage. The authorization-heavy core modules
+were higher: cache 90.32%, client 86.02%, offline verification 81.95%, and
+configuration 89.11%. The Tauri registration/IPC layer lowers the workspace
+aggregate. Coverage is a gap-finding metric, not evidence that unexecuted
+states are secure; the release gate therefore combines it with feature-matrix,
+MSRV, cross-target, adversarial, interoperability, lint, documentation,
+packaging, and dependency checks.
+
 ## Local release gate
 
 GitHub Actions billing/availability is not evidence about the code. Before a release tag, run:
@@ -438,13 +464,16 @@ cargo test -p licenseseat --no-default-features --features rustls,offline --lock
 cargo test -p licenseseat --no-default-features --features native-tls,offline --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
-cargo package --workspace --locked --allow-dirty
+cargo llvm-cov --workspace --all-features --summary-only
+cargo package --workspace --locked
 cargo audit
+actionlint
 
 cd crates/tauri-plugin-licenseseat
 npm ci
 npm test
 npm run pack:check
+npm audit
 ```
 
 Regenerate the Ruby compatibility fixture with the checked-out LicenseSeat core and require an exact diff:
@@ -465,13 +494,18 @@ gate initially found and blocked release on `RUSTSEC-2026-0194` and
 0.3.45`. The split MSRV and updated lock resolve them with `quick-xml 0.41.0`
 and `time 0.3.53`.
 
-The audit still reports 17 allowed warnings inherited through the current Tauri Linux webview stack:
+The audit still reports 14 allowed warnings inherited through the current Tauri Linux webview stack:
 
 - unmaintained GTK3/ATK/GDK bindings and `proc-macro-error`;
 - unmaintained `unic-*` crates through Tauri's `urlpattern`;
 - the `glib 0.18` `VariantStrIter` soundness advisory.
 
 These dependencies are selected transitively by current Tauri 2/Wry on Linux rather than by LicenseSeat core code. They must remain visible in release notes and be re-audited whenever Tauri updates. A Linux product should additionally assess its actual WebKit/GTK runtime and packaging baseline.
+
+The plugin disables Tauri's unused default features, which reduced the locked
+graph and warning count. The remaining GTK/WebKit runtime is still selected by
+Tauri's base Linux runtime rather than by an optional LicenseSeat feature, so
+removing it here would make the Tauri plugin nonfunctional on that target.
 
 ## SemVer review
 

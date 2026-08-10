@@ -11,6 +11,7 @@ use licenseseat::{Config, Error, EventKind, LicenseSeat, LicenseStatus};
 #[cfg(feature = "offline")]
 use licenseseat::{OfflineTokenPayload, OfflineTokenResponse, OfflineTokenSignature};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tempfile::TempDir;
 use wiremock::matchers::{method, path, path_regex};
@@ -29,6 +30,15 @@ fn test_config(server: &MockServer, storage: &TempDir) -> Config {
         retry_delay: Duration::ZERO,
         ..Default::default()
     }
+}
+
+fn cache_path(storage: &TempDir, prefix: &str, key: &str) -> std::path::PathBuf {
+    let namespace = Sha256::digest(prefix.as_bytes());
+    let namespace = namespace
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    storage.path().join(format!("v2_{namespace}__{key}.json"))
 }
 
 fn license_json(license_key: &str, product_slug: &str) -> Value {
@@ -70,7 +80,7 @@ fn heartbeat_json(license_key: &str, product_slug: &str) -> Value {
 
 async fn mount_activation(server: &MockServer) {
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder())
         .mount(server)
         .await;
@@ -198,7 +208,7 @@ async fn duplicate_online_entitlements_are_rejected_before_state_commit() {
 
     assert!(matches!(
         sdk.validate().await,
-        Err(Error::ResponseMismatch(_))
+        Err(Error::InvalidResponse(_))
     ));
     assert_eq!(sdk.current_license(), Some(original));
     assert!(matches!(sdk.status(), LicenseStatus::Active { .. }));
@@ -282,10 +292,7 @@ async fn offline_asset_cleanup_failure_is_reported_but_online_denial_stays_autho
 
     let sdk = LicenseSeat::try_new(test_config(&server, &storage)).unwrap();
     sdk.activate("ACTIVE-LICENSE").await.unwrap();
-    let snapshot_path = storage.path().join(format!(
-        "{}license_snapshot.json",
-        sdk.config().storage_prefix
-    ));
+    let snapshot_path = cache_path(&storage, &sdk.config().storage_prefix, "license_snapshot");
     assert!(!snapshot_path.exists());
     std::fs::create_dir(&snapshot_path).unwrap();
 
@@ -306,10 +313,7 @@ async fn failed_reset_cleanup_revokes_runtime_trust_before_returning() {
     mount_activation(&server).await;
     let sdk = LicenseSeat::try_new(test_config(&server, &storage)).unwrap();
     sdk.activate("ACTIVE-LICENSE").await.unwrap();
-    let snapshot_path = storage.path().join(format!(
-        "{}license_snapshot.json",
-        sdk.config().storage_prefix
-    ));
+    let snapshot_path = cache_path(&storage, &sdk.config().storage_prefix, "license_snapshot");
     assert!(!snapshot_path.exists());
     std::fs::create_dir(&snapshot_path).unwrap();
 
@@ -436,7 +440,7 @@ async fn substituted_offline_artifacts_emit_terminal_fetch_errors() {
     };
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/offline_token$"))
+        .and(path_regex(r"/offline-token$"))
         .respond_with(ResponseTemplate::new(200).set_body_json(token))
         .mount(&server)
         .await;
@@ -552,7 +556,7 @@ async fn malformed_health_release_and_download_metadata_fail_closed() {
     let sdk = LicenseSeat::try_new(test_config(&server, &storage)).unwrap();
     assert!(matches!(
         sdk.health_check().await,
-        Err(Error::ResponseMismatch(_))
+        Err(Error::InvalidResponse(_))
     ));
     assert!(sdk.last_health_response().is_none());
     assert!(sdk.last_health_error().is_some());
@@ -564,7 +568,7 @@ async fn malformed_health_release_and_download_metadata_fail_closed() {
     assert!(matches!(
         sdk.generate_download_token("1.0.0", "LICENSE", None, Some("macos"))
             .await,
-        Err(Error::ResponseMismatch(_))
+        Err(Error::InvalidResponse(_))
     ));
 }
 
@@ -710,9 +714,7 @@ async fn delayed_deactivation_cannot_delete_a_replacement_from_another_sdk_insta
     let storage = tempfile::tempdir().unwrap();
     mount_activation(&server).await;
     Mock::given(method("POST"))
-        .and(path(
-            "/products/test-product/licenses/FIRST-LICENSE/deactivate",
-        ))
+        .and(path("/products/test-product/licenses/deactivate"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(200))

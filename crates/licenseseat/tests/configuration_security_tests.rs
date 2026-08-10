@@ -1,6 +1,16 @@
 //! Fail-fast configuration and durable-storage security checks.
 
 use licenseseat::{Config, Error, LicenseSeat};
+use sha2::{Digest, Sha256};
+
+fn cache_path(directory: &std::path::Path, prefix: &str, key: &str) -> std::path::PathBuf {
+    let namespace = Sha256::digest(prefix.as_bytes());
+    let namespace = namespace
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    directory.join(format!("v2_{namespace}__{key}.json"))
+}
 
 fn config(storage: &tempfile::TempDir) -> Config {
     Config {
@@ -268,7 +278,7 @@ fn corrupt_product_state_blocks_legacy_license_resurrection() {
     let current_prefix = first.config().storage_prefix.clone();
     drop(first);
 
-    let current_path = state_path.join(format!("{current_prefix}license.json"));
+    let current_path = cache_path(&state_path, &current_prefix, "license");
     std::fs::write(&current_path, b"not-json").unwrap();
     let legacy_path = state_path.join("licenseseat_license.json");
     std::fs::write(

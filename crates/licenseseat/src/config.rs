@@ -1,7 +1,6 @@
 //! SDK configuration types.
 
 use crate::error::{Error, Result};
-use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -435,50 +434,6 @@ fn safe_key_id(value: &str) -> bool {
         && value.bytes().enumerate().all(|(index, byte)| {
             byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'-' | b'_' | b'.' | b':'))
         })
-}
-
-impl fmt::Debug for Config {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Config")
-            .field("api_base_url", &self.api_base_url)
-            .field("api_key", &"[REDACTED]")
-            .field("product_slug", &self.product_slug)
-            .field("storage_prefix", &self.storage_prefix)
-            .field("storage_path", &self.storage_path)
-            .field(
-                "device_identifier_configured",
-                &self.device_identifier.is_some(),
-            )
-            .field(
-                "signing_public_key_configured",
-                &self.signing_public_key.is_some(),
-            )
-            .field("signing_key_id", &self.signing_key_id)
-            .field("auto_validate_interval", &self.auto_validate_interval)
-            .field("heartbeat_interval", &self.heartbeat_interval)
-            .field("network_recheck_interval", &self.network_recheck_interval)
-            .field("request_timeout", &self.request_timeout)
-            .field("verify_ssl", &self.verify_ssl)
-            .field("max_retries", &self.max_retries)
-            .field("retry_delay", &self.retry_delay)
-            .field("offline_fallback_mode", &self.offline_fallback_mode)
-            .field(
-                "offline_token_refresh_interval",
-                &self.offline_token_refresh_interval,
-            )
-            .field(
-                "enable_legacy_offline_tokens",
-                &self.enable_legacy_offline_tokens,
-            )
-            .field("max_offline_days", &self.max_offline_days)
-            .field("max_clock_skew", &self.max_clock_skew)
-            .field("telemetry_enabled", &self.telemetry_enabled)
-            .field("debug", &self.debug)
-            .field("app_version", &self.app_version)
-            .field("app_build", &self.app_build)
-            .finish()
-    }
 }
 
 pub(crate) fn is_loopback_host(host: &str) -> bool {

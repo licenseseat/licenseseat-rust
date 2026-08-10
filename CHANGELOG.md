@@ -35,6 +35,8 @@ and complete local release gate.
 - Serialized JavaScript state subscriptions with error recovery and
   unsubscribe/drain semantics.
 - Generated Ruby-core compatibility fixtures and adversarial integration tests.
+- Opaque SHA-256 cache namespaces, one-way legacy-cache migration, strict JSON
+  duplicate-key rejection, and explicit offline-artifact complexity limits.
 
 ### Changed
 
@@ -42,6 +44,9 @@ and complete local release gate.
   `quick-xml >=0.41` and `time >=0.3.47`; the standalone core remains Rust 1.85.
 - The audited workspace lockfile is committed, all CI Cargo commands use
   `--locked`, and a scheduled RustSec audit prevents silent dependency drift.
+- The Tauri dependency disables unused default features. This reduces the
+  transitive desktop dependency graph while retaining the base runtime needed
+  by the plugin.
 - Legacy tenant-specific offline examples were consolidated into one
   environment-driven signed-restoration example with no embedded credentials.
 - Historical fieldless-enum discriminants remain stable; regression tests
@@ -100,6 +105,12 @@ and complete local release gate.
   deleting the wrong local grant.
 - Prevented cached fetched keys, corrupt current cache files, symlinked paths,
   and legacy fallback files from becoming unintended trust roots.
+- Prevented product slugs from appearing in cache filenames or lock names,
+  rejected Windows reparse-point cache handles, and made legacy adoption
+  transactional before legacy files are removed.
+- Rejected duplicate JSON object keys and bounded offline envelope fields,
+  nested metadata, entitlement counts, ciphertext, lifetimes, and PEM lines
+  before expensive parsing or cryptographic work.
 - Made corrupt/unreadable startup license state an actionable initialization
   error instead of silently treating it as a missing activation.
 - Fixed validation authentication classification to use HTTP 401/403 rather

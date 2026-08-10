@@ -34,8 +34,11 @@ const CLEAR_SURVIVING_KEYS: &[&str] = &[INSTALLATION_IDENTIFIER_KEY, LAST_SEEN_T
 /// Cache for persisting license data.
 #[derive(Debug)]
 pub struct LicenseCache {
-    namespace: String,
-    legacy_prefix: Option<String>,
+    /// Opaque v2 namespace used for every newly-created cache file.
+    prefix: String,
+    /// Pre-hardening plaintext prefix used only for one-way migration and
+    /// cleanup. New writes never use this value as a filename component.
+    legacy_prefix: String,
     cache_dir: Option<PathBuf>,
     legacy_cache_dir: Option<PathBuf>,
     io_lock: Mutex<()>,
@@ -52,6 +55,9 @@ struct CacheIoGuard<'a> {
 impl LicenseCache {
     /// Create a new cache with the given prefix.
     pub fn new(prefix: impl Into<String>, cache_dir: Option<PathBuf>) -> Self {
+        let legacy_prefix = safe_prefix(&prefix.into());
+        let namespace = Sha256::digest(legacy_prefix.as_bytes());
+        let prefix = format!("v2_{}__", hex_bytes(&namespace));
         let (cache_dir, legacy_cache_dir) = match cache_dir {
             Some(cache_dir) => (Some(cache_dir), None),
             None => {
@@ -65,13 +71,15 @@ impl LicenseCache {
             }
         };
         Self {
-            prefix: safe_prefix(&prefix.into()),
+            prefix,
+            legacy_prefix,
             cache_dir,
             legacy_cache_dir,
             io_lock: Mutex::new(()),
         }
     }
 
+    /// Get the path for a cache key.
     fn path(&self, key: &str) -> Option<PathBuf> {
         self.path_in(self.cache_dir.as_deref(), key)
     }
@@ -89,15 +97,22 @@ impl LicenseCache {
         directory.map(|directory| directory.join(format!("{}{}.json", self.prefix, key)))
     }
 
+    fn legacy_path_in(&self, directory: Option<&Path>, key: &str) -> Option<PathBuf> {
+        if !is_safe_cache_key(key) {
+            return None;
+        }
+        directory.map(|directory| directory.join(format!("{}{}.json", self.legacy_prefix, key)))
+    }
+
     /// Ensure the cache directory exists.
     fn ensure_dir(&self) -> Result<()> {
         if let Some(ref dir) = self.cache_dir {
             std::fs::create_dir_all(dir).map_err(|e| Error::Cache(e.to_string()))?;
             let metadata =
                 std::fs::symlink_metadata(dir).map_err(|error| Error::Cache(error.to_string()))?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
                 return Err(Error::Cache(
-                    "cache directory must be a real directory, not a symlink".into(),
+                    "cache directory must be a real directory, not a link or reparse point".into(),
                 ));
             }
             restrict_directory_permissions(dir)?;
@@ -106,37 +121,6 @@ impl LicenseCache {
                 "no durable application-data directory is available".into(),
             ));
         }
-        let Some(prefix) = &self.legacy_prefix else {
-            return Vec::new();
-        };
-        let filename = format!("{prefix}{key}.json");
-        [self.cache_dir.as_ref(), self.legacy_cache_dir.as_ref()]
-            .into_iter()
-            .flatten()
-            .map(|directory| directory.join(&filename))
-            .collect()
-    }
-
-    fn ensure_dir(&self) -> Result<()> {
-        let Some(directory) = &self.cache_dir else {
-            return Ok(());
-        };
-        let existed = match std::fs::symlink_metadata(directory) {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(cache_io_error(error)),
-        };
-        std::fs::create_dir_all(directory).map_err(cache_io_error)?;
-        let metadata = std::fs::symlink_metadata(directory).map_err(cache_io_error)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(Error::Cache(
-                "cache directory is not a real directory".into(),
-            ));
-        }
-        if self.manage_directory_permissions || !existed {
-            set_directory_permissions(directory)?;
-        }
-        validate_directory_security(directory)?;
         Ok(())
     }
 
@@ -186,7 +170,7 @@ impl LicenseCache {
         } else if self.cache_dir.is_some() {
             return Err(Error::Cache("invalid cache key".into()));
         }
-        atomic_write(&path, &json)
+        Ok(())
     }
 
     /// Get a value from the cache.
@@ -222,15 +206,7 @@ impl LicenseCache {
             }
         }
 
-        let legacy_directory = self.legacy_cache_dir.as_deref()?;
-        if !existing_real_directory(legacy_directory).ok()? {
-            return None;
-        }
-        let value = self
-            .path_in(Some(legacy_directory), key)
-            .and_then(|path| read_cache_value(&path))?;
-        let _ = self.set_unlocked(key, &value);
-        Some(value)
+        self.migrate_legacy_value_unlocked(key)
     }
 
     fn get_unlocked_strict<T: serde::de::DeserializeOwned + serde::Serialize>(
@@ -250,24 +226,64 @@ impl LicenseCache {
             }
         }
 
-        let Some(legacy_directory) = self.legacy_cache_dir.as_deref() else {
-            return Ok(None);
-        };
-        if !existing_real_directory(legacy_directory)? {
-            return Ok(None);
-        }
-        let path = self
-            .path_in(Some(legacy_directory), key)
-            .ok_or_else(|| Error::Cache("invalid cache key".into()))?;
-        match std::fs::symlink_metadata(&path) {
-            Ok(_) => {
-                let value = read_cache_value_strict(&path)?;
-                self.set_unlocked(key, &value)?;
-                Ok(Some(value))
+        self.migrate_legacy_value_unlocked_strict(key)
+    }
+
+    fn migrate_legacy_value_unlocked<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        key: &str,
+    ) -> Option<T> {
+        for directory in [&self.cache_dir, &self.legacy_cache_dir]
+            .into_iter()
+            .flatten()
+        {
+            if !existing_real_directory(directory).ok()? {
+                continue;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(Error::Cache(error.to_string())),
+            let path = self.legacy_path_in(Some(directory), key)?;
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    let value = read_cache_value(&path)?;
+                    if self.set_unlocked(key, &value).is_ok() {
+                        let _ = remove_cache_file(&path);
+                        let _ = sync_parent_directory(directory);
+                    }
+                    return Some(value);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
         }
+        None
+    }
+
+    fn migrate_legacy_value_unlocked_strict<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>> {
+        for directory in [&self.cache_dir, &self.legacy_cache_dir]
+            .into_iter()
+            .flatten()
+        {
+            if !existing_real_directory(directory)? {
+                continue;
+            }
+            let path = self
+                .legacy_path_in(Some(directory), key)
+                .ok_or_else(|| Error::Cache("invalid cache key".into()))?;
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    let value = read_cache_value_strict(&path)?;
+                    self.set_unlocked(key, &value)?;
+                    remove_cache_file(&path)?;
+                    sync_parent_directory(directory)?;
+                    return Ok(Some(value));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::Cache(error.to_string())),
+            }
+        }
+        Ok(None)
     }
 
     fn remove_key_unlocked(&self, key: &str) -> Result<()> {
@@ -284,17 +300,22 @@ impl LicenseCache {
         if !existing_real_directory(directory)? {
             return Ok(());
         }
-        let path = self
-            .path_in(Some(directory), key)
-            .ok_or_else(|| Error::Cache("invalid cache key".into()))?;
-        let target_file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| Error::Cache("invalid cache file name".into()))?;
-        let removed_file = remove_cache_file(&path)?;
-        let removed_temporary =
-            remove_atomic_temporary_files_for_target(directory, target_file_name)?;
-        if removed_file || removed_temporary {
+        let mut removed_any = false;
+        for path in [
+            self.path_in(Some(directory), key),
+            self.legacy_path_in(Some(directory), key),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let target_file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| Error::Cache("invalid cache file name".into()))?;
+            removed_any |= remove_cache_file(&path)?;
+            removed_any |= remove_atomic_temporary_files_for_target(directory, target_file_name)?;
+        }
+        if removed_any {
             sync_parent_directory(directory)?;
         }
         Ok(())
@@ -319,12 +340,19 @@ impl LicenseCache {
             .copied()
             .filter(|key| *key != "license" && !CLEAR_SURVIVING_KEYS.contains(key))
         {
-            if let Some(path) = self.path_in(Some(directory), key) {
+            for path in [
+                self.path_in(Some(directory), key),
+                self.legacy_path_in(Some(directory), key),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 removed_any |= remove_cache_file(&path)?;
             }
         }
 
         let signing_key_prefix = format!("{}signing_key_", self.prefix);
+        let legacy_signing_key_prefix = format!("{}signing_key_", self.legacy_prefix);
         let entries =
             std::fs::read_dir(directory).map_err(|error| Error::Cache(error.to_string()))?;
         for entry in entries {
@@ -333,18 +361,31 @@ impl LicenseCache {
             let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            let is_our_signing_key = is_signing_key_file_name(file_name, &signing_key_prefix);
-            let is_our_storage_probe = is_storage_probe_file_name(file_name, &self.prefix);
+            let is_our_signing_key = is_signing_key_file_name(file_name, &signing_key_prefix)
+                || is_signing_key_file_name(file_name, &legacy_signing_key_prefix);
+            let is_our_storage_probe = is_storage_probe_file_name(file_name, &self.prefix)
+                || is_storage_probe_file_name(file_name, &self.legacy_prefix);
             let is_our_atomic_temporary =
                 atomic_temporary_target_name(file_name).is_some_and(|target| {
                     is_owned_cache_target_name(target, &self.prefix, &signing_key_prefix)
+                        || is_owned_cache_target_name(
+                            target,
+                            &self.legacy_prefix,
+                            &legacy_signing_key_prefix,
+                        )
                 });
             if is_our_signing_key || is_our_storage_probe || is_our_atomic_temporary {
                 removed_any |= remove_cache_file(&path)?;
             }
         }
 
-        if let Some(path) = self.path_in(Some(directory), "license") {
+        for path in [
+            self.path_in(Some(directory), "license"),
+            self.legacy_path_in(Some(directory), "license"),
+        ]
+        .into_iter()
+        .flatten()
+        {
             removed_any |= remove_cache_file(&path)?;
         }
 
@@ -414,6 +455,11 @@ impl LicenseCache {
         Ok(())
     }
 
+    // ========================================================================
+    // License-specific methods
+    // ========================================================================
+
+    /// Store the current license.
     pub fn set_license(&self, license: &License) -> Result<()> {
         self.set("license", license)
     }
@@ -605,16 +651,19 @@ impl LicenseCache {
         self.set("offline_token", token)
     }
 
+    /// Get the cached offline token.
     #[cfg(feature = "offline")]
     pub fn get_offline_token(&self) -> Option<crate::models::OfflineTokenResponse> {
         self.get("offline_token")
     }
 
+    /// Store the machine file.
     #[cfg(feature = "offline")]
     pub fn set_machine_file(&self, machine_file: &crate::models::MachineFile) -> Result<()> {
         self.set("machine_file", machine_file)
     }
 
+    /// Get the cached machine file.
     #[cfg(feature = "offline")]
     pub fn get_machine_file(&self) -> Option<crate::models::MachineFile> {
         self.get("machine_file")
@@ -696,6 +745,7 @@ impl LicenseCache {
         Ok(())
     }
 
+    /// Get the last seen timestamp.
     pub fn get_last_seen_timestamp(&self) -> Option<i64> {
         self.get(LAST_SEEN_TIMESTAMP_KEY)
     }
@@ -833,9 +883,11 @@ fn is_random_suffix(value: &str, length: usize) -> bool {
 
 fn existing_real_directory(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(
-            Error::Cache("cache directory must remain a real directory, not a symlink".into()),
-        ),
+        Ok(metadata) if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_dir() => {
+            Err(Error::Cache(
+                "cache directory must remain a real directory, not a link or reparse point".into(),
+            ))
+        }
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(Error::Cache(error.to_string())),
@@ -844,7 +896,7 @@ fn existing_real_directory(path: &Path) -> Result<bool> {
 
 fn read_cache_value<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     let metadata = std::fs::symlink_metadata(path).ok()?;
-    if metadata.file_type().is_symlink()
+    if metadata_is_link_or_reparse_point(&metadata)
         || !metadata.is_file()
         || metadata.len() > MAX_CACHE_FILE_BYTES
     {
@@ -856,11 +908,20 @@ fn read_cache_value<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(path).ok()?;
     let opened_metadata = file.metadata().ok()?;
-    if !opened_metadata.is_file() || opened_metadata.len() > MAX_CACHE_FILE_BYTES {
+    if metadata_is_link_or_reparse_point(&opened_metadata)
+        || !opened_metadata.is_file()
+        || opened_metadata.len() > MAX_CACHE_FILE_BYTES
+    {
         return None;
     }
 
@@ -873,15 +934,15 @@ fn read_cache_value<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     if json.len() as u64 > MAX_CACHE_FILE_BYTES {
         return None;
     }
-    serde_json::from_slice(&json).ok()
+    crate::strict_json::from_slice(&json).ok()
 }
 
 fn read_cache_value_strict<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| Error::Cache(format!("failed to inspect cached state: {error}")))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_file() {
         return Err(Error::Cache(
-            "cache path must remain a real file, not a symlink".into(),
+            "cache path must remain a real file, not a link or reparse point".into(),
         ));
     }
     if metadata.len() > MAX_CACHE_FILE_BYTES {
@@ -895,7 +956,13 @@ fn read_cache_value_strict<T: serde::de::DeserializeOwned>(path: &Path) -> Resul
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options
         .open(path)
@@ -903,7 +970,10 @@ fn read_cache_value_strict<T: serde::de::DeserializeOwned>(path: &Path) -> Resul
     let opened_metadata = file
         .metadata()
         .map_err(|error| Error::Cache(format!("failed to inspect cached state: {error}")))?;
-    if !opened_metadata.is_file() || opened_metadata.len() > MAX_CACHE_FILE_BYTES {
+    if metadata_is_link_or_reparse_point(&opened_metadata)
+        || !opened_metadata.is_file()
+        || opened_metadata.len() > MAX_CACHE_FILE_BYTES
+    {
         return Err(Error::Cache(
             "cached state is not a bounded real file".into(),
         ));
@@ -918,16 +988,16 @@ fn read_cache_value_strict<T: serde::de::DeserializeOwned>(path: &Path) -> Resul
             "cached state exceeds the {MAX_CACHE_FILE_BYTES}-byte safety limit"
         )));
     }
-    serde_json::from_slice(&json)
+    crate::strict_json::from_slice(&json)
         .map_err(|error| Error::Cache(format!("cached state is corrupt: {error}")))
 }
 
 #[cfg(any(unix, windows))]
 fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+        Ok(metadata) if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_file() => {
             return Err(Error::Cache(
-                "cache lock path must be a real file, not a symlink".into(),
+                "cache lock path must be a real file, not a link or reparse point".into(),
             ));
         }
         Ok(_) => {}
@@ -940,7 +1010,15 @@ fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options
         .open(path)
@@ -948,11 +1026,28 @@ fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
     let metadata = file
         .metadata()
         .map_err(|error| Error::Cache(error.to_string()))?;
-    if !metadata.is_file() {
-        return Err(Error::Cache("cache lock path is not a file".into()));
+    if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+        return Err(Error::Cache("cache lock path is not a real file".into()));
     }
     restrict_file_permissions(path)?;
     Ok(file)
+}
+
+fn metadata_is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    #[cfg(not(windows))]
+    false
 }
 
 fn safe_prefix(prefix: &str) -> String {
@@ -1135,13 +1230,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.starts_with("v2_")));
+        assert!(entries.iter().all(|entry| !entry.contains("escape")));
         assert!(
             entries
                 .iter()
-                .all(|entry| entry.starts_with("licenseseat_"))
+                .any(|entry| entry.ends_with("__license.json"))
         );
-        assert!(entries.iter().any(|entry| entry.ends_with("_license.json")));
-        assert!(entries.iter().any(|entry| entry.ends_with("_state.lock")));
+        assert!(entries.iter().any(|entry| entry.ends_with("__state.lock")));
 
         #[cfg(feature = "offline")]
         {
@@ -1167,21 +1263,53 @@ mod tests {
     }
 
     #[test]
+    fn safe_caller_prefixes_are_not_disclosed_in_v2_filenames() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let cache = LicenseCache::new(
+            "customer-product-confidential_",
+            Some(directory.path().into()),
+        );
+        cache
+            .set_license(&sample_license("KEY", "fingerprint", "activation"))
+            .expect("cache write");
+
+        let entries = std::fs::read_dir(directory.path())
+            .expect("cache directory")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(entries.iter().all(|entry| entry.starts_with("v2_")));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.contains("customer") && !entry.contains("confidential"))
+        );
+    }
+
+    #[test]
+    fn duplicate_json_keys_are_never_accepted_from_cache() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let cache = LicenseCache::new("strict_json_", Some(directory.path().into()));
+        cache.initialize().expect("cache initialization");
+        let path = cache.path("ambiguous").expect("cache path");
+        std::fs::write(&path, br#"{"decision":"deny","decision":"grant"}"#)
+            .expect("ambiguous cache fixture");
+
+        assert_eq!(cache.get::<serde_json::Value>("ambiguous"), None);
+        assert!(cache.get_strict::<serde_json::Value>("ambiguous").is_err());
+    }
+
+    #[test]
     fn corrupt_current_state_never_resurrects_legacy_state() {
         let current = tempfile::tempdir().expect("current directory");
         let legacy = tempfile::tempdir().expect("legacy directory");
         let prefix = "migration_test_";
-        let legacy_cache = LicenseCache::new(prefix, Some(legacy.path().into()));
         let license = sample_license("LEGACY", "fingerprint", "activation");
-        legacy_cache.set_license(&license).expect("legacy write");
+        let legacy_path = legacy.path().join(format!("{prefix}license.json"));
+        std::fs::write(&legacy_path, serde_json::to_vec(&license).unwrap()).expect("legacy write");
 
-        let cache = LicenseCache {
-            prefix: prefix.into(),
-            cache_dir: Some(current.path().into()),
-            legacy_cache_dir: Some(legacy.path().into()),
-            io_lock: Mutex::new(()),
-        };
-        let current_path = current.path().join(format!("{prefix}license.json"));
+        let mut cache = LicenseCache::new(prefix, Some(current.path().into()));
+        cache.legacy_cache_dir = Some(legacy.path().into());
+        let current_path = cache.path("license").expect("current path");
         std::fs::write(&current_path, b"not-json").expect("corrupt current file");
         assert!(cache.get_license().is_none());
 
@@ -1191,6 +1319,7 @@ mod tests {
             current_path.exists(),
             "legacy value should migrate once absent"
         );
+        assert!(!legacy_path.exists(), "migration must be one-way");
     }
 
     #[test]
@@ -1204,7 +1333,7 @@ mod tests {
             None
         );
 
-        let path = directory.path().join("current_license.json");
+        let path = cache.path("license").expect("current license path");
         std::fs::write(&path, b"not-json").expect("corrupt current state");
         assert!(cache.get_license_for_initialization().is_err());
         assert!(cache.get_license().is_none());
@@ -1219,21 +1348,16 @@ mod tests {
         let current = tempfile::tempdir().expect("current directory");
         let legacy = tempfile::tempdir().expect("legacy directory");
         let prefix = "denial_order_test_";
-        let legacy_cache = LicenseCache::new(prefix, Some(legacy.path().into()));
-        legacy_cache
-            .set_license(&sample_trusted_license(
-                "LEGACY",
-                "legacy-fingerprint",
-                "legacy-activation",
-            ))
-            .expect("legacy state");
+        let legacy_license =
+            sample_trusted_license("LEGACY", "legacy-fingerprint", "legacy-activation");
+        std::fs::write(
+            legacy.path().join(format!("{prefix}license.json")),
+            serde_json::to_vec(&legacy_license).unwrap(),
+        )
+        .expect("legacy state");
 
-        let cache = LicenseCache {
-            prefix: prefix.into(),
-            cache_dir: Some(current.path().into()),
-            legacy_cache_dir: Some(legacy.path().into()),
-            io_lock: Mutex::new(()),
-        };
+        let mut cache = LicenseCache::new(prefix, Some(current.path().into()));
+        cache.legacy_cache_dir = Some(legacy.path().into());
         let active = sample_trusted_license("CURRENT", "fingerprint", "activation");
         let identity = active.identity();
         cache.set_license(&active).expect("current state");
@@ -1457,17 +1581,14 @@ mod tests {
         let current = tempfile::tempdir().expect("current directory");
         let legacy = tempfile::tempdir().expect("legacy directory");
         let prefix = "watermark_legacy_";
-        let poisoned_legacy = LicenseCache::new(prefix, Some(legacy.path().into()));
-        poisoned_legacy
-            .set_last_seen_timestamp(4_102_444_800)
-            .expect("poisoned legacy watermark");
+        std::fs::write(
+            legacy.path().join(format!("{prefix}last_seen_ts.json")),
+            b"4102444800",
+        )
+        .expect("poisoned legacy watermark");
 
-        let cache = LicenseCache {
-            prefix: prefix.into(),
-            cache_dir: Some(current.path().into()),
-            legacy_cache_dir: Some(legacy.path().into()),
-            io_lock: Mutex::new(()),
-        };
+        let mut cache = LicenseCache::new(prefix, Some(current.path().into()));
+        cache.legacy_cache_dir = Some(legacy.path().into());
         cache
             .anchor_last_seen_timestamp(1_700_000_000)
             .expect("authoritative online re-anchor");
@@ -1482,7 +1603,7 @@ mod tests {
 
         // Even if the durable copy is later lost, the legacy read fallback can
         // no longer resurrect the poisoned pre-anchor value.
-        std::fs::remove_file(current.path().join(format!("{prefix}last_seen_ts.json")))
+        std::fs::remove_file(cache.path(LAST_SEEN_TIMESTAMP_KEY).unwrap())
             .expect("simulate loss of the durable copy");
         assert_eq!(cache.get_last_seen_timestamp(), None);
     }
@@ -1578,397 +1699,5 @@ mod tests {
         assert_ne!(first, LicenseCache::product_scoped_prefix("hustl"));
         assert!(first.starts_with("licenseseat_"));
         assert!(first.ends_with('_'));
-    }
-}
-
-fn digest_hex(value: &[u8]) -> String {
-    Sha256::digest(value)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn is_safe_legacy_component(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
-
-fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > MAX_CACHE_BYTES
-    {
-        return None;
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path).ok()?;
-    let opened_metadata = file.metadata().ok()?;
-    if !opened_metadata.is_file() || opened_metadata.len() > MAX_CACHE_BYTES {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
-    file.take(MAX_CACHE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_CACHE_BYTES {
-        return None;
-    }
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let directory = path
-        .parent()
-        .ok_or_else(|| Error::Cache("cache path has no parent directory".into()))?;
-    for _ in 0..16 {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = directory.join(format!(
-            ".licenseseat-{}-{sequence}.tmp",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = match options.open(&temporary) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(cache_io_error(error)),
-        };
-        let result = (|| {
-            file.write_all(bytes).map_err(cache_io_error)?;
-            file.sync_all().map_err(cache_io_error)?;
-            drop(file);
-            replace_file(&temporary, path)?;
-            set_file_permissions(path)?;
-            sync_replaced_entry(path, directory)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        return result;
-    }
-    Err(Error::Cache(
-        "could not allocate an atomic cache file".into(),
-    ))
-}
-
-#[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> Result<()> {
-    std::fs::rename(source, destination).map_err(cache_io_error)
-}
-
-#[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-
-    // SAFETY: both pointers reference owned, NUL-terminated UTF-16 buffers for
-    // the duration of the call. MoveFileExW does not retain either pointer.
-    let replaced = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if replaced == 0 {
-        return Err(cache_io_error(std::io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-fn cache_io_error(error: std::io::Error) -> Error {
-    Error::Cache(format!("cache I/O failure ({:?})", error.kind()))
-}
-
-#[cfg(unix)]
-fn sync_replaced_entry(path: &Path, directory: &Path) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file_options = OpenOptions::new();
-    file_options
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    file_options
-        .open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(cache_io_error)?;
-
-    let mut directory_options = OpenOptions::new();
-    directory_options
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY);
-    directory_options
-        .open(directory)
-        .and_then(|directory| directory.sync_all())
-        .map_err(cache_io_error)
-}
-
-#[cfg(not(unix))]
-fn sync_replaced_entry(_path: &Path, _directory: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_directory_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(cache_io_error)
-}
-
-#[cfg(unix)]
-fn validate_directory_security(path: &Path) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let metadata = std::fs::symlink_metadata(path).map_err(cache_io_error)?;
-    // SAFETY: geteuid has no pointer arguments or caller-side preconditions.
-    let effective_user_id = unsafe { libc::geteuid() };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.uid() != effective_user_id
-        || metadata.permissions().mode() & 0o022 != 0
-    {
-        return Err(Error::Cache(
-            "cache directory permissions are unsafe".into(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_directory_security(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_directory_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_file_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(cache_io_error)
-}
-
-#[cfg(not(unix))]
-fn set_file_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    struct TestDirectory(PathBuf);
-
-    impl TestDirectory {
-        fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "licenseseat-{label}-{}-{}",
-                std::process::id(),
-                TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn caller_controlled_prefix_and_key_cannot_escape_storage_directory() {
-        let directory = TestDirectory::new("path-confinement");
-        let cache = LicenseCache::new("../../outside/\\..", Some(directory.0.clone()));
-
-        cache
-            .set("../../attacker-key", &json!({"safe": true}))
-            .unwrap();
-        let path = cache.path("../../attacker-key").unwrap();
-
-        assert_eq!(path.parent(), Some(directory.0.as_path()));
-        assert!(
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("v2-")
-        );
-        assert_eq!(
-            cache.get::<serde_json::Value>("../../attacker-key"),
-            Some(json!({"safe": true}))
-        );
-    }
-
-    #[test]
-    fn oversized_cache_values_are_rejected() {
-        let directory = TestDirectory::new("oversized");
-        let cache = LicenseCache::new("test", Some(directory.0.clone()));
-        let oversized = "x".repeat(MAX_CACHE_BYTES as usize);
-
-        assert!(matches!(
-            cache.set("value", &oversized),
-            Err(Error::Cache(_))
-        ));
-        assert!(!cache.path("value").unwrap().exists());
-    }
-
-    #[test]
-    fn atomic_overwrite_returns_only_the_latest_complete_value() {
-        let directory = TestDirectory::new("atomic-overwrite");
-        let cache = LicenseCache::new("test", Some(directory.0.clone()));
-
-        cache.set("value", &json!({"version": 1})).unwrap();
-        cache.set("value", &json!({"version": 2})).unwrap();
-
-        assert_eq!(
-            cache.get::<serde_json::Value>("value"),
-            Some(json!({"version": 2}))
-        );
-        assert!(
-            std::fs::read_dir(&directory.0)
-                .unwrap()
-                .flatten()
-                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
-        );
-    }
-
-    #[test]
-    fn clear_removes_only_the_selected_namespace() {
-        let directory = TestDirectory::new("namespace-clear");
-        let first = LicenseCache::new("first", Some(directory.0.clone()));
-        let second = LicenseCache::new("second", Some(directory.0.clone()));
-        first.set("value", &json!(1)).unwrap();
-        second.set("value", &json!(2)).unwrap();
-
-        first.clear();
-
-        assert_eq!(first.get::<serde_json::Value>("value"), None);
-        assert_eq!(second.get::<serde_json::Value>("value"), Some(json!(2)));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cache_reads_do_not_follow_symbolic_links() {
-        use std::os::unix::fs::symlink;
-
-        let directory = TestDirectory::new("symlink-read");
-        let cache = LicenseCache::new("test", Some(directory.0.clone()));
-        cache.ensure_dir().unwrap();
-        let outside = directory.0.join("outside.json");
-        std::fs::write(&outside, br#"{"forged":true}"#).unwrap();
-        symlink(&outside, cache.path("value").unwrap()).unwrap();
-
-        assert_eq!(cache.get::<serde_json::Value>("value"), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symbolic_link_storage_directory_is_rejected() {
-        use std::os::unix::fs::symlink;
-
-        let root = TestDirectory::new("symlink-directory");
-        let target = root.0.join("target");
-        let link = root.0.join("link");
-        std::fs::create_dir(&target).unwrap();
-        symlink(&target, &link).unwrap();
-        let cache = LicenseCache::new("test", Some(link));
-
-        assert!(matches!(
-            cache.set("value", &json!(1)),
-            Err(Error::Cache(_))
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unsafe_custom_directory_permissions_are_rejected() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = TestDirectory::new("unsafe-directory-permissions");
-        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o770)).unwrap();
-        let cache = LicenseCache::new("test", Some(directory.0.clone()));
-
-        assert!(matches!(
-            cache.set("value", &json!(1)),
-            Err(Error::Cache(_))
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn existing_custom_directory_permissions_are_not_rewritten() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = TestDirectory::new("preserve-directory-permissions");
-        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o750)).unwrap();
-        let cache = LicenseCache::new("test", Some(directory.0.clone()));
-
-        cache.set("value", &json!(1)).unwrap();
-
-        assert_eq!(
-            std::fs::metadata(&directory.0)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o750
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cache_permissions_are_private() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = TestDirectory::new("permissions");
-        let directory = root.0.join("new-cache-directory");
-        let cache = LicenseCache::new("test", Some(directory.clone()));
-        cache.set("value", &json!(1)).unwrap();
-
-        let directory_mode = std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
-        let file_mode = std::fs::metadata(cache.path("value").unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(directory_mode, 0o700);
-        assert_eq!(file_mode, 0o600);
     }
 }

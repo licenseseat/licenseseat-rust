@@ -861,17 +861,32 @@ fn cache_dir_for_config(config: &licenseseat::Config) -> Option<PathBuf> {
 }
 
 fn cache_path_for_key(config: &licenseseat::Config, key: &str) -> Option<String> {
-    let namespace = digest_hex(config.storage_prefix.as_bytes());
-    let key_digest = digest_hex(key.as_bytes());
+    let logical_prefix = normalized_cache_prefix(&config.storage_prefix);
+    let namespace = digest_hex(logical_prefix.as_bytes());
     cache_dir_for_config(config)
-        .map(|dir| {
-            dir.join(format!(
-                "v2-{}-{}.json",
-                &namespace[..32],
-                &key_digest[..32]
-            ))
-        })
+        .map(|dir| dir.join(format!("v2_{namespace}__{key}.json")))
         .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn normalized_cache_prefix(prefix: &str) -> String {
+    if !prefix.is_empty()
+        && prefix.len() <= 128
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        prefix.to_string()
+    } else {
+        let digest = digest_hex(prefix.as_bytes());
+        format!("licenseseat_{}_", &digest[..24])
+    }
+}
+
+fn digest_hex(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 // `cargo package --workspace` stages the matching core package in a way that
@@ -1522,7 +1537,7 @@ pub(crate) fn event_payload_to_json(data: Option<EventData>) -> serde_json::Valu
 #[cfg(test)]
 mod tests {
     use super::{
-        MachineFileResponse, OfflineTokenResponse, event_payload_to_json,
+        MachineFileResponse, OfflineTokenResponse, cache_path_for_key, event_payload_to_json,
         map_admin_snapshot_response, map_state_response,
     };
     use chrono::Utc;
@@ -1807,6 +1822,25 @@ mod tests {
     }
 
     #[test]
+    fn admin_cache_paths_match_the_opaque_core_namespace() {
+        let storage_path = unique_storage_path("licenseseat-plugin-admin-path-test");
+        let mut config =
+            Config::new("pk_test_123", "demo-product").with_storage_path(storage_path.clone());
+        config.storage_prefix = "private_customer_namespace_".into();
+
+        let path = cache_path_for_key(&config, "license").expect("cache path should exist");
+        let file_name = Path::new(&path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("cache file name should be UTF-8");
+
+        assert!(file_name.starts_with("v2_"));
+        assert!(file_name.ends_with("__license.json"));
+        assert!(!file_name.contains(&config.storage_prefix));
+        assert_eq!(file_name.len(), 3 + 64 + 2 + "license.json".len());
+    }
+
+    #[test]
     fn test_admin_snapshot_reports_cached_offline_artifacts() {
         let storage_path = unique_storage_path("licenseseat-plugin-admin-populated-test");
         let mut config = Config::new("pk_test_123", "demo-product")
@@ -1923,7 +1957,14 @@ mod tests {
                 .map(|value| value.key_id.as_str()),
             Some("kid_123")
         );
-        assert!(snapshot.cache_paths.license_snapshot_path.is_some());
+        assert!(snapshot.cache_paths.license_snapshot_path.is_none());
+        let license_path = snapshot
+            .cache_paths
+            .license_path
+            .as_deref()
+            .expect("the durable license cache path should be reported");
+        assert!(Path::new(license_path).is_file());
+        assert!(!license_path.contains(&config.storage_prefix));
     }
 
     #[test]
@@ -1982,6 +2023,6 @@ mod tests {
         assert_eq!(snapshot.state.client_status, "pending");
         assert!(snapshot.state.validation.is_none());
         assert!(snapshot.state.entitlements.is_empty());
-        assert!(snapshot.cache_paths.license_snapshot_path.is_some());
+        assert!(snapshot.cache_paths.license_snapshot_path.is_none());
     }
 }

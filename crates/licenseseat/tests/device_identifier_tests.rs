@@ -75,7 +75,7 @@ async fn test_device_id_is_generated() {
     let fingerprint = sdk.fingerprint().to_string();
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response(&fingerprint)))
         .mount(&server)
         .await;
@@ -106,7 +106,7 @@ async fn test_device_id_is_stable() {
     let fingerprint = sdk1.fingerprint().to_string();
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response(&fingerprint)))
         .mount(&server)
         .await;
@@ -287,7 +287,7 @@ async fn test_device_id_format() {
     let fingerprint = sdk.fingerprint().to_string();
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(ResponseTemplate::new(201).set_body_json(activation_response(&fingerprint)))
         .mount(&server)
         .await;
@@ -314,8 +314,12 @@ async fn test_device_id_format() {
 #[tokio::test]
 async fn test_device_id_uniqueness_across_different_machines() {
     let server = MockServer::start().await;
-    let first = LicenseSeat::new(test_config(&server.uri()));
-    let second = LicenseSeat::new(test_config(&server.uri()));
+    let mut first_config = test_config(&server.uri());
+    first_config.device_identifier = None;
+    let mut second_config = test_config(&server.uri());
+    second_config.device_identifier = None;
+    let first = LicenseSeat::new(first_config);
+    let second = LicenseSeat::new(second_config);
     assert_ne!(first.fingerprint(), second.fingerprint());
 
     // Device ID should be a reasonably sized string (not too short, not too long)

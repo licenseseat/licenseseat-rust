@@ -15,12 +15,22 @@ use licenseseat::{
     OfflineTokenResponse,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/ruby_compat.json")).unwrap()
+}
+
+fn cache_path(storage: &tempfile::TempDir, prefix: &str, key: &str) -> std::path::PathBuf {
+    let namespace = Sha256::digest(prefix.as_bytes());
+    let namespace = namespace
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    storage.path().join(format!("v2_{namespace}__{key}.json"))
 }
 
 fn config(server: &MockServer, storage: &tempfile::TempDir, fixture: &Value) -> Config {
@@ -43,7 +53,6 @@ fn machine_file_api_response(fixture: &Value) -> Value {
     serde_json::json!({
         "data": {
             "type": "machine-files",
-            "id": "ruby-fixture-machine-file",
             "attributes": {
                 "certificate": fixture["machine_file"]["certificate"],
                 "algorithm": fixture["machine_file"]["algorithm"],
@@ -229,9 +238,15 @@ async fn ruby_machine_file_rejects_signature_fingerprint_and_product_substitutio
     .into();
     let encoded =
         base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&envelope).unwrap());
+    let wrapped = encoded
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
     tampered.certificate = format!(
         "-----BEGIN MACHINE FILE-----\n{}\n-----END MACHINE FILE-----",
-        encoded
+        wrapped
     );
     let mut events = sdk.subscribe();
     let tampered_result = sdk
@@ -347,7 +362,7 @@ async fn ruby_machine_file_restore_fails_closed_after_clock_rollback() {
         sdk_with_cached_machine_file(&server, &storage, &fixture, "ruby_clock_rollback_").await;
     drop(sdk);
 
-    let last_seen_path = storage.path().join("ruby_clock_rollback_last_seen_ts.json");
+    let last_seen_path = cache_path(&storage, "ruby_clock_rollback_", "last_seen_ts");
     let future_timestamp = Utc::now().timestamp() + 3_600;
     std::fs::write(
         &last_seen_path,
@@ -387,7 +402,7 @@ async fn offline_restore_cache_failure_emits_both_terminal_failure_events() {
     restored_config.api_base_url = "http://127.0.0.1:9".into();
     restored_config.request_timeout = Duration::from_millis(100);
     let restored_sdk = LicenseSeat::try_new(restored_config).unwrap();
-    let last_seen_path = storage.path().join(format!("{prefix}last_seen_ts.json"));
+    let last_seen_path = cache_path(&storage, prefix, "last_seen_ts");
     std::fs::remove_file(&last_seen_path).unwrap();
     std::fs::create_dir(&last_seen_path).unwrap();
     let mut events = restored_sdk.subscribe();
@@ -548,7 +563,7 @@ async fn cached_online_denial_overrides_a_restored_signed_machine_file() {
     let stale_machine_file: MachineFile =
         serde_json::from_value(fixture["machine_file"].clone()).unwrap();
     std::fs::write(
-        storage.path().join("ruby_online_denial_machine_file.json"),
+        cache_path(&storage, "ruby_online_denial_", "machine_file"),
         serde_json::to_vec_pretty(&stale_machine_file).unwrap(),
     )
     .unwrap();
@@ -591,7 +606,7 @@ async fn authoritative_online_validation_reanchors_a_poisoned_clock_watermark() 
     drop(sdk);
 
     // A transiently future-set clock poisoned the ratcheting watermark.
-    let last_seen_path = storage.path().join(format!("{prefix}last_seen_ts.json"));
+    let last_seen_path = cache_path(&storage, prefix, "last_seen_ts");
     let poisoned_timestamp = Utc::now().timestamp() + 3_600;
     std::fs::write(
         &last_seen_path,
@@ -681,7 +696,7 @@ async fn authoritative_heartbeat_reanchors_a_poisoned_clock_watermark() {
         sdk_with_cached_machine_file(&server, &storage, &fixture, prefix).await;
     drop(sdk);
 
-    let last_seen_path = storage.path().join(format!("{prefix}last_seen_ts.json"));
+    let last_seen_path = cache_path(&storage, prefix, "last_seen_ts");
     let poisoned_timestamp = Utc::now().timestamp() + 3_600;
     std::fs::write(
         &last_seen_path,
@@ -729,7 +744,7 @@ async fn restored_machine_file_for_a_foreign_license_fails_identity_bound_verifi
     // Simulate re-importing a signed machine file that belongs to a different
     // license into this installation's cache.
     std::fs::write(
-        storage.path().join(format!("{prefix}machine_file.json")),
+        cache_path(&storage, prefix, "machine_file"),
         serde_json::to_vec_pretty(&fixture["machine_file"]).unwrap(),
     )
     .unwrap();

@@ -9,8 +9,9 @@ use common::{
     activation_responder, activation_responder_with_entitlements, validation_responder,
     validation_responder_with_entitlements,
 };
-use licenseseat::{Config, LicenseSeat};
+use licenseseat::{Config, LicenseSeat, LicenseStatus};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -35,7 +36,6 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
-        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix(),
         device_identifier: Some("device-123".into()),
@@ -47,11 +47,16 @@ fn test_config(base_url: &str) -> Config {
 }
 
 fn cache_path(prefix: &str, key: &str) -> std::path::PathBuf {
+    let namespace = Sha256::digest(prefix.as_bytes());
+    let namespace = namespace
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     dirs::data_local_dir()
         .or_else(dirs::data_dir)
         .expect("application data dir")
         .join("licenseseat")
-        .join(format!("{prefix}{key}.json"))
+        .join(format!("v2_{namespace}__{key}.json"))
 }
 
 fn deactivation_response() -> serde_json::Value {
@@ -71,7 +76,7 @@ async fn test_license_cached_after_activation() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder())
         .mount(&server)
         .await;
@@ -95,7 +100,7 @@ async fn test_license_cleared_after_deactivation() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder())
         .mount(&server)
         .await;
@@ -120,7 +125,7 @@ async fn test_license_cleared_on_reset() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder())
         .mount(&server)
         .await;
@@ -143,13 +148,13 @@ async fn test_validation_result_cached() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(validation_responder())
         .mount(&server)
         .await;
@@ -180,13 +185,13 @@ async fn test_validation_updates_last_validated_time() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(validation_responder())
         .mount(&server)
         .await;
@@ -213,7 +218,7 @@ async fn test_different_prefixes_isolated() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder())
         .mount(&server)
         .await;
@@ -245,7 +250,7 @@ async fn test_same_prefix_shares_cache() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder())
         .mount(&server)
         .await;
@@ -285,7 +290,7 @@ async fn test_license_persists_across_sdk_instances() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder())
         .mount(&server)
         .await;
@@ -334,13 +339,13 @@ async fn test_persisted_validation_requires_revalidation_after_restart() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(validation_responder())
         .mount(&server)
         .await;
@@ -393,12 +398,12 @@ async fn test_persisted_unsigned_validation_requires_runtime_restoration() {
     })];
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder_with_entitlements(entitlements.clone()))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(validation_responder_with_entitlements(entitlements))
         .mount(&server)
         .await;
@@ -430,7 +435,7 @@ async fn test_persisted_unsigned_validation_requires_runtime_restoration() {
 async fn mutating_persisted_json_cannot_change_live_runtime_entitlements() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder_with_entitlements(vec![json!({
             "key": "licensed-feature",
             "expires_at": null,
@@ -481,7 +486,7 @@ async fn test_active_entitlement_listing_filters_expired_items() {
     let expired = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
     let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder_with_entitlements(vec![
             json!({"key": "expired", "expires_at": expired, "metadata": null}),
             json!({"key": "active", "expires_at": future, "metadata": null}),
@@ -588,12 +593,12 @@ async fn short_fingerprint_cached_activation_can_validate_and_deactivate() {
     // configuration input (see configuration_security_tests.rs).
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(validation_responder())
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/deactivate"))
+        .and(path_regex(r"/products/.*/licenses/deactivate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(deactivation_response()))
         .mount(&server)
         .await;
@@ -665,13 +670,13 @@ async fn test_concurrent_status_reads() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(validation_responder())
         .mount(&server)
         .await;
@@ -874,6 +879,13 @@ async fn test_entitlements_preserved_in_cache() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "object": "validation_result",
             "valid": true,
+            "activation": {
+                "object": "activation",
+                "id": "act-uuid",
+                "device_id": "device-123",
+                "license_key": "KEY",
+                "activated_at": "2025-01-01T00:00:00Z"
+            },
             "license": {
                 "object": "license",
                 "key": "KEY",
@@ -916,13 +928,13 @@ async fn test_empty_entitlements() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/activate"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/.*/validate"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(validation_responder())
         .mount(&server)
         .await;

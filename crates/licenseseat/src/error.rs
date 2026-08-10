@@ -30,6 +30,10 @@ pub enum Error {
     #[error("response identity mismatch: {0}")]
     ResponseMismatch(String),
 
+    /// A successful HTTP response violated the authenticated API contract.
+    #[error("invalid API response: {0}")]
+    InvalidResponse(String),
+
     /// A newer state-changing operation superseded an in-flight request.
     #[error("{operation} was superseded by a newer license-state operation")]
     OperationSuperseded {
@@ -175,6 +179,7 @@ impl Error {
             }
             Self::NoActiveLicense => "no active license".into(),
             Self::ResponseMismatch(_) => "response identity mismatch".into(),
+            Self::InvalidResponse(_) => "invalid API response".into(),
             Self::OperationSuperseded { .. } => "operation superseded".into(),
             Self::Json(_) => "invalid JSON response".into(),
             Self::RequestTooLarge { .. } => "request exceeded safety limit".into(),

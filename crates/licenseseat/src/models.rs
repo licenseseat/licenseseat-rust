@@ -565,7 +565,6 @@ pub struct OfflineTokenPayload {
     pub seat_limit: Option<u32>,
     /// Canonical fingerprint / legacy device id.
     #[serde(
-        rename = "fingerprint",
         default,
         rename = "fingerprint",
         skip_serializing_if = "Option::is_none",

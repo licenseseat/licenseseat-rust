@@ -24,8 +24,11 @@ impl Respond for ActivationResponder {
                 .unwrap_or_default()
         };
         let product_slug = segment_after("products");
-        let license_key = segment_after("licenses");
         let request_body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let license_key = request_body
+            .get("license_key")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let fingerprint = request_body
             .get("fingerprint")
             .or_else(|| request_body.get("device_id"))
@@ -73,7 +76,7 @@ pub fn activation_responder_with_entitlements(entitlements: Vec<Value>) -> Activ
     ActivationResponder { entitlements }
 }
 
-fn request_identity(request: &Request) -> (&str, &str) {
+fn request_identity(request: &Request) -> (String, String) {
     let segments = request
         .url
         .path_segments()
@@ -87,7 +90,15 @@ fn request_identity(request: &Request) -> (&str, &str) {
             .copied()
             .unwrap_or_default()
     };
-    (segment_after("products"), segment_after("licenses"))
+    let request_body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+    let license_key = request_body
+        .get("license_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    (
+        segment_after("products").to_string(),
+        license_key.to_string(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +110,12 @@ pub struct ValidationResponder {
 impl Respond for ValidationResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let (product_slug, license_key) = request_identity(request);
+        let request_body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let fingerprint = request_body
+            .get("fingerprint")
+            .or_else(|| request_body.get("device_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let (status, code, message) = if self.valid {
             ("active", Value::Null, Value::Null)
         } else {
@@ -128,7 +145,17 @@ impl Respond for ValidationResponder {
                 "metadata": null,
                 "product": { "slug": product_slug, "name": "Test App" }
             },
-            "activation": null
+            "activation": self.valid.then(|| json!({
+                "object": "activation",
+                "id": "act-12345-uuid",
+                "device_id": fingerprint,
+                "device_name": "Test Device",
+                "license_key": license_key,
+                "activated_at": "2025-01-01T00:00:00Z",
+                "deactivated_at": null,
+                "ip_address": "127.0.0.1",
+                "metadata": null
+            }))
         }))
     }
 }

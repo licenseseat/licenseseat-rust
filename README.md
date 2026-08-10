@@ -178,7 +178,13 @@ Set `network_recheck_interval` or `offline_token_refresh_interval` to zero to di
 - A no-default-features build without either TLS backend supports loopback HTTP testing only and rejects HTTPS configuration with an actionable error.
 - Requests and responses are bounded before allocation/processing; retries are limited to transport, HTTP 408/429, and 5xx conditions as appropriate.
 - URLs containing license keys and bearer credentials are stripped from logs and surfaced transport errors.
-- Cache files use private permissions where supported, bounded reads, atomic replacement, symlink/path rejection, product scoping, and legacy migration.
+- Cache files use private permissions where supported, bounded reads, atomic replacement, symlink/reparse-point rejection, opaque SHA-256 product scoping, and transactional one-way legacy migration.
+
+When upgrading an installation with an existing pre-0.6 cache, stop every old
+SDK process before the first 0.6 launch. The two formats intentionally use
+different lock names, and a successful hardened write removes the legacy copy;
+rolling the storage back to an older SDK after migration is therefore not a
+supported authorization-state rollback path.
 
 ```toml
 # Default: rustls + offline support
