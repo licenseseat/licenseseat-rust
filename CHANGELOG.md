@@ -2,9 +2,11 @@
 
 ## [Unreleased]
 
-Planned release line: **0.6.0**. A minor version bump is required because the
-hardening adds fields to public configuration/signed-payload structs and adds
-fail-closed public error/reason variants.
+## [0.6.0] - 2026-08-10
+
+A minor version bump is required because the hardening adds fields to public
+configuration/signed-payload structs and adds fail-closed public error/reason
+variants.
 
 This is a security and production-readiness hardening pass. See
 [`docs/releases/production-hardening-audit.md`](docs/releases/production-hardening-audit.md)
