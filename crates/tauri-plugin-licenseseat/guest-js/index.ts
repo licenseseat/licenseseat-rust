@@ -49,7 +49,7 @@ export interface LicenseStatus {
 /** Entitlement check response */
 export interface EntitlementStatus {
   active: boolean;
-  reason?: 'nolicense' | 'notfound' | 'expired';
+  reason?: 'nolicense' | 'invalidlicense' | 'notfound' | 'expired';
   expiresAt?: string;
 }
 
@@ -221,6 +221,7 @@ export interface MachineFilePayload {
   ttl: number;
   gracePeriod: number;
   licenseKey: string;
+  productSlug: string;
   licenseExpiresAt?: number;
   keyId: string;
   sdkVersion?: string;
@@ -287,29 +288,33 @@ export interface SigningKeyRecord {
   object: string;
   keyId: string;
   algorithm: string;
-  publicKey: string;
+  publicKeyConfigured: boolean;
   createdAt?: string;
   status: string;
 }
 
 export interface LicenseSeatAdminConfig {
   apiBaseUrl: string;
-  apiKey: string;
+  apiKeyConfigured: boolean;
   productSlug: string;
   storagePrefix: string;
   storagePath?: string;
-  deviceIdentifier?: string;
-  signingPublicKey?: string;
+  deviceIdentifierConfigured: boolean;
+  sendFingerprintComponents: boolean;
+  signingPublicKeyConfigured: boolean;
   signingKeyId?: string;
   autoValidateIntervalSeconds: number;
   heartbeatIntervalSeconds: number;
   networkRecheckIntervalSeconds: number;
   requestTimeoutSeconds: number;
+  maxRetries: number;
+  retryDelaySeconds: number;
   verifySsl: boolean;
   offlineFallbackMode: string;
   offlineTokenRefreshIntervalSeconds: number;
   enableLegacyOfflineTokens: boolean;
   maxOfflineDays: number;
+  maxClockSkewSeconds: number;
   telemetryEnabled: boolean;
   debug: boolean;
   appVersion?: string;
@@ -323,7 +328,6 @@ export interface LicenseSeatAdminCachePaths {
   machineFilePath?: string;
   offlineTokenPath?: string;
   lastSeenTimestampPath?: string;
-  signingKeyPath?: string;
 }
 
 export interface LicenseSeatAdminRuntime {
@@ -337,6 +341,15 @@ export interface LicenseSeatAdminRuntime {
   lastHealthError?: string;
 }
 
+/** Authority that established the current process-local licensing decision. */
+export type TrustedLicenseSource =
+  | 'online_response'
+  | 'signed_offline_artifact'
+  | 'fail_closed_denial'
+  | 'snapshot_file'
+  | 'cached_license'
+  | 'unknown';
+
 export interface LicenseSeatAdminSnapshot {
   capturedAt: string;
   config: LicenseSeatAdminConfig;
@@ -345,7 +358,7 @@ export interface LicenseSeatAdminSnapshot {
   runtime: LicenseSeatAdminRuntime;
   signingKeyId?: string;
   trustedLicense?: ValidationResult['license'];
-  trustedLicenseSource?: 'snapshot_file' | 'cached_license';
+  trustedLicenseSource?: TrustedLicenseSource;
   offlineToken?: OfflineToken;
   machineFile?: MachineFile;
   machineFileVerification?: MachineFileVerificationResult;
@@ -379,6 +392,7 @@ export const LICENSESEAT_EVENTS = {
   HEARTBEAT_ERROR: 'licenseseat://heartbeat-error',
   LICENSE_LOADED: 'licenseseat://license-loaded',
   LICENSE_REVOKED: 'licenseseat://license-revoked',
+  LICENSE_STATE_CHANGED: 'licenseseat://license-state-changed',
   OFFLINE_TOKEN_FETCHING: 'licenseseat://offlineToken-fetching',
   OFFLINE_TOKEN_FETCHED: 'licenseseat://offlineToken-fetched',
   OFFLINE_TOKEN_FETCH_ERROR: 'licenseseat://offlineToken-fetchError',
@@ -417,9 +431,11 @@ export const LICENSESEAT_STATE_EVENTS = [
   LICENSESEAT_EVENTS.VALIDATION_OFFLINE_FAILED,
   LICENSESEAT_EVENTS.VALIDATION_AUTH_FAILED,
   LICENSESEAT_EVENTS.VALIDATION_AUTO_FAILED,
+  LICENSESEAT_EVENTS.HEARTBEAT_SUCCESS,
   LICENSESEAT_EVENTS.DEACTIVATION_SUCCESS,
   LICENSESEAT_EVENTS.LICENSE_LOADED,
   LICENSESEAT_EVENTS.LICENSE_REVOKED,
+  LICENSESEAT_EVENTS.LICENSE_STATE_CHANGED,
   LICENSESEAT_EVENTS.OFFLINE_ASSETS_REFRESHED,
   LICENSESEAT_EVENTS.NETWORK_ONLINE,
   LICENSESEAT_EVENTS.NETWORK_OFFLINE,
@@ -437,6 +453,7 @@ export interface LicenseSeatStateChange {
 export interface SubscribeStateOptions {
   emitCurrent?: boolean;
   events?: readonly LicenseSeatEventName[];
+  onError?: (error: LicenseSeatPluginError) => void | Promise<void>;
 }
 
 /** Plugin error */
@@ -504,26 +521,52 @@ function isGenericErrorMessage(value: string): boolean {
 }
 
 function getErrorCandidates(error: unknown): UnknownRecord[] {
-  const record = asRecord(error);
-  if (!record) return [];
+  const candidates: UnknownRecord[] = [];
+  const queue: unknown[] = [error];
+  const seen = new Set<UnknownRecord>();
 
-  return [
-    record,
-    asRecord(record.error),
-    asRecord(record.data),
-    asRecord(record.payload),
-    asRecord(record.cause),
-    asRecord(record.details),
-  ].filter((candidate): candidate is UnknownRecord => candidate !== null);
+  while (queue.length > 0 && candidates.length < 16) {
+    const value = queue.shift();
+    const structured =
+      typeof value === 'string'
+        ? parseStructuredErrorString(value)
+        : value instanceof Error
+          ? parseStructuredErrorString(value.message)
+          : null;
+    const record = asRecord(value);
+    const structuredRecord = asRecord(structured);
+
+    for (const candidate of [record, structuredRecord]) {
+      if (!candidate || seen.has(candidate)) continue;
+      seen.add(candidate);
+      candidates.push(candidate);
+      for (const key of [
+        'error',
+        'data',
+        'payload',
+        'cause',
+        'details',
+        'message',
+      ]) {
+        queue.push(candidate[key]);
+      }
+    }
+  }
+
+  return candidates;
 }
 
-function extractKnownErrorMessage(error: unknown): string | null {
+function extractKnownErrorMessage(error: unknown, depth = 0): string | null {
+  if (depth >= 8) return null;
+
   if (typeof error === 'string') {
     const value = error.trim();
     if (value.length === 0) return null;
 
     const parsed = parseStructuredErrorString(value);
-    const parsedMessage = parsed ? extractKnownErrorMessage(parsed) : null;
+    const parsedMessage = parsed
+      ? extractKnownErrorMessage(parsed, depth + 1)
+      : null;
     if (parsedMessage) return parsedMessage;
 
     return isGenericErrorMessage(value) ? null : value;
@@ -533,7 +576,9 @@ function extractKnownErrorMessage(error: unknown): string | null {
     const value = error.message.trim();
     if (value.length > 0 && !isGenericErrorMessage(value)) {
       const parsed = parseStructuredErrorString(value);
-      return (parsed ? extractKnownErrorMessage(parsed) : null) ?? value;
+      return (
+        (parsed ? extractKnownErrorMessage(parsed, depth + 1) : null) ?? value
+      );
     }
   }
 
@@ -544,13 +589,14 @@ function extractKnownErrorMessage(error: unknown): string | null {
       readText(candidate.title),
       readText(candidate.error),
     ]) {
-      if (value && !isGenericErrorMessage(value)) return value;
+      if (value && !isGenericErrorMessage(value)) {
+        const parsed = parseStructuredErrorString(value);
+        const parsedMessage = parsed
+          ? extractKnownErrorMessage(parsed, depth + 1)
+          : null;
+        return parsedMessage ?? value;
+      }
     }
-
-    const nestedMessage = readText(candidate.message);
-    const parsed = nestedMessage ? parseStructuredErrorString(nestedMessage) : null;
-    const parsedMessage = parsed ? extractKnownErrorMessage(parsed) : null;
-    if (parsedMessage) return parsedMessage;
   }
 
   return null;
@@ -801,7 +847,7 @@ export async function checkEntitlement(
 }
 
 /**
- * Get the current active entitlements from the cached validation result.
+ * Get the current active entitlements from process-authoritative state.
  *
  * @returns The active entitlement records
  */
@@ -860,23 +906,15 @@ export async function restoreAndGetState(): Promise<LicenseSeatState> {
 }
 
 /**
- * Activate a license, attempt an immediate validation, and return the latest state snapshot.
- *
- * Validation errors are intentionally swallowed so activation success can still
- * be observed through `getState()` and lifecycle events.
+ * Activate a license and return the resulting authoritative state snapshot.
+ * Activation responses already contain the validated license grant, so this
+ * helper deliberately avoids a redundant second network request.
  */
 export async function activateAndGetState(
   licenseKey: string,
   options?: ActivationOptions
 ): Promise<LicenseSeatState> {
   await activate(licenseKey, options);
-
-  try {
-    await validate();
-  } catch {
-    // Activation succeeded; return the freshest cached state even if validation failed.
-  }
-
   return getState();
 }
 
@@ -890,7 +928,7 @@ export async function activateAndGetState(
 export async function bootstrapState(
   options: BootstrapStateOptions = {}
 ): Promise<LicenseSeatState> {
-  const { validateIfActivated = true } = options;
+  const { validateIfActivated = false } = options;
 
   try {
     await restoreLicense();
@@ -1000,7 +1038,11 @@ export async function listenEvent<T = LicenseSeatEventPayload>(
   eventName: LicenseSeatEventName,
   handler: (event: Event<T>) => void | Promise<void>
 ): Promise<UnlistenFn> {
-  return listen<T>(eventName, handler);
+  try {
+    return await listen<T>(eventName, handler);
+  } catch (error) {
+    throw normalizeError(error);
+  }
 }
 
 /**
@@ -1010,29 +1052,66 @@ export async function subscribeState(
   listener: (change: LicenseSeatStateChange) => void | Promise<void>,
   options: SubscribeStateOptions = {}
 ): Promise<UnlistenFn> {
-  const { emitCurrent = false, events = LICENSESEAT_STATE_EVENTS } = options;
-  const unlisteners = await Promise.all(
-    events.map((eventName) =>
-      listenEvent(eventName, async (event) => {
-        await listener({
+  const {
+    emitCurrent = false,
+    events = LICENSESEAT_STATE_EVENTS,
+    onError,
+  } = options;
+  let active = true;
+  let deliveryQueue = Promise.resolve();
+  const enqueue = (
+    eventName: LicenseSeatEventName | null,
+    payload: LicenseSeatEventPayload
+  ): Promise<void> => {
+    deliveryQueue = deliveryQueue.then(async () => {
+      if (!active) return;
+      const state = await getState();
+      if (!active) return;
+      await listener({ eventName, payload, state });
+    });
+    deliveryQueue = deliveryQueue.catch(async (error) => {
+      if (!onError) return;
+      try {
+        await onError(normalizeError(error));
+      } catch {
+        // Error reporting must not break future state deliveries.
+      }
+    });
+    return deliveryQueue;
+  };
+
+  const eventNames = [...new Set(events)];
+  const registrations = await Promise.allSettled(
+    eventNames.map((eventName) =>
+      listenEvent(eventName, (event) => {
+        void enqueue(
           eventName,
-          payload: (event.payload ?? null) as LicenseSeatEventPayload,
-          state: await getState(),
-        });
+          (event.payload ?? null) as LicenseSeatEventPayload
+        );
       })
     )
   );
+  const unlisteners = registrations.flatMap((registration) =>
+    registration.status === 'fulfilled' ? [registration.value] : []
+  );
+  const registrationFailure = registrations.find(
+    (registration): registration is PromiseRejectedResult =>
+      registration.status === 'rejected'
+  );
+  if (registrationFailure) {
+    active = false;
+    await Promise.all(unlisteners.map((unlisten) => unlisten()));
+    throw normalizeError(registrationFailure.reason);
+  }
 
   if (emitCurrent) {
-    await listener({
-      eventName: null,
-      payload: null,
-      state: await getState(),
-    });
+    await enqueue(null, null);
   }
 
   return async () => {
+    active = false;
     await Promise.all(unlisteners.map((unlisten) => unlisten()));
+    await deliveryQueue;
   };
 }
 

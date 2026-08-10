@@ -3,13 +3,19 @@
 //! These tests mirror the thread safety tests from C++ and C# SDKs,
 //! ensuring the SDK handles concurrent operations correctly.
 
-use licenseseat::{Config, EventKind, LicenseSeat};
+mod common;
+
+use common::{
+    activation_responder, activation_responder_with_entitlements, heartbeat_responder,
+    validation_responder, validation_responder_with_entitlements,
+};
+use licenseseat::{Config, Error, EventKind, LicenseSeat};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use wiremock::matchers::{method, path_regex};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wiremock::{Mock, MockServer};
 
 static TEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -27,129 +33,14 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
-        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
+        device_identifier: Some("device-123".into()),
         auto_validate_interval: Duration::from_secs(0),
         heartbeat_interval: Duration::from_secs(0),
         debug: true,
         ..Default::default()
     }
-}
-
-fn request_license_key(request: &Request) -> String {
-    serde_json::from_slice::<serde_json::Value>(&request.body)
-        .ok()
-        .and_then(|body| body.get("license_key")?.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "missing-license-key".to_owned())
-}
-
-fn activation_response(license_key: &str) -> serde_json::Value {
-    json!({
-        "object": "activation",
-        "id": "act-12345-uuid",
-        "device_id": "device-123",
-        "device_name": "Test Device",
-        "license_key": license_key,
-        "activated_at": "2025-01-01T00:00:00Z",
-        "deactivated_at": null,
-        "ip_address": "127.0.0.1",
-        "metadata": null,
-        "license": {
-            "object": "license",
-            "key": license_key,
-            "status": "active",
-            "starts_at": null,
-            "expires_at": null,
-            "mode": "hardware_locked",
-            "plan_key": "pro",
-            "seat_limit": 5,
-            "active_seats": 1,
-            "active_entitlements": [],
-            "metadata": null,
-            "product": {
-                "slug": "test-product",
-                "name": "Test App"
-            }
-        }
-    })
-}
-
-fn validation_response(license_key: &str) -> serde_json::Value {
-    json!({
-        "object": "validation_result",
-        "valid": true,
-        "code": null,
-        "message": null,
-        "warnings": null,
-        "license": {
-            "object": "license",
-            "key": license_key,
-            "status": "active",
-            "starts_at": null,
-            "expires_at": null,
-            "mode": "hardware_locked",
-            "plan_key": "pro",
-            "seat_limit": 5,
-            "active_seats": 1,
-            "active_entitlements": [],
-            "metadata": null,
-            "product": {
-                "slug": "test-product",
-                "name": "Test App"
-            }
-        },
-        "activation": {
-            "object": "activation",
-            "id": "act-12345-uuid",
-            "device_id": "device-123",
-            "device_name": "Test Device",
-            "license_key": license_key,
-            "activated_at": "2025-01-01T00:00:00Z",
-            "deactivated_at": null,
-            "ip_address": "127.0.0.1",
-            "metadata": null
-        }
-    })
-}
-
-fn heartbeat_response(license_key: &str) -> serde_json::Value {
-    json!({
-        "object": "heartbeat",
-        "received_at": "2025-01-01T00:00:00Z",
-        "license": {
-            "object": "license",
-            "key": license_key,
-            "status": "active",
-            "starts_at": null,
-            "expires_at": null,
-            "mode": "hardware_locked",
-            "plan_key": "pro",
-            "seat_limit": 5,
-            "active_seats": 1,
-            "active_entitlements": [],
-            "metadata": null,
-            "product": {
-                "slug": "test-product",
-                "name": "Test App"
-            }
-        }
-    })
-}
-
-fn activation_responder(request: &Request) -> ResponseTemplate {
-    let license_key = request_license_key(request);
-    ResponseTemplate::new(201).set_body_json(activation_response(&license_key))
-}
-
-fn validation_responder(request: &Request) -> ResponseTemplate {
-    let license_key = request_license_key(request);
-    ResponseTemplate::new(200).set_body_json(validation_response(&license_key))
-}
-
-fn heartbeat_responder(request: &Request) -> ResponseTemplate {
-    let license_key = request_license_key(request);
-    ResponseTemplate::new(200).set_body_json(heartbeat_response(&license_key))
 }
 
 // ============================================================================
@@ -162,13 +53,13 @@ async fn test_concurrent_validations() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder)
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(validation_responder)
+        .respond_with(validation_responder())
         .mount(&server)
         .await;
 
@@ -182,12 +73,21 @@ async fn test_concurrent_validations() {
         handles.push(tokio::spawn(async move { sdk_clone.validate().await }));
     }
 
-    // All validations should succeed
+    let mut successes = 0;
     for handle in handles {
         let result = handle.await.unwrap();
-        assert!(result.is_ok());
-        assert!(result.unwrap().valid);
+        match result {
+            Ok(validation) => {
+                successes += 1;
+                assert!(validation.valid);
+            }
+            Err(Error::OperationSuperseded { operation }) => {
+                assert_eq!(operation, "validation");
+            }
+            Err(error) => panic!("unexpected concurrent validation error: {error:?}"),
+        }
     }
+    assert!(successes >= 1, "the newest validation must commit");
 }
 
 #[tokio::test]
@@ -196,13 +96,13 @@ async fn test_concurrent_heartbeats() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder)
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/heartbeat"))
-        .respond_with(heartbeat_responder)
+        .respond_with(heartbeat_responder())
         .mount(&server)
         .await;
 
@@ -216,11 +116,18 @@ async fn test_concurrent_heartbeats() {
         handles.push(tokio::spawn(async move { sdk_clone.heartbeat().await }));
     }
 
-    // All heartbeats should succeed
+    let mut successes = 0;
     for handle in handles {
         let result = handle.await.unwrap();
-        assert!(result.is_ok());
+        match result {
+            Ok(_) => successes += 1,
+            Err(Error::OperationSuperseded { operation }) => {
+                assert_eq!(operation, "heartbeat");
+            }
+            Err(error) => panic!("unexpected concurrent heartbeat error: {error:?}"),
+        }
     }
+    assert!(successes >= 1, "the newest heartbeat must commit");
 }
 
 #[tokio::test]
@@ -229,13 +136,13 @@ async fn test_concurrent_status_checks() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder)
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(validation_responder)
+        .respond_with(validation_responder())
         .mount(&server)
         .await;
 
@@ -272,78 +179,13 @@ async fn test_concurrent_entitlement_checks() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-            "object": "activation",
-            "id": "act-12345-uuid",
-            "device_id": "device-123",
-            "device_name": "Test Device",
-            "license_key": "ENTITLEMENT-KEY",
-            "activated_at": "2025-01-01T00:00:00Z",
-            "deactivated_at": null,
-            "ip_address": "127.0.0.1",
-            "metadata": null,
-            "license": {
-                "object": "license",
-                "key": "ENTITLEMENT-KEY",
-                "status": "active",
-                "starts_at": null,
-                "expires_at": null,
-                "mode": "hardware_locked",
-                "plan_key": "pro",
-                "seat_limit": 5,
-                "active_seats": 1,
-                "active_entitlements": entitlements,
-                "metadata": null,
-                "product": {
-                    "slug": "test-product",
-                    "name": "Test App"
-                }
-            }
-        })))
+        .respond_with(activation_responder_with_entitlements(entitlements.clone()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "object": "validation_result",
-            "valid": true,
-            "code": null,
-            "message": null,
-            "warnings": null,
-            "license": {
-                "object": "license",
-                "key": "ENTITLEMENT-KEY",
-                "status": "active",
-                "starts_at": null,
-                "expires_at": null,
-                "mode": "hardware_locked",
-                "plan_key": "pro",
-                "seat_limit": 5,
-                "active_seats": 1,
-                "active_entitlements": [
-                    {"key": "feature-1", "expires_at": null, "metadata": null},
-                    {"key": "feature-2", "expires_at": null, "metadata": null},
-                    {"key": "feature-3", "expires_at": null, "metadata": null}
-                ],
-                "metadata": null,
-                "product": {
-                    "slug": "test-product",
-                    "name": "Test App"
-                }
-            },
-            "activation": {
-                "object": "activation",
-                "id": "act-12345-uuid",
-                "device_id": "device-123",
-                "device_name": "Test Device",
-                "license_key": "ENTITLEMENT-KEY",
-                "activated_at": "2025-01-01T00:00:00Z",
-                "deactivated_at": null,
-                "ip_address": "127.0.0.1",
-                "metadata": null
-            }
-        })))
+        .respond_with(validation_responder_with_entitlements(entitlements))
         .mount(&server)
         .await;
 
@@ -378,7 +220,7 @@ async fn test_concurrent_event_subscriptions() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder)
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
@@ -426,13 +268,13 @@ async fn test_sdk_clone_shares_state() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder)
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(validation_responder)
+        .respond_with(validation_responder())
         .mount(&server)
         .await;
 
@@ -462,19 +304,19 @@ async fn test_sdk_clone_concurrent_operations() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder)
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(validation_responder)
+        .respond_with(validation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/heartbeat"))
-        .respond_with(heartbeat_responder)
+        .respond_with(heartbeat_responder())
         .mount(&server)
         .await;
 
@@ -494,17 +336,58 @@ async fn test_sdk_clone_concurrent_operations() {
         }
     }
 
-    // All validate operations should complete successfully
+    let mut successful_operations = 0;
     for handle in validate_handles {
-        let result = handle.await;
-        assert!(result.is_ok());
+        match handle.await.unwrap() {
+            Ok(_) => successful_operations += 1,
+            Err(Error::OperationSuperseded { .. }) => {}
+            Err(error) => panic!("unexpected concurrent validation error: {error:?}"),
+        }
     }
 
-    // All heartbeat operations should complete successfully
     for handle in heartbeat_handles {
-        let result = handle.await;
-        assert!(result.is_ok());
+        match handle.await.unwrap() {
+            Ok(_) => successful_operations += 1,
+            Err(Error::OperationSuperseded { .. }) => {}
+            Err(error) => panic!("unexpected concurrent heartbeat error: {error:?}"),
+        }
     }
+    assert!(
+        successful_operations >= 1,
+        "the newest state operation must commit"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_restore_requests_are_single_flight_and_idempotent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(activation_responder())
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(validation_responder())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = test_config(&server.uri());
+    let activating_sdk = LicenseSeat::new(config.clone());
+    activating_sdk.activate("RESTORE-KEY").await.unwrap();
+    drop(activating_sdk);
+
+    let restored_sdk = LicenseSeat::new(config);
+    let (first, second) = tokio::join!(
+        restored_sdk.restore_license(),
+        restored_sdk.restore_license()
+    );
+
+    assert!(first.restored);
+    assert!(second.restored);
+    assert!(restored_sdk.is_license_state_trusted());
 }
 
 // ============================================================================
@@ -517,13 +400,13 @@ async fn test_no_race_on_status() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder)
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(validation_responder)
+        .respond_with(validation_responder())
         .mount(&server)
         .await;
 
@@ -562,13 +445,13 @@ async fn test_high_concurrency_stress() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder)
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(validation_responder)
+        .respond_with(validation_responder())
         .mount(&server)
         .await;
 
@@ -606,7 +489,7 @@ async fn test_multiple_independent_instances() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder)
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 

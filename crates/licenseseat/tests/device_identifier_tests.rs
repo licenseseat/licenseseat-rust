@@ -71,14 +71,15 @@ fn activation_response(device_id: &str) -> Value {
 #[tokio::test]
 async fn test_device_id_is_generated() {
     let server = MockServer::start().await;
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    let fingerprint = sdk.fingerprint().to_string();
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("device-123")))
+        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response(&fingerprint)))
         .mount(&server)
         .await;
 
-    let sdk = LicenseSeat::new(test_config(&server.uri()));
     let result = sdk.activate("TEST-KEY").await;
 
     assert!(result.is_ok());
@@ -99,16 +100,17 @@ async fn test_device_id_is_generated() {
 async fn test_device_id_is_stable() {
     let server = MockServer::start().await;
 
+    // Create two SDK instances with the same durable storage namespace.
+    let config = test_config(&server.uri());
+    let sdk1 = LicenseSeat::new(config.clone());
+    let fingerprint = sdk1.fingerprint().to_string();
+
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("device-123")))
+        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response(&fingerprint)))
         .mount(&server)
         .await;
 
-    // Create two SDK instances with same config
-    let config = test_config(&server.uri());
-
-    let sdk1 = LicenseSeat::new(config.clone());
     let _ = sdk1.activate("TEST-KEY").await;
 
     let sdk2 = LicenseSeat::new(config);
@@ -281,14 +283,15 @@ async fn test_activation_options_override_config() {
 #[tokio::test]
 async fn test_device_id_format() {
     let server = MockServer::start().await;
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    let fingerprint = sdk.fingerprint().to_string();
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("device-123")))
+        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response(&fingerprint)))
         .mount(&server)
         .await;
 
-    let sdk = LicenseSeat::new(test_config(&server.uri()));
     let _ = sdk.activate("TEST-KEY").await;
 
     // Check the request
@@ -310,29 +313,23 @@ async fn test_device_id_format() {
 
 #[tokio::test]
 async fn test_device_id_uniqueness_across_different_machines() {
-    // This test verifies that we're generating unique IDs
-    // In practice, different machines should have different hardware UUIDs
-    // For testing, we just verify the format and that it's non-empty
-
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("device-123")))
-        .mount(&server)
-        .await;
-
-    let sdk = LicenseSeat::new(test_config(&server.uri()));
-    let license = sdk.activate("TEST-KEY").await.unwrap();
+    let mut first_config = test_config(&server.uri());
+    first_config.device_identifier = None;
+    let mut second_config = test_config(&server.uri());
+    second_config.device_identifier = None;
+    let first = LicenseSeat::new(first_config);
+    let second = LicenseSeat::new(second_config);
+    assert_ne!(first.fingerprint(), second.fingerprint());
 
     // Device ID should be a reasonably sized string (not too short, not too long)
-    assert!(license.device_id.len() >= 5);
-    assert!(license.device_id.len() <= 100);
+    assert!(first.fingerprint().len() >= 8);
+    assert!(first.fingerprint().len() <= 255);
 
     // Should contain only valid characters
     assert!(
-        license
-            .device_id
+        first
+            .fingerprint()
             .chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
     );

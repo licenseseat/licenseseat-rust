@@ -2,13 +2,19 @@
 //!
 //! These tests mirror the scenario and journey tests from C++, C#, and Swift SDKs.
 
+mod common;
+
+use common::{
+    activation_responder, activation_responder_with_entitlements, heartbeat_responder,
+    invalid_validation_responder, validation_responder, validation_responder_with_entitlements,
+};
 use licenseseat::{Config, EventKind, LicenseSeat};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use wiremock::matchers::{method, path_regex};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 static TEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -26,113 +32,14 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
-        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
+        device_identifier: Some("device-123".into()),
         auto_validate_interval: Duration::from_secs(0),
         heartbeat_interval: Duration::from_secs(0),
         debug: true,
         ..Default::default()
     }
-}
-
-fn request_license_key(request: &Request) -> String {
-    serde_json::from_slice::<serde_json::Value>(&request.body)
-        .ok()
-        .and_then(|body| body.get("license_key")?.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "missing-license-key".to_owned())
-}
-
-fn activation_response(
-    license_key: &str,
-    entitlements: Vec<serde_json::Value>,
-) -> serde_json::Value {
-    json!({
-        "object": "activation",
-        "id": "act-12345-uuid",
-        "device_id": "device-123",
-        "device_name": "Test Device",
-        "license_key": license_key,
-        "activated_at": "2025-01-01T00:00:00Z",
-        "deactivated_at": null,
-        "ip_address": "127.0.0.1",
-        "metadata": null,
-        "license": {
-            "object": "license",
-            "key": license_key,
-            "status": "active",
-            "starts_at": null,
-            "expires_at": null,
-            "mode": "hardware_locked",
-            "plan_key": "pro",
-            "seat_limit": 5,
-            "active_seats": 1,
-            "active_entitlements": entitlements,
-            "metadata": null,
-            "product": {
-                "slug": "test-product",
-                "name": "Test App"
-            }
-        }
-    })
-}
-
-fn validation_response(
-    license_key: &str,
-    valid: bool,
-    entitlements: Vec<serde_json::Value>,
-) -> serde_json::Value {
-    let code = if valid {
-        serde_json::Value::Null
-    } else {
-        json!("license_invalid")
-    };
-    let message = if valid {
-        serde_json::Value::Null
-    } else {
-        json!("License is invalid")
-    };
-    let status = if valid { "active" } else { "suspended" };
-
-    json!({
-        "object": "validation_result",
-        "valid": valid,
-        "code": code,
-        "message": message,
-        "warnings": null,
-        "license": {
-            "object": "license",
-            "key": license_key,
-            "status": status,
-            "starts_at": null,
-            "expires_at": null,
-            "mode": "hardware_locked",
-            "plan_key": "pro",
-            "seat_limit": 5,
-            "active_seats": 1,
-            "active_entitlements": entitlements,
-            "metadata": null,
-            "product": {
-                "slug": "test-product",
-                "name": "Test App"
-            }
-        },
-        "activation": if valid {
-            Some(json!({
-                "object": "activation",
-                "id": "act-12345-uuid",
-                "device_id": "device-123",
-                "device_name": "Test Device",
-                "license_key": license_key,
-                "activated_at": "2025-01-01T00:00:00Z",
-                "deactivated_at": null,
-                "ip_address": "127.0.0.1",
-                "metadata": null
-            }))
-        } else {
-            None
-        }
-    })
 }
 
 fn deactivation_response() -> serde_json::Value {
@@ -141,59 +48,6 @@ fn deactivation_response() -> serde_json::Value {
         "activation_id": "act-12345-uuid",
         "deactivated_at": "2025-01-01T01:00:00Z"
     })
-}
-
-fn heartbeat_response(license_key: &str) -> serde_json::Value {
-    json!({
-        "object": "heartbeat",
-        "received_at": "2025-01-01T00:00:00Z",
-        "license": {
-            "object": "license",
-            "key": license_key,
-            "status": "active",
-            "starts_at": null,
-            "expires_at": null,
-            "mode": "hardware_locked",
-            "plan_key": "pro",
-            "seat_limit": 5,
-            "active_seats": 1,
-            "active_entitlements": [],
-            "metadata": null,
-            "product": {
-                "slug": "test-product",
-                "name": "Test App"
-            }
-        }
-    })
-}
-
-fn activation_responder(
-    entitlements: Vec<serde_json::Value>,
-) -> impl Fn(&Request) -> ResponseTemplate + Send + Sync + 'static {
-    move |request| {
-        let license_key = request_license_key(request);
-        ResponseTemplate::new(201)
-            .set_body_json(activation_response(&license_key, entitlements.clone()))
-    }
-}
-
-fn validation_responder(
-    valid: bool,
-    entitlements: Vec<serde_json::Value>,
-) -> impl Fn(&Request) -> ResponseTemplate + Send + Sync + 'static {
-    move |request| {
-        let license_key = request_license_key(request);
-        ResponseTemplate::new(200).set_body_json(validation_response(
-            &license_key,
-            valid,
-            entitlements.clone(),
-        ))
-    }
-}
-
-fn heartbeat_responder(request: &Request) -> ResponseTemplate {
-    let license_key = request_license_key(request);
-    ResponseTemplate::new(200).set_body_json(heartbeat_response(&license_key))
 }
 
 // ============================================================================
@@ -206,7 +60,7 @@ async fn test_scenario_new_user_activation() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(vec![
+        .respond_with(activation_responder_with_entitlements(vec![
             json!({"key": "basic", "expires_at": null, "metadata": null}),
         ]))
         .mount(&server)
@@ -238,13 +92,13 @@ async fn test_scenario_returning_user_with_cached_license() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(vec![]))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(validation_responder(true, vec![]))
+        .respond_with(validation_responder())
         .mount(&server)
         .await;
 
@@ -284,13 +138,13 @@ async fn test_scenario_feature_gating_with_entitlements() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(entitlements.clone()))
+        .respond_with(activation_responder_with_entitlements(entitlements.clone()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(validation_responder(true, entitlements))
+        .respond_with(validation_responder_with_entitlements(entitlements))
         .mount(&server)
         .await;
 
@@ -324,13 +178,13 @@ async fn test_scenario_expired_entitlement() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(entitlements.clone()))
+        .respond_with(activation_responder_with_entitlements(entitlements.clone()))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(validation_responder(true, entitlements))
+        .respond_with(validation_responder_with_entitlements(entitlements))
         .mount(&server)
         .await;
 
@@ -357,7 +211,7 @@ async fn test_scenario_clean_deactivation() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(vec![]))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
@@ -390,7 +244,7 @@ async fn test_scenario_deactivate_already_deactivated() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(vec![]))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
@@ -426,13 +280,13 @@ async fn test_scenario_license_revoked() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(vec![]))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
             "error": {
                 "code": "license_revoked",
                 "message": "This license has been revoked"
@@ -478,13 +332,13 @@ async fn test_scenario_license_suspended() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(vec![]))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(validation_responder(false, vec![]))
+        .respond_with(invalid_validation_responder())
         .mount(&server)
         .await;
 
@@ -509,13 +363,13 @@ async fn test_scenario_regular_heartbeat() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(vec![]))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/heartbeat"))
-        .respond_with(heartbeat_responder)
+        .respond_with(heartbeat_responder())
         .expect(3)
         .mount(&server)
         .await;
@@ -541,7 +395,7 @@ async fn test_scenario_temporary_network_failure() {
     // Fail first two attempts, succeed on third
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(vec![]))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
@@ -571,7 +425,7 @@ async fn test_scenario_sdk_reset() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(vec![]))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
@@ -659,7 +513,7 @@ async fn test_scenario_check_entitlement_without_validation() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(vec![]))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
@@ -689,7 +543,7 @@ async fn test_scenario_multiple_sdk_instances_same_config() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(vec![]))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
@@ -721,7 +575,7 @@ async fn test_scenario_isolated_sdk_instances() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(activation_responder(vec![]))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 

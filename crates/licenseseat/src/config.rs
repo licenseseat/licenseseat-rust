@@ -1,7 +1,6 @@
 //! SDK configuration types.
 
 use crate::error::{Error, Result};
-use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -41,26 +40,44 @@ pub struct Config {
     /// Product slug - identifies your product (required).
     pub product_slug: String,
 
-    /// Prefix for cache storage keys.
-    /// Default: `licenseseat_`
+    /// Prefix for persisted state keys.
+    ///
+    /// The default `licenseseat_` marker is automatically replaced with a
+    /// deterministic product-scoped prefix, preventing different product slugs
+    /// from sharing installation or license state. Two non-Tauri applications
+    /// that reuse one product slug and the default shared directory should set
+    /// an app-specific `storage_path` or custom prefix. A custom value is used
+    /// verbatim after filename-safety normalization.
     pub storage_prefix: String,
 
     /// Optional directory for persisted SDK state.
     ///
-    /// When omitted, the SDK uses the platform local-data directory under
+    /// When omitted, the SDK uses the platform application-data directory under
     /// `licenseseat/`.
     pub storage_path: Option<PathBuf>,
 
-    /// Custom device fingerprint. If not set, auto-generated from hardware.
+    /// Custom installation fingerprint. If not set, the SDK generates and
+    /// persists a random storage-scope installation identifier.
     ///
     /// This remains named `device_identifier` for backwards compatibility, but
     /// the API now treats `fingerprint` as the canonical field name.
     pub device_identifier: Option<String>,
 
+    /// Automatically collect and send raw hardware fingerprint components
+    /// (for example hostname or platform machine identifiers) when the SDK
+    /// checks out a machine file for its own installation fingerprint.
+    ///
+    /// This is disabled by default for data minimization. Callers can still
+    /// provide an explicit `fingerprint_components` map through
+    /// `MachineFileCheckoutOptions` without enabling this global opt-in.
+    pub send_fingerprint_components: bool,
+
     /// Ed25519 signing public key used for offline artifact verification.
     ///
-    /// If omitted, the SDK fetches the key by `kid` for the current process.
-    /// Fetched keys are never persisted as trust anchors.
+    /// If omitted, the SDK can fetch the key by `kid` for verification during
+    /// the current online process. Persisted fetched keys are diagnostic cache,
+    /// not cross-process trust anchors. Offline startup requires both this
+    /// value and [`Self::signing_key_id`] to be pinned in the application.
     pub signing_public_key: Option<String>,
 
     /// Key identifier for the configured signing public key.
@@ -111,7 +128,8 @@ pub struct Config {
     /// Disabled by default; machine files are the preferred offline artifact.
     pub enable_legacy_offline_tokens: bool,
 
-    /// Maximum days a license can be used offline (0 = disabled).
+    /// Maximum age of a signed offline grant in days (`0` = no additional
+    /// host-side age cap; the artifact's signed expiration still applies).
     /// Default: 0
     pub max_offline_days: u32,
 
@@ -119,7 +137,11 @@ pub struct Config {
     /// Default: 5 minutes
     pub max_clock_skew: Duration,
 
-    /// Enable telemetry collection (set false for GDPR compliance).
+    /// Send SDK, OS, architecture, coarse hardware-capacity, locale/timezone,
+    /// and optional app-version/build telemetry with API requests.
+    ///
+    /// Applications are responsible for deciding whether collection is
+    /// appropriate for their privacy policy and jurisdiction.
     /// Default: true
     pub telemetry_enabled: bool,
 
@@ -143,6 +165,7 @@ impl Default for Config {
             storage_prefix: "licenseseat_".into(),
             storage_path: None,
             device_identifier: None,
+            send_fingerprint_components: false,
             signing_public_key: None,
             signing_key_id: None,
             auto_validate_interval: Duration::from_secs(3600), // 1 hour
@@ -163,6 +186,61 @@ impl Default for Config {
             app_build: None,
         }
     }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let api_key = (!self.api_key.is_empty()).then_some("[REDACTED]");
+        let api_base_url = debug_api_base_url(&self.api_base_url);
+        let device_identifier = self.device_identifier.as_ref().map(|_| "[REDACTED]");
+        let signing_public_key = self.signing_public_key.as_ref().map(|_| "[REDACTED]");
+
+        formatter
+            .debug_struct("Config")
+            .field("api_base_url", &api_base_url)
+            .field("api_key", &api_key)
+            .field("product_slug", &self.product_slug)
+            .field("storage_prefix", &self.storage_prefix)
+            .field("storage_path", &self.storage_path)
+            .field("device_identifier", &device_identifier)
+            .field(
+                "send_fingerprint_components",
+                &self.send_fingerprint_components,
+            )
+            .field("signing_public_key", &signing_public_key)
+            .field("signing_key_id", &self.signing_key_id)
+            .field("auto_validate_interval", &self.auto_validate_interval)
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("network_recheck_interval", &self.network_recheck_interval)
+            .field("request_timeout", &self.request_timeout)
+            .field("verify_ssl", &self.verify_ssl)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay", &self.retry_delay)
+            .field("offline_fallback_mode", &self.offline_fallback_mode)
+            .field(
+                "offline_token_refresh_interval",
+                &self.offline_token_refresh_interval,
+            )
+            .field(
+                "enable_legacy_offline_tokens",
+                &self.enable_legacy_offline_tokens,
+            )
+            .field("max_offline_days", &self.max_offline_days)
+            .field("max_clock_skew", &self.max_clock_skew)
+            .field("telemetry_enabled", &self.telemetry_enabled)
+            .field("debug", &self.debug)
+            .field("app_version", &self.app_version)
+            .field("app_build", &self.app_build)
+            .finish()
+    }
+}
+
+fn debug_api_base_url(value: &str) -> String {
+    url::Url::parse(value)
+        .ok()
+        .filter(|url| !url.cannot_be_a_base() && url.host().is_some())
+        .map(|url| format!("{}{}", url.origin().ascii_serialization(), url.path()))
+        .unwrap_or_else(|| "[INVALID URL]".into())
 }
 
 impl Config {
@@ -358,50 +436,6 @@ fn safe_key_id(value: &str) -> bool {
         })
 }
 
-impl fmt::Debug for Config {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Config")
-            .field("api_base_url", &self.api_base_url)
-            .field("api_key", &"[REDACTED]")
-            .field("product_slug", &self.product_slug)
-            .field("storage_prefix", &self.storage_prefix)
-            .field("storage_path", &self.storage_path)
-            .field(
-                "device_identifier_configured",
-                &self.device_identifier.is_some(),
-            )
-            .field(
-                "signing_public_key_configured",
-                &self.signing_public_key.is_some(),
-            )
-            .field("signing_key_id", &self.signing_key_id)
-            .field("auto_validate_interval", &self.auto_validate_interval)
-            .field("heartbeat_interval", &self.heartbeat_interval)
-            .field("network_recheck_interval", &self.network_recheck_interval)
-            .field("request_timeout", &self.request_timeout)
-            .field("verify_ssl", &self.verify_ssl)
-            .field("max_retries", &self.max_retries)
-            .field("retry_delay", &self.retry_delay)
-            .field("offline_fallback_mode", &self.offline_fallback_mode)
-            .field(
-                "offline_token_refresh_interval",
-                &self.offline_token_refresh_interval,
-            )
-            .field(
-                "enable_legacy_offline_tokens",
-                &self.enable_legacy_offline_tokens,
-            )
-            .field("max_offline_days", &self.max_offline_days)
-            .field("max_clock_skew", &self.max_clock_skew)
-            .field("telemetry_enabled", &self.telemetry_enabled)
-            .field("debug", &self.debug)
-            .field("app_version", &self.app_version)
-            .field("app_build", &self.app_build)
-            .finish()
-    }
-}
-
 pub(crate) fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
         || host
@@ -411,13 +445,20 @@ pub(crate) fn is_loopback_host(host: &str) -> bool {
 
 /// Offline fallback behavior when network validation fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum OfflineFallbackMode {
-    /// Only fall back to offline validation for network errors
-    /// (timeouts, connectivity issues, 5xx responses).
-    /// Business logic errors (4xx) immediately invalidate the license.
+    /// Only fall back to offline validation for availability errors: transport
+    /// failures, timeouts, HTTP 408, and 5xx responses.
+    ///
+    /// Other 4xx responses, malformed/substituted responses, configuration
+    /// errors, and local state races return an error without consulting an
+    /// older offline grant. Only specifically recognized authoritative license
+    /// denials clear the last trusted grant.
     #[default]
     NetworkOnly,
 
-    /// Always attempt offline validation on any failure.
+    /// Attempt offline validation for transport errors, retryable server errors,
+    /// and rate limiting. Authoritative 4xx decisions, malformed responses,
+    /// configuration errors, and local state races always fail closed.
     Always,
 }

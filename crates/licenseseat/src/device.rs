@@ -1,12 +1,13 @@
-//! Device fingerprinting helpers.
+//! Opt-in hardware fingerprinting helpers.
 //!
-//! This module intentionally mirrors the C++ reference fingerprinting strategy
-//! so mixed-SDK estates identify the same machine consistently by default.
+//! The SDK's default installation identity is a durable random, storage/product-
+//! scoped identifier. These helpers preserve the C++ component strategy only
+//! for deployments that explicitly opt into sending hardware components.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-/// Generate a stable device fingerprint.
+/// Generate the legacy C++-compatible hardware fingerprint.
 pub fn generate_fingerprint() -> String {
     fingerprint_from_components(&collect_fingerprint_components())
 }
@@ -17,7 +18,11 @@ pub fn generate_device_id() -> String {
     generate_fingerprint()
 }
 
-/// Collect structured fingerprint components for diagnostics and server-side matching.
+/// Collect raw structured hardware fingerprint components.
+///
+/// Values can include a hostname or platform machine identifier. They are sent
+/// only when `Config::send_fingerprint_components` is enabled or a caller
+/// explicitly supplies a component map.
 pub fn collect_fingerprint_components() -> HashMap<String, String> {
     let mut components = HashMap::new();
     components.insert("schema_version".into(), "1".into());

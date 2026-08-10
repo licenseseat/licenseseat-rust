@@ -19,6 +19,7 @@ fn test_config_default_values() {
     assert_eq!(config.storage_prefix, "licenseseat_");
     assert!(config.storage_path.is_none());
     assert!(config.device_identifier.is_none());
+    assert!(!config.send_fingerprint_components);
     assert_eq!(config.auto_validate_interval, Duration::from_secs(3600));
     assert_eq!(config.heartbeat_interval, Duration::from_secs(300));
     assert_eq!(config.network_recheck_interval, Duration::from_secs(30));
@@ -276,13 +277,30 @@ fn test_config_clone() {
 
 #[test]
 fn test_config_debug_format() {
-    let config = Config::new("api-key", "product");
+    let config = Config {
+        api_base_url: "https://url-user:url-password@example.test/api/v1?token=url-secret#fragment"
+            .into(),
+        api_key: "secret-key-must-not-leak".into(),
+        product_slug: "product".into(),
+        device_identifier: Some("private-device-id".into()),
+        signing_public_key: Some("large-public-key".into()),
+        ..Default::default()
+    };
     let debug_str = format!("{:?}", config);
 
     // Debug output should contain key field names
     assert!(debug_str.contains("api_key"));
     assert!(debug_str.contains("product_slug"));
     assert!(debug_str.contains("api_base_url"));
+    assert!(!debug_str.contains("secret-key-must-not-leak"));
+    assert!(!debug_str.contains("private-device-id"));
+    assert!(!debug_str.contains("large-public-key"));
+    assert!(!debug_str.contains("url-user"));
+    assert!(!debug_str.contains("url-password"));
+    assert!(!debug_str.contains("url-secret"));
+    assert!(!debug_str.contains("fragment"));
+    assert!(debug_str.contains("https://example.test/api/v1"));
+    assert!(debug_str.contains("[REDACTED]"));
 }
 
 #[test]

@@ -1,7 +1,6 @@
 //! Plugin configuration from tauri.conf.json.
 
 use serde::Deserialize;
-use std::fmt;
 
 /// Plugin configuration read from tauri.conf.json.
 ///
@@ -51,6 +50,11 @@ pub struct PluginConfig {
     #[serde(default)]
     pub device_identifier: Option<String>,
 
+    /// Opt in to collecting and sending raw hardware fingerprint components
+    /// during automatic machine-file checkout. Default: false.
+    #[serde(default)]
+    pub send_fingerprint_components: Option<bool>,
+
     /// Optional Ed25519 public key used for machine-file/offline-token verification.
     #[serde(default)]
     pub signing_public_key: Option<String>,
@@ -79,6 +83,16 @@ pub struct PluginConfig {
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
 
+    /// Maximum retry attempts for retryable requests.
+    /// Default: 3
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+
+    /// Initial retry delay in seconds. Exponential backoff is capped by the SDK.
+    /// Default: 1
+    #[serde(default)]
+    pub retry_delay_seconds: Option<u64>,
+
     /// Whether TLS certificates should be verified.
     /// Default: true
     #[serde(default)]
@@ -87,16 +101,22 @@ pub struct PluginConfig {
     /// Offline fallback mode: "networkOnly", "always", or "allow_offline".
     ///
     /// - "networkOnly": Only fall back to offline validation for network errors
-    /// - "always" / "allow_offline": Always fall back to offline validation
+    /// - "always" / "allow_offline": Also fall back for rate limiting; signed
+    ///   offline state never overrides authoritative client/business errors
     ///
     /// Default: "networkOnly"
     #[serde(default)]
     pub offline_fallback_mode: Option<String>,
 
-    /// Maximum days a license can be used offline.
-    /// Default: 0 (disabled)
+    /// Maximum age of a signed offline grant in days.
+    /// Default: 0 (no additional age cap)
     #[serde(default)]
     pub max_offline_days: Option<u32>,
+
+    /// Maximum accepted clock skew for signed offline artifacts (in seconds).
+    /// Default: 300 (5 minutes)
+    #[serde(default)]
+    pub max_clock_skew_seconds: Option<u64>,
 
     /// Interval for refreshing cached offline artifacts (in seconds).
     /// Default: 259200 (72 hours)
@@ -118,6 +138,15 @@ pub struct PluginConfig {
     #[serde(default)]
     pub debug: Option<bool>,
 
+    /// Emit raw LicenseSeat lifecycle events to every Tauri renderer.
+    ///
+    /// Default: true for backward compatibility. Set this to false when the
+    /// application exposes a narrow native licensing facade instead of the
+    /// generic renderer API. Native Rust subscribers continue to receive SDK
+    /// events regardless of this setting.
+    #[serde(default)]
+    pub emit_frontend_events: Option<bool>,
+
     /// App version (for telemetry).
     #[serde(default)]
     pub app_version: Option<String>,
@@ -127,33 +156,52 @@ pub struct PluginConfig {
     pub app_build: Option<String>,
 }
 
-impl fmt::Debug for PluginConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Debug for PluginConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PluginConfig")
-            .field("api_key", &"[REDACTED]")
+            .field(
+                "api_key",
+                &(!self.api_key.is_empty()).then_some("[REDACTED]"),
+            )
             .field("product_slug", &self.product_slug)
             .field("api_base_url", &self.api_base_url)
-            .field("storage_prefix_configured", &self.storage_prefix.is_some())
-            .field("storage_path_configured", &self.storage_path.is_some())
+            .field("storage_prefix", &self.storage_prefix)
+            .field("storage_path", &self.storage_path)
             .field(
-                "device_identifier_configured",
-                &self.device_identifier.is_some(),
+                "device_identifier",
+                &self.device_identifier.as_ref().map(|_| "[REDACTED]"),
             )
             .field(
-                "signing_public_key_configured",
-                &self.signing_public_key.is_some(),
+                "send_fingerprint_components",
+                &self.send_fingerprint_components,
+            )
+            .field(
+                "signing_public_key",
+                &self.signing_public_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("signing_key_id", &self.signing_key_id)
             .field("auto_validate_interval", &self.auto_validate_interval)
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("network_recheck_interval", &self.network_recheck_interval)
             .field("timeout_seconds", &self.timeout_seconds)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay_seconds", &self.retry_delay_seconds)
             .field("verify_ssl", &self.verify_ssl)
             .field("offline_fallback_mode", &self.offline_fallback_mode)
             .field("max_offline_days", &self.max_offline_days)
+            .field("max_clock_skew_seconds", &self.max_clock_skew_seconds)
+            .field(
+                "offline_token_refresh_interval",
+                &self.offline_token_refresh_interval,
+            )
+            .field(
+                "enable_legacy_offline_tokens",
+                &self.enable_legacy_offline_tokens,
+            )
             .field("telemetry_enabled", &self.telemetry_enabled)
             .field("debug", &self.debug)
+            .field("emit_frontend_events", &self.emit_frontend_events)
             .field("app_version", &self.app_version)
             .field("app_build", &self.app_build)
             .finish()

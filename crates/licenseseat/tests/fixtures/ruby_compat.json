@@ -1,0 +1,67 @@
+{
+  "provenance": {
+    "issuer": "LicenseSeat Ruby core-compatible generator",
+    "canonical_json_source": "license_seat/lib/license_seat/utils/json_utils.rb",
+    "machine_file_contract_source": "license_seat/lib/license_seat/services/offline_machine_file.rb",
+    "seed_source": "RFC 8032 test vector 1",
+    "generated_by": "generate_ruby_compat_fixtures.rb"
+  },
+  "public_key": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+  "key_id": "ruby-fixture-key-v1",
+  "license_key": "RUBY-FIXTURE-LICENSE",
+  "product_slug": "ruby-fixture-product",
+  "fingerprint": "ruby-fixture-installation",
+  "activation_id": "act-12345-uuid",
+  "offline_token": {
+    "object": "offline_token",
+    "token": {
+      "entitlements": [
+        {
+          "expires_at": 3471292800,
+          "key": "pro-feature"
+        },
+        {
+          "expires_at": null,
+          "key": "perpetual-feature"
+        }
+      ],
+      "exp": 4070908800,
+      "fingerprint": "ruby-fixture-installation",
+      "iat": 1735689600,
+      "kid": "ruby-fixture-key-v1",
+      "license_expires_at": 4070908800,
+      "license_key": "RUBY-FIXTURE-LICENSE",
+      "metadata": {
+        "fractional": 0.125,
+        "issuer": "license_seat-ruby",
+        "large_float": 1e+20,
+        "nested": {
+          "a": 2,
+          "z": 1
+        },
+        "unicode": "Licença ✓"
+      },
+      "mode": "hardware_locked",
+      "nbf": 1735689600,
+      "plan_key": "pro",
+      "product_slug": "ruby-fixture-product",
+      "schema_version": 1,
+      "seat_limit": 1
+    },
+    "signature": {
+      "algorithm": "Ed25519",
+      "key_id": "ruby-fixture-key-v1",
+      "value": "ETqs7AoGoo6/eNZMYLYNz1biePWVPBHk9UDBwYn05t+DAVsIl53KmGa3bvIMswaUk2N3w5rfUDz/RJEx6gaHCw=="
+    },
+    "canonical": "{\"entitlements\":[{\"expires_at\":3471292800,\"key\":\"pro-feature\"},{\"expires_at\":null,\"key\":\"perpetual-feature\"}],\"exp\":4070908800,\"fingerprint\":\"ruby-fixture-installation\",\"iat\":1735689600,\"kid\":\"ruby-fixture-key-v1\",\"license_expires_at\":4070908800,\"license_key\":\"RUBY-FIXTURE-LICENSE\",\"metadata\":{\"fractional\":0.125,\"issuer\":\"license_seat-ruby\",\"large_float\":1e+20,\"nested\":{\"a\":2,\"z\":1},\"unicode\":\"Licença ✓\"},\"mode\":\"hardware_locked\",\"nbf\":1735689600,\"plan_key\":\"pro\",\"product_slug\":\"ruby-fixture-product\",\"schema_version\":1,\"seat_limit\":1}"
+  },
+  "machine_file": {
+    "certificate": "-----BEGIN MACHINE FILE-----\neyJlbmMiOiJvc2dzTVVSUGpZWVRQd2REVGlZM05KLXM3ZmxuaGktWm9VUk56WWNT\nTHVnaDRKSW53U1l3bDlVRTFWd2RWMy1sMERVMktUMjAxalVXdVF1LVd2SURVZFdS\nVmpocTNlM3FwMGZZOUdtRENCSGxldTg3UTNnbmZtUUxrQU95MDVkR1Y3aDR4RUl5\nMm9zeElkMDRKN1cycTRjMDY1V29jZkF5SkFzeWdoaW1XUTRfZklfUUlycjRBRUpR\nSDFkQmhXeUpLZFVCcnZ0OEE3ZHppeHJ3LS1zeDJwSFc2V2V3T0FYOU5fWGgtcFhj\ndGhpVDVZZzFlN2xiRkhpRTlEdWVjX0p2Yno4ME5UNUdTX3VfbVl6SDJESjNTaWYy\nQzJSQXNDblkyLXlaUXZ0cFdSMjNMb29BVmxHTHkyUFM1Z2NGcXh0TUIyUmMtaHRa\ndmpYQ0NJcWdTMThCekN0UFhaZmN1Y1hSUnFKdXdGdC13eWJQT0FZclJ0SVlkRloy\nVmdwR3hLcTl4R0UxSEhiNFBpTUFzR1ktVkQtVEFFQ3MzVmZUMllFT0xibEp6ekFE\nWDd2NzJ4THM5SVd2cWktTmZPbGNIai1ENDU5Ym92VjhQTlVGTmpjajg4STJ6QTFh\nMjFBVTV3Q1hPNU5oMEozMnRHYkNZSGVzZHFRd2dSTm1ndkthdzVkc0xNM2Z4enhB\nVWhIYlVhVDVwTEo5ZDVYTGpHN3EtT2tHZV9Wb2Nod3o4Y09nWnhrLTh4QmpMYXB0\nNTRZQWd1RHRlaTFWaENnaUp2UHFMd3BMdnFjMGNiakNMUTdZbU5sOFJqQ1VTcDBj\namZ6alp6bzFTQk50U2JoZ25hWnV1ZEg4NzNfVG9td1h2c2k3N21LRzNNbC14RmJS\nUjgxRmZIa2l4djBhU21PeEpmVDMxbGpaZXFtbmtXaHdjVDhJNUNfaUdGYl9TdlU4\nWVpsTWd5RlZMWUdJQ0taSllXQmlQYWlQZjdPZUtoTkVFbm5uaUMzVnAtSVBtWVZX\nT01qMms4Q1FDOF9KM2QtTWRvNmJUcF9WbVdQZjFKZVpiZDhHTmxIZDhCSkdTcGpQ\nVHZOTmdkRWVDdE5KQWRXV19ZQl8tQXNmU0hkRFF0QVREVGhFbjIyUklqdW81cTRa\neUI4S2VEelEzYXpzRHJld2RQdENVd0oyaUFvTEU0TDQ2bnZ4S2pwV0YzRUdvYjVi\nUGdKX1RGbFFtUU5WUG5FNGpQMkh0ekw5VE9uM1RNaHBMeXh5clJvSnhMUVd3MjFW\nZFFLXzViMU94ZW5nQ2NqdHROZWIydEZGM1NGZi1hYU82NUNtUlh3cUM4MFFkZVJv\ndURVbm9qUmFEX2E2OTg4cTdTUU9yZGpDelpHbjVNWExUSmZNaWpNRkhvR3F1dTNz\nOFBCWkQ1Tm1WM3dWZVM0SE1KdU95YjFXZTFUbHBuaUkyYmQtZTFTV01yaEpzWG5E\nYlJXVmJLOGEtUzNPWnFZUFE2MHBKTl9ZZk1oZVllUF9pUVdJM3ZpVUdOSHlVeWFE\nNmJZai1BOTAzUXA2X0hBSC11SW5jY2toclVuUDlXSl9sUWx0eFBlaGZqSGxGTmxt\nQmdvMUZpYXYwVkpPREY1YTR4MnZjNzdod2w5SjQxZ21hOHgzVXVOUzliYktCYTRU\neWtjWjJ5ZGt0dFN3d2lQVGRlSjJ2QXJmN0pfSkhVYzBRMFhGTVVwZWpWNUVqMHFm\naHR2OGxCR3lmYlFjemppckdDM1hGMUJvZ08zQk1lbzFacUNHb0paU19SWWgtYWFB\nV2E4Sm5FQmJ5VkxVMUttRHN5WEZtY0lkOWMxcVF4RmxNU1pweTFraDRsVGExR1Rk\nV3pzUEhpZTViNzFrMVJ0YTMzXy1TZUs1VXRsZHlWRDBKVFVKbGJJN055UDVsN21L\nZmc4d0pDbUIxLW5FQnVuc3VRdU1MWnJiWVR1MmVBMmVVQnFvM29oS25vRXpBU0lT\ncUxhb2pvTC1WMzFTY25ZOGVIbDktOFlldnY3OFFCZlJRTmtDOWoxU09DdDFucTBR\nbFpCVExabE1rdVR1cHc5bWNfWkh5eTg0TE1DMFhUd0VyMjI5bzk3SnRiUEtaYzdl\nSTdsaWFaOWVZQ2pkeTNaQk5EMnY3QnhDOGRjdkR4eGVfQ21YdkJySUdqYjhiOVJ6\nLkFRSURCQVVHQndnSkNnc00ueEVTdGtOQXQtNElJVGNYcEJMa2ljdyIsInNpZyI6\nImxUTFVaNjdXSXpsTl9QS1Bqd05OZlI0MmRiUmhsWTBzajM5WGhnV1VtMFR4bE9T\nM0NlZ1Q1NUpjT0pIcWFOX01KaDVGU1p1NzRIaHpBYWMzck55SUR3IiwiYWxnIjoi\nYWVzLTI1Ni1nY20rZWQyNTUxOSIsImtpZCI6InJ1YnktZml4dHVyZS1rZXktdjEi\nfQ==\n-----END MACHINE FILE-----",
+    "algorithm": "aes-256-gcm+ed25519",
+    "ttl": 2335219200,
+    "issued_at": "2025-01-01T00:00:00Z",
+    "expires_at": "2099-01-01T00:00:00Z",
+    "license_key": "RUBY-FIXTURE-LICENSE",
+    "fingerprint": "ruby-fixture-installation"
+  }
+}

@@ -1,6 +1,6 @@
 ## Default Permission
 
-Least-privilege permissions for normal end-user license lifecycle operations
+Least-privilege LicenseSeat lifecycle, status, and entitlement permissions
 
 #### This default permission set includes the following:
 
@@ -19,8 +19,6 @@ Least-privilege permissions for normal end-user license lifecycle operations
 - `allow-has-entitlement`
 - `allow-get-license`
 - `allow-get-state`
-- `allow-get-latest-release`
-- `allow-list-releases`
 
 ## Permission Table
 
@@ -781,6 +779,58 @@ Enables the verify_offline_token command without any pre-configured scope.
 <td>
 
 Denies the verify_offline_token command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`licenseseat:diagnostics`
+
+</td>
+<td>
+
+Health and detailed diagnostic state. The snapshot may contain license state, offline artifacts, and local filesystem paths, but never raw API or signing keys.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`licenseseat:advanced-lifecycle`
+
+</td>
+<td>
+
+Operations that target caller-supplied license/fingerprint pairs or destructively reset local state.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`licenseseat:offline-management`
+
+</td>
+<td>
+
+Raw offline artifact checkout, verification, refresh, and signing-key lookup commands.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`licenseseat:releases`
+
+</td>
+<td>
+
+Release discovery and license-bound download-token commands.
 
 </td>
 </tr>

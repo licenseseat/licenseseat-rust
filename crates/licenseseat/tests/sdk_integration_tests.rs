@@ -6,11 +6,12 @@
 use chrono::Utc;
 use licenseseat::{
     ClientStatus, Config, EntitlementReason, LicenseSeat, LicenseStatus, OfflineFallbackMode,
+    TrustedLicenseSource,
 };
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use wiremock::matchers::{header, method, path, path_regex, query_param};
+use wiremock::matchers::{body_partial_json, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[cfg(feature = "offline")]
@@ -46,9 +47,9 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
-        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix,
+        device_identifier: Some("device-123".into()),
         auto_validate_interval: Duration::from_secs(0), // Disable for tests
         heartbeat_interval: Duration::from_secs(0),     // Disable for tests
         offline_fallback_mode: OfflineFallbackMode::NetworkOnly,
@@ -59,6 +60,20 @@ fn test_config(base_url: &str) -> Config {
         telemetry_enabled: true,
         ..Default::default()
     }
+}
+
+#[cfg(feature = "offline")]
+fn cache_path_for(prefix: &str, key: &str) -> std::path::PathBuf {
+    let namespace = Sha256::digest(prefix.as_bytes());
+    let namespace = namespace
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    dirs::data_local_dir()
+        .or_else(dirs::data_dir)
+        .expect("application data dir")
+        .join("licenseseat")
+        .join(format!("v2_{namespace}__{key}.json"))
 }
 
 fn entitlement_json(key: &str) -> serde_json::Value {
@@ -292,6 +307,27 @@ fn build_machine_file_fixture_with_options(
     fingerprint: &str,
     embedded_license: Option<serde_json::Value>,
 ) -> (serde_json::Value, String) {
+    build_machine_file_fixture_with_timing(
+        license_key,
+        fingerprint,
+        embedded_license,
+        Utc::now() - chrono::Duration::minutes(1),
+        chrono::Duration::days(30).num_seconds(),
+        3600,
+        None,
+    )
+}
+
+#[cfg(feature = "offline")]
+fn build_machine_file_fixture_with_timing(
+    license_key: &str,
+    fingerprint: &str,
+    embedded_license: Option<serde_json::Value>,
+    issued_at: chrono::DateTime<Utc>,
+    ttl: i64,
+    grace_period: i64,
+    not_before_override: Option<i64>,
+) -> (serde_json::Value, String) {
     let signing_key = SigningKey::try_from(
         hex_to_bytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60").as_slice(),
     )
@@ -302,28 +338,26 @@ fn build_machine_file_fixture_with_options(
     let included = embedded_license
         .map(|license| json!([machine_file_license_json(&license)]))
         .unwrap_or_else(|| json!([]));
-
-    let now = chrono::DateTime::<Utc>::from_timestamp(Utc::now().timestamp(), 0).unwrap();
-    let expires_at = now + chrono::Duration::days(30);
+    let expires_at = issued_at + chrono::Duration::seconds(ttl);
 
     let payload = json!({
         "meta": {
             "schema_version": 2,
-            "issued": now.to_rfc3339(),
-            "iat": now.timestamp(),
+            "issued": issued_at.to_rfc3339(),
+            "iat": issued_at.timestamp(),
             "expiry": expires_at.to_rfc3339(),
             "exp": expires_at.timestamp(),
-            "nbf": now.timestamp(),
-            "ttl": 30 * 24 * 60 * 60,
-            "grace_period": 3600,
+            "nbf": not_before_override.unwrap_or_else(|| issued_at.timestamp()),
+            "ttl": ttl,
+            "grace_period": grace_period,
             "lic": license_key,
             "license_exp": null,
             "kid": "key-2026",
-            "sdk_version": "0.5.3"
+            "sdk_version": env!("CARGO_PKG_VERSION")
         },
         "data": {
             "type": "machines",
-            "id": "machine-123",
+            "id": "act-12345-uuid",
             "attributes": {
                 "fingerprint": fingerprint,
                 "fingerprint_components": {
@@ -391,8 +425,8 @@ fn build_machine_file_fixture_with_options(
                 "attributes": {
                     "certificate": certificate,
                     "algorithm": "aes-256-gcm+ed25519",
-                    "ttl": 30 * 24 * 60 * 60,
-                    "issued": now.to_rfc3339(),
+                    "ttl": ttl,
+                    "issued": issued_at.to_rfc3339(),
                     "expiry": expires_at.to_rfc3339()
                 },
                 "relationships": {
@@ -662,6 +696,7 @@ async fn test_product_slug_required() {
     let config = Config {
         api_key: "test-key".into(),
         product_slug: "".into(), // Empty product slug
+        api_base_url: "http://127.0.0.1:9".into(),
         ..Default::default()
     };
 
@@ -972,6 +1007,108 @@ async fn test_deactivate_key_uses_explicit_license_and_fingerprint() {
 }
 
 #[tokio::test]
+async fn stateless_deactivation_does_not_stop_or_clear_the_cached_license() {
+    let server = MockServer::start().await;
+    let active_key = "ACTIVE-LICENSE";
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response(active_key, "device-123")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/licenses/deactivate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "deactivation",
+            "activation_id": "other-activation",
+            "deactivated_at": Utc::now().to_rfc3339()
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    config.auto_validate_interval = Duration::from_secs(3_600);
+    config.heartbeat_interval = Duration::from_secs(3_600);
+    let sdk = LicenseSeat::try_new(config).unwrap();
+    sdk.activate(active_key).await.unwrap();
+    assert!(sdk.is_auto_validating());
+    assert!(sdk.is_heartbeat_running());
+
+    sdk.deactivate_key("OTHER-LICENSE", Some("other-installation"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sdk.current_license()
+            .as_ref()
+            .map(|license| license.license_key.as_str()),
+        Some(active_key)
+    );
+    assert!(sdk.is_license_state_trusted());
+    assert!(matches!(sdk.status(), LicenseStatus::Active { .. }));
+    assert!(sdk.is_auto_validating());
+    assert!(sdk.is_heartbeat_running());
+    sdk.reset();
+}
+
+#[tokio::test]
+async fn stateless_validation_does_not_supersede_active_license_validation() {
+    let server = MockServer::start().await;
+    let active_key = "ACTIVE-LICENSE";
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response(active_key, "device-123")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/licenses/validate"))
+        .and(body_partial_json(
+            json!({ "license_key": "ACTIVE-LICENSE" }),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(validation_with_entitlements(active_key)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/licenses/validate"))
+        .and(body_partial_json(json!({ "license_key": "OTHER-LICENSE" })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(validation_response(true, "OTHER-LICENSE")),
+        )
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::try_new(test_config(&server.uri())).unwrap();
+    sdk.activate(active_key).await.unwrap();
+
+    let active_validation = {
+        let sdk = sdk.clone();
+        tokio::spawn(async move { sdk.validate().await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let unrelated_validation = sdk.validate_key("OTHER-LICENSE").await.unwrap();
+
+    assert!(unrelated_validation.valid);
+    assert!(active_validation.await.unwrap().unwrap().valid);
+    assert_eq!(
+        sdk.current_license()
+            .as_ref()
+            .map(|license| license.license_key.as_str()),
+        Some(active_key)
+    );
+    assert!(sdk.has_entitlement("pro-features"));
+    assert!(matches!(sdk.status(), LicenseStatus::Active { .. }));
+}
+
+#[tokio::test]
 async fn test_deactivation_no_license() {
     // Use isolated config to avoid shared cache issues
     let config = test_config("http://localhost:9999");
@@ -998,7 +1135,7 @@ async fn test_status_inactive() {
 }
 
 #[tokio::test]
-async fn test_status_pending_before_validation() {
+async fn test_status_active_immediately_after_activation() {
     let server = MockServer::start().await;
     let license_key = "TEST-LICENSE-KEY";
 
@@ -1015,8 +1152,9 @@ async fn test_status_pending_before_validation() {
     let _ = sdk.activate(license_key).await.unwrap();
 
     let status = sdk.status();
-    // After activation but before validation, status should be pending
-    assert!(matches!(status, LicenseStatus::Pending { .. }));
+    // Activation is an authoritative online grant; a redundant validation is
+    // not required before the host can enable licensed functionality.
+    assert!(matches!(status, LicenseStatus::Active { .. }));
 }
 
 #[tokio::test]
@@ -1048,6 +1186,164 @@ async fn test_status_active_after_validation() {
     let status = sdk.status();
     assert!(matches!(status, LicenseStatus::Active { .. }));
     assert_eq!(sdk.get_client_status(), ClientStatus::Active);
+}
+
+#[tokio::test]
+async fn state_snapshot_is_internally_consistent_during_deactivation() {
+    let server = MockServer::start().await;
+    let license_key = "SNAPSHOT-LICENSE";
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response_with_license(
+                license_key,
+                "device-123",
+                license_json(
+                    license_key,
+                    "active",
+                    "pro",
+                    "hardware_locked",
+                    &["pro-features"],
+                    "Test App",
+                ),
+            )),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/deactivate"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(100))
+                .set_body_json(deactivation_response()),
+        )
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::try_new(test_config(&server.uri())).unwrap();
+    sdk.activate(license_key).await.unwrap();
+
+    let task = {
+        let sdk = sdk.clone();
+        tokio::spawn(async move { sdk.deactivate().await })
+    };
+
+    while !task.is_finished() {
+        assert_coherent_snapshot(&sdk);
+        tokio::task::yield_now().await;
+    }
+    task.await.unwrap().unwrap();
+    assert_coherent_snapshot(&sdk);
+}
+
+fn assert_coherent_snapshot(sdk: &LicenseSeat) {
+    let snapshot = sdk.state_snapshot();
+    match snapshot.client_status {
+        ClientStatus::Active => {
+            assert!(matches!(snapshot.status, LicenseStatus::Active { .. }));
+            assert!(snapshot.license.is_some());
+            assert!(
+                snapshot
+                    .validation
+                    .as_ref()
+                    .is_some_and(|value| value.valid)
+            );
+            assert_eq!(snapshot.active_entitlements.len(), 1);
+            assert_eq!(
+                snapshot.trusted_source,
+                Some(TrustedLicenseSource::OnlineResponse)
+            );
+        }
+        ClientStatus::Inactive => {
+            assert!(matches!(snapshot.status, LicenseStatus::Inactive { .. }));
+            assert!(snapshot.license.is_none());
+            assert!(snapshot.validation.is_none());
+            assert!(snapshot.active_entitlements.is_empty());
+            assert!(snapshot.trusted_source.is_none());
+        }
+        other => panic!("impossible mixed snapshot during deactivation: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn entitlement_expiry_notifies_subscribers_and_revokes_access_in_process() {
+    let server = MockServer::start().await;
+    let license_key = "EXPIRING-ENTITLEMENT-LICENSE";
+    let entitlement_expiry = Utc::now() + chrono::Duration::seconds(2);
+    let mut license = license_json(
+        license_key,
+        "active",
+        "pro",
+        "hardware_locked",
+        &[],
+        "Test App",
+    );
+    license["active_entitlements"] = json!([{
+        "key": "short-lived-feature",
+        "expires_at": entitlement_expiry.to_rfc3339(),
+        "metadata": null
+    }]);
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response_with_license(
+                license_key,
+                "device-123",
+                license,
+            )),
+        )
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::try_new(test_config(&server.uri())).unwrap();
+    sdk.activate(license_key).await.unwrap();
+    assert!(sdk.has_entitlement("short-lived-feature"));
+    let mut events = sdk.subscribe();
+
+    let wait_seconds = entitlement_expiry
+        .timestamp()
+        .saturating_sub(Utc::now().timestamp())
+        .saturating_add(1)
+        .max(1) as u64;
+    tokio::time::sleep(Duration::from_secs(wait_seconds)).await;
+
+    let entitlement = sdk.check_entitlement("short-lived-feature");
+    assert!(!entitlement.active);
+    assert_eq!(entitlement.reason, Some(EntitlementReason::Expired));
+    assert!(sdk.active_entitlements().is_empty());
+    assert!(matches!(sdk.status(), LicenseStatus::Active { .. }));
+
+    let transition = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.kind == licenseseat::EventKind::LicenseStateChanged {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("entitlement expiry state-change event");
+    let licenseseat::EventData::Validation(event_validation) =
+        transition.data.expect("state change validation payload")
+    else {
+        panic!("state change should carry the current validation");
+    };
+    assert!(event_validation.license.active_entitlements.is_empty());
+    assert!(
+        sdk.current_authoritative_validation()
+            .expect("authoritative validation")
+            .license
+            .active_entitlements
+            .is_empty(),
+        "every public authoritative snapshot must prune expired entitlements"
+    );
+    sdk.check_entitlement("short-lived-feature");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    while let Ok(event) = events.try_recv() {
+        assert_ne!(event.kind, licenseseat::EventKind::LicenseStateChanged);
+    }
 }
 
 // ============================================================================
@@ -1083,7 +1379,7 @@ async fn test_heartbeat_success() {
 
 #[cfg(feature = "offline")]
 #[tokio::test]
-async fn test_unsigned_cached_heartbeat_metadata_is_not_used_for_offline_authorization() {
+async fn test_offline_restore_does_not_reuse_unsigned_heartbeat_metadata() {
     let server = MockServer::start().await;
     let license_key = "TEST-LICENSE-KEY";
     let fingerprint = "stable-fingerprint-heartbeat-snapshot";
@@ -1140,11 +1436,21 @@ async fn test_unsigned_cached_heartbeat_metadata_is_not_used_for_offline_authori
 
     let sdk = LicenseSeat::new(online_config.clone());
     sdk.activate(license_key).await.unwrap();
-    assert!(matches!(sdk.status(), LicenseStatus::Pending { .. }));
+    assert!(matches!(sdk.status(), LicenseStatus::Active { .. }));
     let heartbeat = sdk.heartbeat().await.unwrap();
     assert_eq!(heartbeat.license.plan_key, "pro");
     assert_eq!(heartbeat.license.mode, "named_user");
     assert_eq!(heartbeat.license.active_entitlements.len(), 2);
+    assert!(sdk.has_entitlement("pro-features"));
+    assert!(sdk.has_entitlement("team-sync"));
+    assert_eq!(sdk.active_entitlements().len(), 2);
+    assert_eq!(
+        sdk.current_trusted_license_source(),
+        Some(licenseseat::TrustedLicenseSource::OnlineResponse)
+    );
+    let snapshot_path = cache_path_for(&online_config.storage_prefix, "license_snapshot");
+    assert!(!snapshot_path.exists());
+
     let machine_file = sdk
         .checkout_machine_file(license_key, Some(fingerprint), Some(30))
         .await
@@ -1165,15 +1471,177 @@ async fn test_unsigned_cached_heartbeat_metadata_is_not_used_for_offline_authori
     let restored_sdk = LicenseSeat::new(offline_config);
     let restore = restored_sdk.restore_license().await;
 
-    assert!(restore.restored);
+    assert!(restore.restored, "restore failed: {restore:?}");
     assert!(matches!(restore.status, LicenseStatus::OfflineValid { .. }));
     let validation = restore.validation.as_ref().unwrap();
     assert!(validation.valid);
     assert!(validation.offline);
-    assert!(validation.license.plan_key.is_empty());
+    assert_eq!(validation.license.plan_key, "");
     assert_eq!(validation.license.mode, "hardware_locked");
-    assert_eq!(validation.license.product.slug, "test-product");
+    assert_eq!(validation.license.product.name, "test-product");
     assert!(validation.license.active_entitlements.is_empty());
+    assert!(!snapshot_path.exists());
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn signed_offline_runtime_grant_expires_without_process_restart() {
+    let server = MockServer::start().await;
+    let license_key = "SHORT-LIVED-OFFLINE-LICENSE";
+    let fingerprint = "short-lived-offline-installation";
+    let embedded_license = license_json(
+        license_key,
+        "active",
+        "pro",
+        "hardware_locked",
+        &["pro-features"],
+        "Test Product",
+    );
+    let issued_at = Utc::now() - chrono::Duration::seconds(1);
+    let ttl = 6;
+    let authorization_deadline = issued_at.timestamp() + ttl;
+    let (machine_file_response, public_key_b64) = build_machine_file_fixture_with_timing(
+        license_key,
+        fingerprint,
+        Some(embedded_license.clone()),
+        issued_at,
+        ttl,
+        0,
+        None,
+    );
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response_with_license(
+                license_key,
+                fingerprint,
+                embedded_license,
+            )),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/licenses/machine-file"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
+        .mount(&server)
+        .await;
+
+    let mut online_config = test_config(&server.uri());
+    online_config.device_identifier = Some(fingerprint.into());
+    online_config.signing_public_key = Some(public_key_b64);
+    online_config.signing_key_id = Some("key-2026".into());
+
+    let online_sdk = LicenseSeat::try_new(online_config.clone()).unwrap();
+    online_sdk.activate(license_key).await.unwrap();
+    online_sdk
+        .checkout_machine_file(license_key, Some(fingerprint), Some(30))
+        .await
+        .unwrap();
+    drop(online_sdk);
+
+    let mut offline_config = online_config;
+    offline_config.api_base_url = "http://127.0.0.1:9".into();
+    offline_config.max_retries = 0;
+    offline_config.retry_delay = Duration::ZERO;
+    let offline_sdk = LicenseSeat::try_new(offline_config).unwrap();
+    let restored = offline_sdk.restore_license().await;
+    assert!(restored.restored);
+    assert!(matches!(
+        restored.status,
+        LicenseStatus::OfflineValid { .. }
+    ));
+    assert!(offline_sdk.has_entitlement("pro-features"));
+    let mut expiry_events = offline_sdk.subscribe();
+
+    let seconds_until_expired = authorization_deadline
+        .saturating_sub(Utc::now().timestamp())
+        .saturating_add(1)
+        .max(1) as u64;
+    tokio::time::sleep(Duration::from_secs(seconds_until_expired)).await;
+
+    assert!(offline_sdk.is_license_state_trusted());
+    assert!(matches!(
+        offline_sdk.status(),
+        LicenseStatus::OfflineInvalid { .. }
+    ));
+    assert_eq!(
+        offline_sdk.get_client_status(),
+        ClientStatus::OfflineInvalid
+    );
+    let validation = offline_sdk.get_status();
+    assert!(!validation.valid);
+    assert!(validation.offline);
+    assert_eq!(validation.code.as_deref(), Some("offline_artifact_expired"));
+    assert!(!offline_sdk.has_entitlement("pro-features"));
+    assert!(offline_sdk.active_entitlements().is_empty());
+    assert_eq!(
+        offline_sdk.current_trusted_license_source(),
+        Some(licenseseat::TrustedLicenseSource::SignedOfflineArtifact)
+    );
+    assert_eq!(
+        expiry_events.recv().await.unwrap().kind,
+        licenseseat::EventKind::OfflineValidationFailed
+    );
+    assert_eq!(
+        expiry_events.recv().await.unwrap().kind,
+        licenseseat::EventKind::ValidationOfflineFailed
+    );
+    assert!(expiry_events.try_recv().is_err());
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn machine_file_grace_cannot_resurrect_a_zero_width_validity_window() {
+    let server = MockServer::start().await;
+    let license_key = "ZERO-WINDOW-LICENSE";
+    let fingerprint = "zero-window-installation";
+    let issued_at = Utc::now() - chrono::Duration::minutes(2);
+    let ttl = 60;
+    let expires_at = issued_at.timestamp() + ttl;
+    let (machine_file_response, public_key_b64) = build_machine_file_fixture_with_timing(
+        license_key,
+        fingerprint,
+        Some(license_json(
+            license_key,
+            "active",
+            "pro",
+            "hardware_locked",
+            &["pro-features"],
+            "Test Product",
+        )),
+        issued_at,
+        ttl,
+        3600,
+        Some(expires_at),
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/licenses/machine-file"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    config.device_identifier = Some(fingerprint.into());
+    config.signing_public_key = Some(public_key_b64);
+    config.signing_key_id = Some("key-2026".into());
+    let sdk = LicenseSeat::try_new(config).unwrap();
+    let error = sdk
+        .checkout_machine_file(license_key, Some(fingerprint), Some(30))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+        error,
+        licenseseat::Error::OfflineVerificationFailed(ref code)
+            if code == "verification_failed"
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert!(sdk.current_machine_file().is_none());
+    assert!(!sdk.has_entitlement("pro-features"));
 }
 
 #[tokio::test]
@@ -1344,7 +1812,7 @@ async fn test_full_license_lifecycle() {
     // Activate
     let license = sdk.activate(license_key).await.unwrap();
     assert_eq!(license.license_key, license_key);
-    assert!(matches!(sdk.status(), LicenseStatus::Pending { .. }));
+    assert!(matches!(sdk.status(), LicenseStatus::Active { .. }));
 
     // Validate
     let validation = sdk.validate().await.unwrap();
@@ -1523,9 +1991,10 @@ async fn test_checkout_machine_file() {
         .await;
 
     let mut config = test_config(&server.uri());
+    config.device_identifier = Some(fingerprint.into());
     config.signing_public_key = Some(public_key_b64);
     config.signing_key_id = Some("key-2026".into());
-    let sdk = LicenseSeat::new(config);
+    let sdk = LicenseSeat::try_new(config).unwrap();
     let result = sdk
         .checkout_machine_file(license_key, Some(fingerprint), Some(45))
         .await
@@ -1599,9 +2068,10 @@ async fn test_checkout_machine_file_with_options_sends_extended_fields() {
         .await;
 
     let mut config = test_config(&server.uri());
+    config.device_identifier = Some(fingerprint.into());
     config.signing_public_key = Some(public_key_b64);
     config.signing_key_id = Some("key-2026".into());
-    let sdk = LicenseSeat::new(config);
+    let sdk = LicenseSeat::try_new(config).unwrap();
     let result = sdk
         .checkout_machine_file_with_options(
             license_key,
@@ -1637,6 +2107,105 @@ async fn test_checkout_machine_file_with_options_sends_extended_fields() {
         body["fingerprint_components"]["platform"].as_str(),
         Some("macos")
     );
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn test_automatic_machine_file_checkout_minimizes_hardware_data_by_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/licenses/machine-file"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "error": {
+                "code": "device_not_activated",
+                "message": "test response"
+            }
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let default_sdk = LicenseSeat::try_new(test_config(&server.uri())).unwrap();
+    assert!(
+        default_sdk
+            .checkout_machine_file("TEST-LICENSE-KEY", None, Some(30))
+            .await
+            .is_err()
+    );
+
+    let mut opted_in_config = test_config(&server.uri());
+    opted_in_config.send_fingerprint_components = true;
+    let opted_in_sdk = LicenseSeat::try_new(opted_in_config).unwrap();
+    assert!(
+        opted_in_sdk
+            .checkout_machine_file("TEST-LICENSE-KEY", None, Some(30))
+            .await
+            .is_err()
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let minimized: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let opted_in: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert!(minimized.get("fingerprint_components").is_none());
+    assert_eq!(
+        opted_in["fingerprint_components"]["schema_version"].as_str(),
+        Some("1")
+    );
+    assert!(opted_in["fingerprint_components"]["platform"].is_string());
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn test_offline_checkout_rejects_invalid_input_before_network_io() {
+    let server = MockServer::start().await;
+    let sdk = LicenseSeat::try_new(test_config(&server.uri())).unwrap();
+
+    for invalid_ttl in [0, -1] {
+        let error = sdk
+            .generate_offline_token("TEST-LICENSE-KEY", None, Some(invalid_ttl))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            licenseseat::Error::Configuration(ref message)
+                if message == "ttl_days must be greater than zero when provided"
+        ));
+    }
+
+    let blank_key_error = sdk
+        .checkout_machine_file(" \t", None, Some(30))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        blank_key_error,
+        licenseseat::Error::Configuration(ref message)
+            if message == "license_key is required"
+    ));
+
+    for (ttl_days, grace_period_days, expected_field) in [
+        (Some(0), None, "ttl_days"),
+        (Some(-7), None, "ttl_days"),
+        (None, Some(-7), "grace_period_days"),
+    ] {
+        let error = sdk
+            .checkout_machine_file_with_options(
+                "TEST-LICENSE-KEY",
+                licenseseat::MachineFileCheckoutOptions {
+                    ttl_days,
+                    grace_period_days,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            licenseseat::Error::Configuration(ref message)
+                if message.contains(expected_field)
+        ));
+    }
+
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[cfg(feature = "offline")]
@@ -1756,7 +2325,7 @@ async fn test_verify_machine_file_and_restore_offline() {
     let restored_sdk = LicenseSeat::new(offline_config);
     let restore = restored_sdk.restore_license().await;
 
-    assert!(restore.restored);
+    assert!(restore.restored, "restore failed: {restore:?}");
     assert!(matches!(restore.status, LicenseStatus::OfflineValid { .. }));
     assert!(restore.validation.as_ref().unwrap().valid);
     assert!(restore.validation.as_ref().unwrap().offline);
@@ -1764,187 +2333,8 @@ async fn test_verify_machine_file_and_restore_offline() {
 
 #[cfg(feature = "offline")]
 #[tokio::test]
-async fn test_zero_day_policy_disables_offline_sync_and_fallback() {
-    let server = MockServer::start().await;
-    let license_key = "TEST-LICENSE-KEY";
-    let fingerprint = "stable-fingerprint-offline-disabled";
-    let (machine_file_response, public_key_b64) =
-        build_machine_file_fixture(license_key, fingerprint);
-
-    Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(
-            ResponseTemplate::new(201).set_body_json(activation_response(license_key, fingerprint)),
-        )
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/products/test-product/licenses/machine-file"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
-        .mount(&server)
-        .await;
-
-    let mut config = test_config(&server.uri());
-    config.device_identifier = Some(fingerprint.into());
-    config.signing_public_key = Some(public_key_b64);
-    config.signing_key_id = Some("key-2026".into());
-    config.max_offline_days = 0;
-    config.offline_fallback_mode = OfflineFallbackMode::Always;
-
-    let sdk = LicenseSeat::new(config.clone());
-    sdk.activate(license_key).await.unwrap();
-
-    let sync_error = sdk.sync_offline_assets().await.unwrap_err();
-    assert!(
-        sync_error
-            .to_string()
-            .contains("offline validation is disabled")
-    );
-    let requests = server.received_requests().await.unwrap();
-    assert!(
-        requests
-            .iter()
-            .all(|request| !request.url.path().ends_with("/machine-file"))
-    );
-
-    // A caller can still inspect/check out a signed artifact explicitly, but
-    // local authorization must refuse to use it while policy is disabled.
-    sdk.checkout_machine_file(license_key, Some(fingerprint), Some(30))
-        .await
-        .unwrap();
-
-    config.api_base_url = "http://127.0.0.1:9".into();
-    config.max_retries = 0;
-    config.retry_delay = Duration::ZERO;
-    let restore = LicenseSeat::new(config).restore_license().await;
-
-    assert!(!restore.restored);
-    assert!(matches!(restore.status, LicenseStatus::Invalid { .. }));
-    assert!(restore.validation.is_none());
-}
-
-#[cfg(feature = "offline")]
-#[tokio::test]
-async fn test_fetched_signing_key_is_not_a_persisted_trust_anchor() {
-    let server = MockServer::start().await;
-    let license_key = "TEST-LICENSE-KEY";
-    let fingerprint = "stable-fingerprint-unpinned-key";
-    let (machine_file_response, public_key_b64) =
-        build_machine_file_fixture(license_key, fingerprint);
-
-    Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(
-            ResponseTemplate::new(201).set_body_json(activation_response(license_key, fingerprint)),
-        )
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/products/test-product/licenses/machine-file"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/signing_keys/key-2026"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "object": "signing_key",
-            "key_id": "key-2026",
-            "algorithm": "Ed25519",
-            "public_key": public_key_b64,
-            "created_at": null,
-            "status": "active"
-        })))
-        .mount(&server)
-        .await;
-
-    let mut online_config = test_config(&server.uri());
-    online_config.device_identifier = Some(fingerprint.into());
-    let sdk = LicenseSeat::new(online_config.clone());
-    sdk.activate(license_key).await.unwrap();
-    sdk.checkout_machine_file(license_key, Some(fingerprint), Some(30))
-        .await
-        .unwrap();
-
-    let mut offline_config = online_config;
-    offline_config.api_base_url = "http://127.0.0.1:9".into();
-    offline_config.max_retries = 0;
-    offline_config.retry_delay = Duration::ZERO;
-    let restored = LicenseSeat::new(offline_config).restore_license().await;
-
-    assert!(!restored.restored);
-    assert!(matches!(
-        restored.status,
-        LicenseStatus::OfflineInvalid { .. }
-    ));
-    assert!(restored.validation.is_some_and(|result| !result.valid));
-}
-
-#[cfg(feature = "offline")]
-#[tokio::test]
-async fn test_offline_validation_does_not_renew_last_online_validation_time() {
-    let server = MockServer::start().await;
-    let license_key = "TEST-LICENSE-KEY";
-    let fingerprint = "stable-fingerprint-grace-window";
-    let (machine_file_response, public_key_b64) =
-        build_machine_file_fixture(license_key, fingerprint);
-
-    Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(
-            ResponseTemplate::new(201).set_body_json(activation_response(license_key, fingerprint)),
-        )
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/products/test-product/licenses/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            validation_response_for_fingerprint(true, license_key, fingerprint),
-        ))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/products/test-product/licenses/machine-file"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
-        .mount(&server)
-        .await;
-
-    let mut config = test_config(&server.uri());
-    config.device_identifier = Some(fingerprint.into());
-    config.signing_public_key = Some(public_key_b64);
-    config.signing_key_id = Some("key-2026".into());
-    config.max_retries = 0;
-    config.retry_delay = Duration::ZERO;
-    config.max_offline_days = 7;
-    let sdk = LicenseSeat::new(config.clone());
-    sdk.activate(license_key).await.unwrap();
-    sdk.checkout_machine_file(license_key, Some(fingerprint), Some(30))
-        .await
-        .unwrap();
-    sdk.validate().await.unwrap();
-    let last_online_validation = sdk.current_license().unwrap().last_validated;
-
-    let mut offline_config = config;
-    offline_config.api_base_url = "http://127.0.0.1:9".into();
-    let offline_sdk = LicenseSeat::new(offline_config);
-    assert_eq!(
-        offline_sdk.current_license().unwrap().last_validated,
-        last_online_validation
-    );
-
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let offline = offline_sdk.validate().await.unwrap();
-
-    assert!(offline.valid);
-    assert!(offline.offline);
-    assert_eq!(
-        offline_sdk.current_license().unwrap().last_validated,
-        last_online_validation
-    );
-}
-
-#[cfg(feature = "offline")]
-#[tokio::test]
-async fn test_unsigned_cached_activation_metadata_is_not_used_for_offline_authorization() {
+async fn test_offline_restore_does_not_reuse_unsigned_activation_metadata_when_snapshot_is_missing()
+{
     let server = MockServer::start().await;
     let license_key = "TEST-LICENSE-KEY";
     let fingerprint = "stable-fingerprint-activation-only";
@@ -1984,7 +2374,9 @@ async fn test_unsigned_cached_activation_metadata_is_not_used_for_offline_author
 
     let sdk = LicenseSeat::new(online_config.clone());
     sdk.activate(license_key).await.unwrap();
-    assert!(matches!(sdk.status(), LicenseStatus::Pending { .. }));
+    assert!(matches!(sdk.status(), LicenseStatus::Active { .. }));
+    let snapshot_path = cache_path_for(&online_config.storage_prefix, "license_snapshot");
+    assert!(!snapshot_path.exists());
     let machine_file = sdk
         .checkout_machine_file(license_key, Some(fingerprint), Some(30))
         .await
@@ -2005,20 +2397,23 @@ async fn test_unsigned_cached_activation_metadata_is_not_used_for_offline_author
     let restored_sdk = LicenseSeat::new(offline_config);
     let restore = restored_sdk.restore_license().await;
 
-    assert!(restore.restored);
+    assert!(restore.restored, "restore failed: {restore:?}");
     assert!(matches!(restore.status, LicenseStatus::OfflineValid { .. }));
     let validation = restore.validation.as_ref().unwrap();
     assert!(validation.valid);
     assert!(validation.offline);
-    assert!(validation.license.plan_key.is_empty());
+    assert_eq!(validation.license.plan_key, "");
     assert_eq!(validation.license.mode, "hardware_locked");
     assert_eq!(validation.license.product.slug, "test-product");
+    assert_eq!(validation.license.product.name, "test-product");
     assert!(validation.license.active_entitlements.is_empty());
+    assert!(!snapshot_path.exists());
 }
 
 #[cfg(feature = "offline")]
 #[tokio::test]
-async fn test_unsigned_cached_validation_metadata_is_not_used_for_offline_authorization() {
+async fn test_offline_restore_does_not_reuse_unsigned_validation_metadata_when_snapshot_is_missing()
+{
     let server = MockServer::start().await;
     let license_key = "TEST-LICENSE-KEY";
     let fingerprint = "stable-fingerprint-123";
@@ -2059,6 +2454,9 @@ async fn test_unsigned_cached_validation_metadata_is_not_used_for_offline_author
     assert_eq!(online_validation.license.plan_key, "pro");
     assert_eq!(online_validation.license.product.slug, "test-product");
     assert_eq!(online_validation.license.active_entitlements.len(), 2);
+    let snapshot_path = cache_path_for(&online_config.storage_prefix, "license_snapshot");
+    assert!(!snapshot_path.exists());
+
     let machine_file = sdk
         .checkout_machine_file(license_key, Some(fingerprint), Some(30))
         .await
@@ -2079,14 +2477,16 @@ async fn test_unsigned_cached_validation_metadata_is_not_used_for_offline_author
     let restored_sdk = LicenseSeat::new(offline_config);
     let restore = restored_sdk.restore_license().await;
 
-    assert!(restore.restored);
+    assert!(restore.restored, "restore failed: {restore:?}");
     assert!(matches!(restore.status, LicenseStatus::OfflineValid { .. }));
     let validation = restore.validation.as_ref().unwrap();
     assert!(validation.valid);
     assert!(validation.offline);
-    assert!(validation.license.plan_key.is_empty());
+    assert_eq!(validation.license.plan_key, "");
     assert_eq!(validation.license.product.slug, "test-product");
+    assert_eq!(validation.license.product.name, "test-product");
     assert!(validation.license.active_entitlements.is_empty());
+    assert!(!snapshot_path.exists());
 }
 
 #[cfg(feature = "offline")]
@@ -2172,14 +2572,15 @@ async fn test_restore_offline_prefers_embedded_machine_file_license_over_cached_
     let restored_sdk = LicenseSeat::new(offline_config);
     let restore = restored_sdk.restore_license().await;
 
-    assert!(restore.restored);
+    assert!(restore.restored, "restore failed: {restore:?}");
     assert!(matches!(restore.status, LicenseStatus::OfflineValid { .. }));
     let validation = restore.validation.as_ref().unwrap();
     assert!(validation.valid);
     assert!(validation.offline);
     assert_eq!(validation.license.plan_key, "starter");
     assert_eq!(validation.license.mode, "floating");
-    // Machine-file schema v2 signs the product slug, not the mutable display name.
+    // The server's v2 embedded-license schema intentionally carries the
+    // product slug, not mutable display metadata such as the product name.
     assert_eq!(validation.license.product.name, "test-product");
     assert_eq!(validation.license.active_entitlements.len(), 1);
     assert_eq!(
@@ -2238,13 +2639,14 @@ async fn test_valid_validation_for_another_key_cannot_replace_current_authorizat
 
     let sdk = LicenseSeat::new(test_config(&server.uri()));
     sdk.activate("CURRENT-KEY").await.unwrap();
+    let original = sdk.current_license().unwrap();
     let other = sdk.validate_key("OTHER-KEY").await.unwrap();
 
     assert!(other.valid);
     assert_eq!(other.license.key, "OTHER-KEY");
-    assert!(sdk.current_license().unwrap().validation.is_none());
+    assert_eq!(sdk.current_license(), Some(original));
     assert!(!sdk.has_entitlement("pro-features"));
-    assert!(matches!(sdk.status(), LicenseStatus::Pending { .. }));
+    assert!(matches!(sdk.status(), LicenseStatus::Active { .. }));
 }
 
 #[tokio::test]
@@ -2269,12 +2671,13 @@ async fn test_valid_validation_requires_matching_activation_proof() {
 
     let sdk = LicenseSeat::new(test_config(&server.uri()));
     sdk.activate("TEST-LICENSE-KEY").await.unwrap();
+    let original = sdk.current_license().unwrap();
 
     assert!(matches!(
         sdk.validate().await,
         Err(licenseseat::Error::InvalidResponse(_))
     ));
-    assert!(sdk.current_license().unwrap().validation.is_none());
+    assert_eq!(sdk.current_license(), Some(original));
     assert!(!sdk.has_entitlement("pro-features"));
 }
 
@@ -2325,7 +2728,7 @@ async fn test_mismatched_deactivation_response_does_not_clear_current_license() 
 
     assert!(matches!(
         sdk.deactivate().await,
-        Err(licenseseat::Error::InvalidResponse(_))
+        Err(licenseseat::Error::ResponseMismatch(_))
     ));
     assert!(sdk.current_license().is_some());
 }
@@ -2424,7 +2827,7 @@ async fn test_malformed_health_and_release_responses_fail_closed() {
     assert!(sdk.last_health_error().is_some());
     assert!(matches!(
         sdk.get_latest_release(None, None, None).await,
-        Err(licenseseat::Error::InvalidResponse(_))
+        Err(licenseseat::Error::ResponseMismatch(_))
     ));
 }
 
@@ -2492,16 +2895,12 @@ async fn test_signed_machine_file_is_bound_to_configured_product() {
     other_product_config.signing_key_id = Some("key-2026".into());
     let other_product_sdk = LicenseSeat::new(other_product_config);
 
-    assert!(matches!(
-        other_product_sdk.inspect_machine_file(
-            &machine_file,
-            None,
-            Some(license_key),
-            Some(fingerprint)
-        ),
-        Err(licenseseat::Error::OfflineVerificationFailed(message))
-            if message == "PRODUCT_MISMATCH"
-    ));
+    let verification = other_product_sdk
+        .inspect_machine_file(&machine_file, None, Some(license_key), Some(fingerprint))
+        .unwrap();
+    assert!(!verification.valid);
+    assert_eq!(verification.code.as_deref(), Some("product_mismatch"));
+    assert!(verification.payload.is_none());
 }
 
 #[tokio::test]

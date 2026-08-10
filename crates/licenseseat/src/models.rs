@@ -269,9 +269,17 @@ pub struct License {
     pub activation_id: String,
     /// When the license was activated.
     pub activated_at: DateTime<Utc>,
-    /// When the license was last validated online or offline.
+    /// When the license was last validated by the authoritative online API.
+    ///
+    /// Offline verification deliberately does not advance this timestamp. This
+    /// preserves a non-sliding record of the last online decision for hosts that
+    /// use it in their own policy or diagnostics.
     pub last_validated: DateTime<Utc>,
-    /// Last trusted rich license metadata seen from an online response.
+    /// Last rich license metadata seen from an online response.
+    ///
+    /// This field is persisted for compatibility and diagnostics. Persistence
+    /// is unsigned, so callers must not use it as authorization after process
+    /// restart. Use the SDK's status and entitlement APIs instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_license: Option<LicenseResponse>,
     /// Current validation state.
@@ -284,10 +292,41 @@ impl License {
     pub fn fingerprint(&self) -> &str {
         &self.device_id
     }
+
+    /// Return the immutable fields that identify this exact cached activation.
+    pub fn identity(&self) -> LicenseIdentity {
+        LicenseIdentity::from(self)
+    }
+}
+
+/// Immutable identity of one cached activation.
+///
+/// A license key alone is insufficient to correlate asynchronous responses: the
+/// same key can be activated again with a different fingerprint or activation ID
+/// while an older request is still in flight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LicenseIdentity {
+    /// License key bound to the activation.
+    pub license_key: String,
+    /// Canonical installation fingerprint bound to the activation.
+    pub fingerprint: String,
+    /// Server activation identifier.
+    pub activation_id: String,
+}
+
+impl From<&License> for LicenseIdentity {
+    fn from(license: &License) -> Self {
+        Self {
+            license_key: license.license_key.clone(),
+            fingerprint: license.device_id.clone(),
+            activation_id: license.activation_id.clone(),
+        }
+    }
 }
 
 /// License status enum for easy status checking.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum LicenseStatus {
     /// No license is activated.
     Inactive {
@@ -328,19 +367,33 @@ impl LicenseStatus {
     }
 }
 
-/// Source of trusted rich license metadata used for offline recovery.
+/// Source of the authoritative license state held by the current process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum TrustedLicenseSource {
-    /// Legacy compatibility value. Snapshot files are no longer trusted.
+    /// Legacy diagnostic value for a dedicated unsigned snapshot file.
+    ///
+    /// Unsigned persisted snapshots are no longer returned as authoritative
+    /// runtime state.
     SnapshotFile,
-    /// Rich metadata came from the cached license record itself.
+    /// Legacy diagnostic value for an unsigned cached license record.
+    ///
+    /// Unsigned persisted records are no longer returned as authoritative
+    /// runtime state.
     CachedLicense,
+    /// State was established by an authenticated online API response.
+    OnlineResponse,
+    /// State was established by a locally verified signed offline artifact.
+    SignedOfflineArtifact,
+    /// State is an authoritative or conservative fail-closed denial.
+    FailClosedDenial,
 }
 
 /// Summary status for the overall SDK/client state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ClientStatus {
     /// Online-validated license.
     Active,
@@ -376,6 +429,31 @@ impl std::fmt::Display for ClientStatus {
     }
 }
 
+/// A coherent point-in-time view of the license decision held by this SDK.
+///
+/// The fields in this value are derived from one runtime-state observation.
+/// This prevents consumers from combining a status from one license operation
+/// with validation or entitlement data committed by another operation.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct LicenseStateSnapshot {
+    /// Rich status derived from the observed decision.
+    pub status: LicenseStatus,
+    /// Compact status derived from [`Self::status`].
+    pub client_status: ClientStatus,
+    /// Whether the most recent API operation considered the service reachable.
+    pub is_online: bool,
+    /// Runtime-established license, or an untrusted persisted restoration
+    /// candidate when no runtime decision exists yet.
+    pub license: Option<License>,
+    /// Process-authoritative validation decision, if one has been established.
+    pub validation: Option<ValidationResult>,
+    /// Unexpired entitlements from the same active decision.
+    pub active_entitlements: Vec<Entitlement>,
+    /// Source that established the process-authoritative decision.
+    pub trusted_source: Option<TrustedLicenseSource>,
+}
+
 /// Details for an active license.
 #[derive(Clone, PartialEq)]
 pub struct LicenseStatusDetails {
@@ -406,6 +484,7 @@ pub struct EntitlementStatus {
 
 /// Reason why an entitlement is not active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EntitlementReason {
     /// No license is activated.
     NoLicense,
@@ -413,6 +492,11 @@ pub enum EntitlementReason {
     NotFound,
     /// Entitlement has expired.
     Expired,
+    /// A license exists, but its latest validation is not an active grant.
+    ///
+    /// Kept after the original variants so their numeric discriminants remain
+    /// stable for compatibility with callers that cast this field.
+    InvalidLicense,
 }
 
 /// Result of restoring a cached license session.
@@ -513,7 +597,7 @@ pub struct OfflineEntitlement {
     /// Entitlement key.
     pub key: String,
     /// Expiration (Unix timestamp).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub expires_at: Option<i64>,
 }
 
@@ -526,7 +610,7 @@ pub struct OfflineTokenSignature {
     /// Key ID for public key lookup.
     #[serde(alias = "kid")]
     pub key_id: String,
-    /// Base64URL-encoded signature value.
+    /// Standard Base64-encoded signature value used by legacy offline tokens.
     pub value: String,
 }
 
@@ -619,7 +703,7 @@ pub struct MachineFilePayload {
     /// License key.
     #[serde(default)]
     pub license_key: String,
-    /// Product slug from the signed machine relationship.
+    /// Product slug bound through the machine relationship.
     #[serde(default)]
     pub product_slug: String,
     /// Underlying license expiration.
@@ -658,15 +742,25 @@ pub struct MachineFilePayload {
 }
 
 impl MachineFilePayload {
-    /// Check whether an entitlement is active in this payload.
+    /// Check whether an entitlement is currently active in this verified
+    /// payload's embedded license.
+    ///
+    /// This is a convenience for payloads returned by machine-file
+    /// verification; it does not independently verify a raw payload.
     pub fn has_entitlement(&self, entitlement_key: &str) -> bool {
+        let now = Utc::now();
         self.license
             .as_ref()
+            .filter(|license| {
+                license.status.eq_ignore_ascii_case("active")
+                    && license.starts_at.is_none_or(|start| start <= now)
+                    && license.expires_at.is_none_or(|expiry| expiry > now)
+            })
             .map(|license| {
-                license
-                    .active_entitlements
-                    .iter()
-                    .any(|entitlement| entitlement.key == entitlement_key)
+                license.active_entitlements.iter().any(|entitlement| {
+                    entitlement.key == entitlement_key
+                        && entitlement.expires_at.is_none_or(|expiry| expiry > now)
+                })
             })
             .unwrap_or(false)
     }

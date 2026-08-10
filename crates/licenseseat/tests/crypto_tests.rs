@@ -3,6 +3,8 @@
 //! These tests include RFC 8032 test vectors and mirror the comprehensive
 //! crypto tests from C++ and C# SDKs.
 
+#![cfg(feature = "offline")]
+
 use base64::Engine;
 
 // ============================================================================

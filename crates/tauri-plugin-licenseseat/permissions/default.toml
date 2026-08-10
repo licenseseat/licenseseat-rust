@@ -1,5 +1,5 @@
 [default]
-description = "Least-privilege permissions for normal end-user license lifecycle operations"
+description = "Least-privilege LicenseSeat lifecycle, status, and entitlement permissions"
 permissions = [
     "allow-activate",
     "allow-validate",
@@ -16,6 +16,4 @@ permissions = [
     "allow-has-entitlement",
     "allow-get-license",
     "allow-get-state",
-    "allow-get-latest-release",
-    "allow-list-releases",
 ]

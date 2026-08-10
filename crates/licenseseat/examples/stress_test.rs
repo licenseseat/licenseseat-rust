@@ -31,6 +31,8 @@ use licenseseat::{
     Config, EntitlementReason, EventKind, LicenseSeat, LicenseStatus, OfflineFallbackMode,
 };
 use std::env;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -84,8 +86,9 @@ enum ScenarioResult {
     Fail,
 }
 
-type ScenarioFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ScenarioResult> + Send>>;
-type Scenario = (u32, &'static str, fn(TestContext) -> ScenarioFuture);
+type ScenarioFuture = Pin<Box<dyn Future<Output = ScenarioResult> + Send>>;
+type ScenarioFunction = fn(TestContext) -> ScenarioFuture;
+type Scenario = (u32, &'static str, ScenarioFunction);
 
 impl ScenarioResult {
     fn symbol(&self) -> &'static str {

@@ -3,8 +3,15 @@
 //! These tests verify caching behavior through the public SDK API.
 //! The internal cache module is tested indirectly via SDK operations.
 
+mod common;
+
+use common::{
+    activation_responder, activation_responder_with_entitlements, validation_responder,
+    validation_responder_with_entitlements,
+};
 use licenseseat::{Config, LicenseSeat, LicenseStatus};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -29,9 +36,9 @@ fn test_config(base_url: &str) -> Config {
     Config {
         api_key: "test-api-key".into(),
         product_slug: "test-product".into(),
-        device_identifier: Some("device-123".into()),
         api_base_url: base_url.into(),
         storage_prefix: unique_prefix(),
+        device_identifier: Some("device-123".into()),
         auto_validate_interval: Duration::from_secs(0),
         heartbeat_interval: Duration::from_secs(0),
         debug: true,
@@ -40,79 +47,16 @@ fn test_config(base_url: &str) -> Config {
 }
 
 fn cache_path(prefix: &str, key: &str) -> std::path::PathBuf {
-    dirs::cache_dir()
-        .expect("cache dir")
+    let namespace = Sha256::digest(prefix.as_bytes());
+    let namespace = namespace
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    dirs::data_local_dir()
+        .or_else(dirs::data_dir)
+        .expect("application data dir")
         .join("licenseseat")
-        .join(format!("{prefix}{key}.json"))
-}
-
-fn activation_response(license_key: &str) -> serde_json::Value {
-    json!({
-        "object": "activation",
-        "id": "act-12345-uuid",
-        "device_id": "device-123",
-        "device_name": "Test Device",
-        "license_key": license_key,
-        "activated_at": "2025-01-01T00:00:00Z",
-        "deactivated_at": null,
-        "ip_address": "127.0.0.1",
-        "metadata": null,
-        "license": {
-            "object": "license",
-            "key": license_key,
-            "status": "active",
-            "starts_at": null,
-            "expires_at": null,
-            "mode": "hardware_locked",
-            "plan_key": "pro",
-            "seat_limit": 5,
-            "active_seats": 1,
-            "active_entitlements": [],
-            "metadata": null,
-            "product": {
-                "slug": "test-product",
-                "name": "Test App"
-            }
-        }
-    })
-}
-
-fn validation_response(license_key: &str) -> serde_json::Value {
-    json!({
-        "object": "validation_result",
-        "valid": true,
-        "code": null,
-        "message": null,
-        "warnings": null,
-        "license": {
-            "object": "license",
-            "key": license_key,
-            "status": "active",
-            "starts_at": null,
-            "expires_at": null,
-            "mode": "hardware_locked",
-            "plan_key": "pro",
-            "seat_limit": 5,
-            "active_seats": 1,
-            "active_entitlements": [],
-            "metadata": null,
-            "product": {
-                "slug": "test-product",
-                "name": "Test App"
-            }
-        },
-        "activation": {
-            "object": "activation",
-            "id": "act-12345-uuid",
-            "device_id": "device-123",
-            "device_name": "Test Device",
-            "license_key": license_key,
-            "activated_at": "2025-01-01T00:00:00Z",
-            "deactivated_at": null,
-            "ip_address": "127.0.0.1",
-            "metadata": null
-        }
-    })
+        .join(format!("v2_{namespace}__{key}.json"))
 }
 
 fn deactivation_response() -> serde_json::Value {
@@ -133,7 +77,7 @@ async fn test_license_cached_after_activation() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("TEST-KEY")))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
@@ -157,7 +101,7 @@ async fn test_license_cleared_after_deactivation() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("TEST-KEY")))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
@@ -182,7 +126,7 @@ async fn test_license_cleared_on_reset() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("TEST-KEY")))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
@@ -205,13 +149,13 @@ async fn test_validation_result_cached() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("TEST-KEY")))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(validation_response("TEST-KEY")))
+        .respond_with(validation_responder())
         .mount(&server)
         .await;
 
@@ -219,9 +163,15 @@ async fn test_validation_result_cached() {
 
     sdk.activate("TEST-KEY").await.unwrap();
 
-    // Before validation, no validation result
+    // Activation is itself a successful online validation and must immediately
+    // establish trusted state rather than leaving the SDK in Pending.
     let license_before = sdk.current_license().unwrap();
-    assert!(license_before.validation.is_none());
+    assert!(
+        license_before
+            .validation
+            .as_ref()
+            .is_some_and(|result| result.valid)
+    );
 
     // After validation, result is stored
     sdk.validate().await.unwrap();
@@ -236,13 +186,13 @@ async fn test_validation_updates_last_validated_time() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("TEST-KEY")))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(validation_response("TEST-KEY")))
+        .respond_with(validation_responder())
         .mount(&server)
         .await;
 
@@ -269,11 +219,7 @@ async fn test_different_prefixes_isolated() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(|request: &wiremock::Request| {
-            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-            let key = body["license_key"].as_str().unwrap();
-            ResponseTemplate::new(201).set_body_json(activation_response(key))
-        })
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
@@ -305,7 +251,7 @@ async fn test_same_prefix_shares_cache() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("SHARED-KEY")))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
@@ -345,7 +291,7 @@ async fn test_license_persists_across_sdk_instances() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("PERSIST-KEY")))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
@@ -394,13 +340,13 @@ async fn test_persisted_validation_requires_revalidation_after_restart() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("PERSIST-KEY")))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(validation_response("PERSIST-KEY")))
+        .respond_with(validation_responder())
         .mount(&server)
         .await;
 
@@ -442,9 +388,137 @@ async fn test_persisted_validation_requires_revalidation_after_restart() {
     }
 }
 
+#[tokio::test]
+async fn test_persisted_unsigned_validation_requires_runtime_restoration() {
+    let server = MockServer::start().await;
+    let entitlements = vec![json!({
+        "key": "licensed-feature",
+        "expires_at": null,
+        "metadata": null
+    })];
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(activation_responder_with_entitlements(entitlements.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(validation_responder_with_entitlements(entitlements))
+        .mount(&server)
+        .await;
+
+    let config = test_config(&server.uri());
+    let first = LicenseSeat::try_new(config.clone()).unwrap();
+    first.activate("RESTORE-KEY").await.unwrap();
+    assert!(first.is_license_state_trusted());
+    assert!(first.has_entitlement("licensed-feature"));
+    drop(first);
+
+    let restored_process = LicenseSeat::try_new(config).unwrap();
+    assert!(restored_process.current_license().is_some());
+    assert!(!restored_process.is_license_state_trusted());
+    assert!(matches!(
+        restored_process.status(),
+        licenseseat::LicenseStatus::Pending { .. }
+    ));
+    assert!(!restored_process.get_status().valid);
+    assert!(!restored_process.has_entitlement("licensed-feature"));
+    assert!(restored_process.active_entitlements().is_empty());
+
+    restored_process.validate().await.unwrap();
+    assert!(restored_process.is_license_state_trusted());
+    assert!(restored_process.has_entitlement("licensed-feature"));
+}
+
+#[tokio::test]
+async fn mutating_persisted_json_cannot_change_live_runtime_entitlements() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(activation_responder_with_entitlements(vec![json!({
+            "key": "licensed-feature",
+            "expires_at": null,
+            "metadata": null
+        })]))
+        .mount(&server)
+        .await;
+
+    let config = test_config(&server.uri());
+    let sdk = LicenseSeat::try_new(config.clone()).unwrap();
+    sdk.activate("TAMPER-KEY").await.unwrap();
+    assert!(sdk.has_entitlement("licensed-feature"));
+
+    let path = cache_path(&config.storage_prefix, "license");
+    let mut persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    persisted["validation"]["license"]["active_entitlements"] = json!([{
+        "key": "attacker-feature",
+        "expires_at": null,
+        "metadata": null
+    }]);
+    std::fs::write(&path, serde_json::to_vec_pretty(&persisted).unwrap()).unwrap();
+
+    assert!(sdk.is_license_state_trusted());
+    assert!(sdk.has_entitlement("licensed-feature"));
+    assert!(!sdk.has_entitlement("attacker-feature"));
+    assert_eq!(
+        sdk.active_entitlements()
+            .into_iter()
+            .map(|entitlement| entitlement.key)
+            .collect::<Vec<_>>(),
+        vec!["licensed-feature"]
+    );
+
+    drop(sdk);
+    let next_process = LicenseSeat::try_new(config).unwrap();
+    assert!(!next_process.is_license_state_trusted());
+    assert!(!next_process.has_entitlement("attacker-feature"));
+    assert!(matches!(
+        next_process.status(),
+        licenseseat::LicenseStatus::Pending { .. }
+    ));
+}
+
+#[tokio::test]
+async fn test_active_entitlement_listing_filters_expired_items() {
+    let server = MockServer::start().await;
+    let expired = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+    let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(activation_responder_with_entitlements(vec![
+            json!({"key": "expired", "expires_at": expired, "metadata": null}),
+            json!({"key": "active", "expires_at": future, "metadata": null}),
+        ]))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::try_new(test_config(&server.uri())).unwrap();
+    sdk.activate("ENTITLEMENT-LIST-KEY").await.unwrap();
+    assert_eq!(
+        sdk.active_entitlements()
+            .into_iter()
+            .map(|entitlement| entitlement.key)
+            .collect::<Vec<_>>(),
+        vec!["active"]
+    );
+    let status_entitlements = match sdk.status() {
+        licenseseat::LicenseStatus::Active { details } => details.entitlements,
+        status => panic!("expected active status, got {status:?}"),
+    };
+    assert_eq!(
+        status_entitlements
+            .into_iter()
+            .map(|entitlement| entitlement.key)
+            .collect::<Vec<_>>(),
+        vec!["active"]
+    );
+}
+
 #[cfg(feature = "offline")]
 #[test]
-fn test_legacy_cached_validation_is_not_a_trust_anchor() {
+fn test_legacy_cached_validation_is_never_promoted_to_runtime_trust() {
     let prefix = unique_prefix();
     let license_path = cache_path(&prefix, "license");
     std::fs::create_dir_all(license_path.parent().expect("cache parent")).unwrap();
@@ -499,10 +573,92 @@ fn test_legacy_cached_validation_is_not_a_trust_anchor() {
         ..Default::default()
     });
 
+    assert!(sdk.current_license().is_some());
     assert!(sdk.current_trusted_license().is_none());
     assert!(sdk.current_trusted_license_source().is_none());
-    assert!(sdk.current_license().unwrap().validation.is_none());
-    assert!(matches!(sdk.status(), LicenseStatus::Pending { .. }));
+    assert!(!sdk.is_license_state_trusted());
+    assert!(!sdk.has_entitlement("anything"));
+    assert!(matches!(
+        sdk.status(),
+        licenseseat::LicenseStatus::Pending { .. }
+    ));
+}
+
+#[tokio::test]
+async fn short_fingerprint_cached_activation_can_validate_and_deactivate() {
+    // An activation cached before the 8-character fingerprint floor existed
+    // (or created by another SDK without it) must stay fully operable: its
+    // identifier is adopted, and validation/deactivation keep using the exact
+    // fingerprint that consumed the seat. The floor continues to apply to new
+    // configuration input (see configuration_security_tests.rs).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(validation_responder())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/deactivate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(deactivation_response()))
+        .mount(&server)
+        .await;
+
+    let prefix = unique_prefix();
+    let license_path = cache_path(&prefix, "license");
+    std::fs::create_dir_all(license_path.parent().expect("cache parent")).unwrap();
+    let cached_license = json!({
+        "license_key": "TEST-KEY",
+        "device_id": "dev-1",
+        "activation_id": "act-12345-uuid",
+        "activated_at": "2025-01-01T00:00:00Z",
+        "last_validated": "2025-01-02T00:00:00Z"
+    });
+    std::fs::write(
+        &license_path,
+        serde_json::to_string_pretty(&cached_license).unwrap(),
+    )
+    .unwrap();
+
+    let sdk = LicenseSeat::try_new(Config {
+        api_key: "test-api-key".into(),
+        product_slug: "test-product".into(),
+        api_base_url: server.uri(),
+        storage_prefix: prefix,
+        auto_validate_interval: Duration::from_secs(0),
+        heartbeat_interval: Duration::from_secs(0),
+        debug: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        sdk.fingerprint(),
+        "dev-1",
+        "the cached activation's short identifier must be adopted, not replaced"
+    );
+
+    let validation = sdk.validate().await.unwrap();
+    assert!(validation.valid);
+
+    sdk.deactivate().await.unwrap();
+    assert!(sdk.current_license().is_none());
+
+    let requests = server.received_requests().await.unwrap();
+    let device_ids: Vec<String> = requests
+        .iter()
+        .filter(|request| {
+            let path = request.url.path();
+            path.contains("/validate") || path.contains("/deactivate")
+        })
+        .map(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body["device_id"].as_str().unwrap_or_default().to_string()
+        })
+        .collect();
+    assert_eq!(
+        device_ids,
+        vec!["dev-1".to_string(), "dev-1".to_string()],
+        "requests must target the exact fingerprint that consumed the seat"
+    );
 }
 
 // ============================================================================
@@ -515,13 +671,13 @@ async fn test_concurrent_status_reads() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("TEST-KEY")))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(validation_response("TEST-KEY")))
+        .respond_with(validation_responder())
         .mount(&server)
         .await;
 
@@ -649,14 +805,14 @@ async fn test_license_data_integrity() {
             "key": "CUSTOM-LICENSE-KEY",
             "status": "active",
             "starts_at": "2025-01-01T00:00:00Z",
-            "expires_at": "2030-01-01T00:00:00Z",
+            "expires_at": "2099-01-01T00:00:00Z",
             "mode": "floating",
             "plan_key": "enterprise",
             "seat_limit": 100,
             "active_seats": 42,
             "active_entitlements": [
                 {"key": "premium", "expires_at": null, "metadata": null},
-                {"key": "analytics", "expires_at": "2029-12-31T23:59:59Z", "metadata": null}
+                {"key": "analytics", "expires_at": "2098-12-31T23:59:59Z", "metadata": null}
             ],
             "metadata": {"org_id": "12345"},
             "product": {
@@ -672,11 +828,10 @@ async fn test_license_data_integrity() {
         .mount(&server)
         .await;
 
-    let sdk = LicenseSeat::new(Config {
-        product_slug: "custom-product".into(),
-        device_identifier: Some("custom-device-id".into()),
-        ..test_config(&server.uri())
-    });
+    let mut config = test_config(&server.uri());
+    config.product_slug = "custom-product".into();
+    config.device_identifier = Some("custom-device-id".into());
+    let sdk = LicenseSeat::new(config);
     sdk.activate("CUSTOM-LICENSE-KEY").await.unwrap();
 
     let license = sdk.current_license().unwrap();
@@ -692,7 +847,7 @@ async fn test_entitlements_preserved_in_cache() {
 
     let entitlements = vec![
         json!({"key": "feature-1", "expires_at": null, "metadata": null}),
-        json!({"key": "feature-2", "expires_at": "2025-12-31T00:00:00Z", "metadata": null}),
+        json!({"key": "feature-2", "expires_at": "2099-12-31T00:00:00Z", "metadata": null}),
         json!({"key": "feature-3", "expires_at": null, "metadata": {"limit": 500}}),
     ];
 
@@ -718,12 +873,19 @@ async fn test_entitlements_preserved_in_cache() {
         .mount(&server)
         .await;
 
-    // Use a future date (2027) to ensure entitlement is not expired
+    // Use a deliberately distant date so this test does not decay with time.
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "object": "validation_result",
             "valid": true,
+            "activation": {
+                "object": "activation",
+                "id": "act-uuid",
+                "device_id": "device-123",
+                "license_key": "KEY",
+                "activated_at": "2025-01-01T00:00:00Z"
+            },
             "license": {
                 "object": "license",
                 "key": "KEY",
@@ -733,20 +895,10 @@ async fn test_entitlements_preserved_in_cache() {
                 "active_seats": 1,
                 "active_entitlements": [
                     {"key": "feature-1"},
-                    {"key": "feature-2", "expires_at": "2027-12-31T00:00:00Z"},
+                    {"key": "feature-2", "expires_at": "2099-12-31T00:00:00Z"},
                     {"key": "feature-3", "metadata": {"limit": 500}}
                 ],
                 "product": {"slug": "test-product", "name": "Test"}
-            },
-            "activation": {
-                "object": "activation",
-                "id": "act-uuid",
-                "device_id": "device-123",
-                "license_key": "KEY",
-                "activated_at": "2025-01-01T00:00:00Z",
-                "deactivated_at": null,
-                "ip_address": "127.0.0.1",
-                "metadata": null
             }
         })))
         .mount(&server)
@@ -777,13 +929,13 @@ async fn test_empty_entitlements() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(activation_response("TEST-KEY")))
+        .respond_with(activation_responder())
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/validate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(validation_response("TEST-KEY")))
+        .respond_with(validation_responder())
         .mount(&server)
         .await;
 
