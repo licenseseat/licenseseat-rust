@@ -1,9 +1,11 @@
 [workspace]
-resolver = "2"
+# Edition 2024's MSRV-aware resolver respects the core's Rust 1.85 minimum and
+# the Tauri plugin's stricter Rust 1.88 dependency-security baseline.
+resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.5.3"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["LicenseSeat <hello@licenseseat.com>"]
@@ -19,17 +21,18 @@ categories = ["authentication", "api-bindings"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
-tokio = { version = "1", features = ["sync", "time", "rt"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tracing = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 
 # HTTP
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 # Crypto (for offline validation)
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64 = "0.22"
 sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 
 # Internal
 licenseseat = { path = "crates/licenseseat" }

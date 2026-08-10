@@ -2,7 +2,150 @@
 
 ## [Unreleased]
 
-- No unreleased changes yet.
+## [0.6.0] - 2026-08-10
+
+A minor version bump is required because the hardening adds fields to public
+configuration/signed-payload structs and adds fail-closed public error/reason
+variants.
+
+This is a security and production-readiness hardening pass. See
+[`docs/releases/production-hardening-audit.md`](docs/releases/production-hardening-audit.md)
+for the threat model, migration notes, compatibility evidence, residual risks,
+and complete local release gate.
+
+### Added
+
+- Durable random, product-scoped installation identity with safe legacy adoption
+  and explicit opt-in hardware fingerprint components.
+- Strict response binding for activation, validation, heartbeat, deactivation,
+  health, releases, download tokens, offline tokens, and machine files.
+- Global state-operation sequencing, commit serialization, restore
+  single-flight behavior, cancellable weak-owned workers, and stale-response
+  rejection.
+- A coherent `LicenseStateSnapshot` API so IPC/UI consumers observe status,
+  validation, license, trust source, and entitlements from one state decision.
+- Advisory cross-process cache locking and MSRV-aware Cargo resolver/CI gates:
+  Rust 1.85 for the core and Rust 1.88 for the Tauri plugin.
+- Explicit request/response size errors, bounded transport bodies, safe API
+  message normalization, and URL-free transport errors.
+- Pinned-key cross-process offline trust, complete signed claim/time/identity
+  checks, denial tombstones, and clock-rollback coverage.
+- Least-privilege Tauri permission sets for diagnostics, advanced lifecycle,
+  offline management, and releases.
+- Typed Tauri `init_with_config` setup and an `emitFrontendEvents` control for
+  high-assurance native facades that must not broadcast generic payloads.
+- Serialized JavaScript state subscriptions with error recovery and
+  unsubscribe/drain semantics.
+- Generated Ruby-core compatibility fixtures and adversarial integration tests.
+- Opaque SHA-256 cache namespaces, one-way legacy-cache migration, strict JSON
+  duplicate-key rejection, and explicit offline-artifact complexity limits.
+
+### Changed
+
+- The Tauri plugin MSRV is now Rust 1.88 so its lockfile can use patched
+  `quick-xml >=0.41` and `time >=0.3.47`; the standalone core remains Rust 1.85.
+- The audited workspace lockfile is committed, all CI Cargo commands use
+  `--locked`, and a scheduled RustSec audit prevents silent dependency drift.
+- The Tauri dependency disables unused default features. This reduces the
+  transitive desktop dependency graph while retaining the base runtime needed
+  by the plugin.
+- Legacy tenant-specific offline examples were consolidated into one
+  environment-driven signed-restoration example with no embedded credentials.
+- Historical fieldless-enum discriminants remain stable; regression tests
+  protect downstream code that previously cast event/trust-source values.
+
+- Persisted unsigned online state is pending and grants no entitlements until
+  the current process completes online or signed-offline restoration.
+- Signed offline artifacts grant rich plan/product/entitlement metadata only
+  when that metadata is embedded in the signed payload. Unsigned snapshots and
+  cached online records no longer enrich stripped machine files.
+- Activation is an immediately trusted online grant; entitlement/status helpers
+  consistently enforce active license, product, time, and entitlement state.
+- Machine files are the preferred offline artifact; legacy offline tokens
+  remain opt-in.
+- Fetched signing-key files are diagnostic cache only. Offline startup requires
+  a public key and matching key ID pinned into the application.
+- The default Tauri capability no longer grants admin, raw offline, explicit
+  arbitrary-key, reset, or release commands.
+- Tauri release builds reject runtime environment placeholders for licensing
+  trust configuration; debug builds retain the development convenience.
+- `bootstrapState` no longer performs a redundant validation by default.
+- `rustls` and `native-tls` now select independent reqwest backends.
+- Zero network-recheck/offline-refresh intervals explicitly disable those
+  workers without creating a busy loop.
+- `Error`, `EntitlementReason`, and `TrustedLicenseSource` are non-exhaustive so
+  future diagnostic additions do not require another source-breaking release.
+- `LicenseStatus`, `ClientStatus`, `OfflineFallbackMode`, `EventKind`, and
+  `EventData` are also non-exhaustive; downstream matches must include a
+  wildcard arm.
+- Startup restore uses validation itself as the single reachability/authority
+  probe, avoiding a redundant health request and health-to-validation race.
+- HTTP redirects are no longer followed (0.5.3 followed up to 10);
+  `api_base_url` must point at the canonical, redirect-free API endpoint.
+- New `device_identifier`/fingerprint configuration and creation input must be
+  8-255 characters. Fingerprints and installation identifiers sourced from an
+  existing cached activation are exempt, so seats activated before the floor
+  (or by another SDK without it) can still validate, heartbeat, deactivate,
+  and be adopted instead of burning a second seat.
+- `max_retries` above 10 now fails construction with a configuration error.
+- The Tauri admin snapshot replaces `apiKey`, `deviceIdentifier`,
+  `signingPublicKey`, and `SigningKeyRecord.publicKey` with
+  `apiKeyConfigured`/`deviceIdentifierConfigured`/`signingPublicKeyConfigured`/
+  `publicKeyConfigured` presence booleans and removes
+  `cachePaths.signingKeyPath`; `PluginConfig` is no longer `app.manage`d.
+- `activateAndGetState` no longer issues an extra validation request; it
+  returns the activation plus one state snapshot.
+- The clock-rollback watermark (`last_seen_ts`) now survives `clear()`/reset
+  like the installation identifier. Authoritative online successes
+  (activation, validation, heartbeat) re-anchor it — and may lower it, which
+  recovers installations poisoned by a transiently future-set clock — while
+  offline verification still only ratchets it forward.
+
+### Fixed
+
+- Prevented substituted or stale responses from creating, replacing, or
+  deleting the wrong local grant.
+- Prevented cached fetched keys, corrupt current cache files, symlinked paths,
+  and legacy fallback files from becoming unintended trust roots.
+- Prevented product slugs from appearing in cache filenames or lock names,
+  rejected Windows reparse-point cache handles, and made legacy adoption
+  transactional before legacy files are removed.
+- Rejected duplicate JSON object keys and bounded offline envelope fields,
+  nested metadata, entitlement counts, ciphertext, lifetimes, and PEM lines
+  before expensive parsing or cryptographic work.
+- Made corrupt/unreadable startup license state an actionable initialization
+  error instead of silently treating it as a missing activation.
+- Fixed validation authentication classification to use HTTP 401/403 rather
+  than 401/501.
+- Fixed missing terminal error events for response-verification, crypto, cache,
+  and superseded-operation failures after a lifecycle start/fetch event.
+- Prevented logs and surfaced reqwest errors from exposing license keys embedded
+  in request paths.
+- Redacted API/transport diagnostics from automatic validation, heartbeat,
+  offline-refresh, activation-support, and Tauri restore logs; direct callers
+  and typed lifecycle events retain their explicit diagnostic contract.
+- Prevented concurrent frontend state handlers from overlapping or observing
+  out-of-order snapshots.
+- Prevented Tauri state responses from mixing fields across concurrent commits,
+  ensured the native event bridge subscribes before automatic restore, and
+  refreshed renderer state after heartbeat-delivered entitlement changes.
+- Fixed signed-offline fallback when health would succeed but validation itself
+  returns a transient outage, and guaranteed terminal offline failure events
+  for cache/commit errors.
+- Bound cached machine-file verification during offline validation to the
+  expected license key, so a restored foreign-license artifact fails
+  verification with `LICENSE_MISMATCH` instead of emitting
+  `MachineFileVerified` and relying on the final grant binding.
+- Moved the synchronous Tauri commands (status/state/entitlement/license
+  reads, offline verification helpers, and reset) onto the blocking pool so
+  the core commit mutex, cross-process file lock, crypto, and cache IO can no
+  longer stall Tauri's main thread.
+- Added a plugin test that pins the triplicated command registry: the
+  `build.rs` command list and the default plus opt-in permission sets must
+  exactly partition the command surface.
+- Corrected documentation for fallback policy, Base64 encoding, telemetry,
+  signing-key pinning, installation identity, Tauri permissions, and trusted
+  entitlement use.
 
 ## [0.5.3] - 2026-04-01
 

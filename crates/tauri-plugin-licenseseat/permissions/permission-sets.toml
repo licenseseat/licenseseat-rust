@@ -1,0 +1,40 @@
+"$schema" = "schemas/schema.json"
+
+[[set]]
+identifier = "diagnostics"
+description = "Health and detailed diagnostic state. The snapshot may contain license state, offline artifacts, and local filesystem paths, but never raw API or signing keys."
+permissions = [
+    "allow-health",
+    "allow-get-admin-snapshot",
+]
+
+[[set]]
+identifier = "advanced-lifecycle"
+description = "Operations that target caller-supplied license/fingerprint pairs or destructively reset local state."
+permissions = [
+    "allow-validate-key",
+    "allow-deactivate-key",
+    "allow-heartbeat-key",
+    "allow-reset",
+]
+
+[[set]]
+identifier = "offline-management"
+description = "Raw offline artifact checkout, verification, refresh, and signing-key lookup commands."
+permissions = [
+    "allow-generate-offline-token",
+    "allow-verify-offline-token",
+    "allow-checkout-machine-file",
+    "allow-fetch-signing-key",
+    "allow-sync-offline-assets",
+    "allow-verify-machine-file",
+]
+
+[[set]]
+identifier = "releases"
+description = "Release discovery and license-bound download-token commands."
+permissions = [
+    "allow-get-latest-release",
+    "allow-list-releases",
+    "allow-generate-download-token",
+]

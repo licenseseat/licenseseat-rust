@@ -5,6 +5,9 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -16,6 +19,7 @@ env:
 jobs:
   test:
     name: Test (${{ matrix.os }})
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -47,13 +51,87 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build
-        run: cargo build --workspace --all-features
+        run: cargo build --workspace --all-features --locked
 
       - name: Run tests
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --locked
+
+  core-feature-matrix:
+    name: Core features (${{ matrix.name }})
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no-default-features
+            features: --no-default-features
+          - name: rustls
+            features: --no-default-features --features rustls
+          - name: native-tls
+            features: --no-default-features --features native-tls
+          - name: rustls-offline
+            features: --no-default-features --features rustls,offline
+          - name: native-tls-offline
+            features: --no-default-features --features native-tls,offline
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-core-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Test core feature selection
+        run: cargo test -p licenseseat ${{ matrix.features }} --locked
+
+  core-msrv:
+    name: Core minimum supported Rust 1.85
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Check core MSRV
+        run: cargo check -p licenseseat --all-features --locked
+
+  tauri-msrv:
+    name: Tauri plugin minimum supported Rust 1.88
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Check Tauri plugin MSRV
+        run: cargo check -p tauri-plugin-licenseseat --all-features --locked
 
   clippy:
     name: Clippy
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,10 +158,11 @@ jobs:
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   fmt:
     name: Formatting
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -96,8 +175,24 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  security-audit:
+    name: RustSec dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit committed dependency graph
+        run: cargo audit
+
   js-bindings:
     name: JS Bindings
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -115,14 +210,33 @@ jobs:
       - name: Install JS dependencies
         run: npm ci
 
-      - name: Build JS bindings
-        run: npm run build
+      - name: Test JS bindings
+        run: npm test
 
       - name: Verify package contents
         run: npm run pack:check
 
+  package:
+    name: Package dry run
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify publishable workspace in dependency order
+        run: cargo package --workspace --locked
+
   docs:
     name: Documentation
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -147,6 +261,6 @@ jobs:
           key: ${{ runner.os }}-cargo-docs-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build docs
-        run: cargo doc --workspace --all-features --no-deps
+        run: cargo doc --workspace --all-features --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings

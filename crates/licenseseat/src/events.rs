@@ -13,6 +13,7 @@ pub struct Event {
 
 /// Types of events emitted by the SDK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum EventKind {
     // Activation lifecycle
     /// Activation started.
@@ -115,10 +116,16 @@ pub enum EventKind {
     SdkReset,
     /// SDK runtime/internal error.
     SdkError,
+
+    // New variants stay after the historical v0.5 variants so downstream
+    // numeric casts do not silently change across the v0.6 upgrade.
+    /// Time-based license or entitlement state changed locally.
+    LicenseStateChanged,
 }
 
 /// Data associated with an event.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum EventData {
     /// License data.
     License(Box<License>),
@@ -192,6 +199,7 @@ impl std::fmt::Display for EventKind {
             Self::HeartbeatError => "heartbeat:error",
             Self::LicenseLoaded => "license:loaded",
             Self::LicenseRevoked => "license:revoked",
+            Self::LicenseStateChanged => "license:state-changed",
             Self::OfflineTokenFetching => "offlineToken:fetching",
             Self::OfflineTokenFetched => "offlineToken:fetched",
             Self::OfflineTokenFetchError => "offlineToken:fetchError",

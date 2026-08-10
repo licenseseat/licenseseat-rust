@@ -19,6 +19,7 @@ fn test_config_default_values() {
     assert_eq!(config.storage_prefix, "licenseseat_");
     assert!(config.storage_path.is_none());
     assert!(config.device_identifier.is_none());
+    assert!(!config.send_fingerprint_components);
     assert_eq!(config.auto_validate_interval, Duration::from_secs(3600));
     assert_eq!(config.heartbeat_interval, Duration::from_secs(300));
     assert_eq!(config.network_recheck_interval, Duration::from_secs(30));
@@ -44,9 +45,9 @@ fn test_config_default_values() {
 
 #[test]
 fn test_config_new_with_required_fields() {
-    let config = Config::new("sk_live_test123", "my-product");
+    let config = Config::new("pk_live_test123", "my-product");
 
-    assert_eq!(config.api_key, "sk_live_test123");
+    assert_eq!(config.api_key, "pk_live_test123");
     assert_eq!(config.product_slug, "my-product");
     // Other values should be defaults
     assert_eq!(config.api_base_url, "https://licenseseat.com/api/v1");
@@ -276,13 +277,30 @@ fn test_config_clone() {
 
 #[test]
 fn test_config_debug_format() {
-    let config = Config::new("api-key", "product");
+    let config = Config {
+        api_base_url: "https://url-user:url-password@example.test/api/v1?token=url-secret#fragment"
+            .into(),
+        api_key: "secret-key-must-not-leak".into(),
+        product_slug: "product".into(),
+        device_identifier: Some("private-device-id".into()),
+        signing_public_key: Some("large-public-key".into()),
+        ..Default::default()
+    };
     let debug_str = format!("{:?}", config);
 
     // Debug output should contain key field names
     assert!(debug_str.contains("api_key"));
     assert!(debug_str.contains("product_slug"));
     assert!(debug_str.contains("api_base_url"));
+    assert!(!debug_str.contains("secret-key-must-not-leak"));
+    assert!(!debug_str.contains("private-device-id"));
+    assert!(!debug_str.contains("large-public-key"));
+    assert!(!debug_str.contains("url-user"));
+    assert!(!debug_str.contains("url-password"));
+    assert!(!debug_str.contains("url-secret"));
+    assert!(!debug_str.contains("fragment"));
+    assert!(debug_str.contains("https://example.test/api/v1"));
+    assert!(debug_str.contains("[REDACTED]"));
 }
 
 #[test]
@@ -387,7 +405,7 @@ fn test_config_very_long_intervals() {
 #[test]
 fn test_config_development_setup() {
     let config = Config {
-        api_key: "sk_test_development".into(),
+        api_key: "pk_test_development".into(),
         product_slug: "my-app-dev".into(),
         api_base_url: "http://localhost:3000/api/v1".into(),
         debug: true,
@@ -404,7 +422,7 @@ fn test_config_development_setup() {
 #[test]
 fn test_config_production_setup() {
     let config = Config {
-        api_key: "sk_live_production_key".into(),
+        api_key: "pk_live_production_key".into(),
         product_slug: "my-app".into(),
         debug: false,
         telemetry_enabled: true,
@@ -418,13 +436,13 @@ fn test_config_production_setup() {
 
     assert!(!config.debug);
     assert!(config.telemetry_enabled);
-    assert!(config.api_key.starts_with("sk_live"));
+    assert!(config.api_key.starts_with("pk_live"));
 }
 
 #[test]
 fn test_config_offline_first_setup() {
     let config = Config {
-        api_key: "sk_live_key".into(),
+        api_key: "pk_live_key".into(),
         product_slug: "offline-app".into(),
         offline_fallback_mode: OfflineFallbackMode::Always,
         max_offline_days: 14,
@@ -435,4 +453,30 @@ fn test_config_offline_first_setup() {
 
     assert_eq!(config.offline_fallback_mode, OfflineFallbackMode::Always);
     assert_eq!(config.max_offline_days, 14);
+}
+
+#[test]
+fn test_validate_accepts_safe_complete_configuration() {
+    let config = Config::new("pk_test_public", "my-app");
+
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn test_validate_rejects_insecure_or_ambiguous_configuration() {
+    let mut config = Config::new("pk_test_public", "my-app");
+    config.api_base_url = "https://example.test\\@attacker.test/api/v1".into();
+    assert!(config.validate().is_err());
+
+    let mut config = Config::new("pk_test_public", "my-app");
+    config.signing_public_key = Some("A".repeat(44));
+    assert!(config.validate().is_err());
+
+    let mut config = Config::new("pk_test_public", "my-app");
+    config.auto_validate_interval = Duration::from_secs(367 * 86_400);
+    assert!(config.validate().is_err());
+
+    let mut config = Config::new("pk_test_public", "my-app");
+    config.app_version = Some("1.0\nforged-log-line".into());
+    assert!(config.validate().is_err());
 }

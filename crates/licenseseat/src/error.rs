@@ -7,6 +7,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Error types that can occur when using the LicenseSeat SDK.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Configuration error (missing required fields, invalid values).
     #[error("configuration error: {0}")]
@@ -23,6 +24,22 @@ pub enum Error {
     /// No active license to operate on.
     #[error("no active license - call activate() first")]
     NoActiveLicense,
+
+    /// A response did not match the requested license, product, installation,
+    /// or activation and was rejected before it could mutate cached state.
+    #[error("response identity mismatch: {0}")]
+    ResponseMismatch(String),
+
+    /// A successful HTTP response violated the authenticated API contract.
+    #[error("invalid API response: {0}")]
+    InvalidResponse(String),
+
+    /// A newer state-changing operation superseded an in-flight request.
+    #[error("{operation} was superseded by a newer license-state operation")]
+    OperationSuperseded {
+        /// Human-readable operation name.
+        operation: &'static str,
+    },
 
     /// API error with status code and details.
     #[error("API error ({status}): {message}")]
@@ -44,6 +61,20 @@ pub enum Error {
     /// JSON serialization/deserialization error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// A serialized API request exceeded the SDK's outbound body limit.
+    #[error("API request exceeded the {limit_bytes}-byte safety limit")]
+    RequestTooLarge {
+        /// Maximum accepted request size.
+        limit_bytes: usize,
+    },
+
+    /// An API response exceeded the SDK's bounded in-memory body limit.
+    #[error("API response exceeded the {limit_bytes}-byte safety limit")]
+    ResponseTooLarge {
+        /// Maximum accepted response size.
+        limit_bytes: usize,
+    },
 
     /// Cryptographic verification failed (offline validation).
     #[cfg(feature = "offline")]
@@ -129,6 +160,58 @@ impl Error {
             Self::Api { status, .. } => Some(*status),
             _ => None,
         }
+    }
+
+    /// Return a bounded, credential-safe summary suitable for automatic logs.
+    ///
+    /// Full errors remain available to the direct caller. Background tasks
+    /// must not format them automatically because API messages and reqwest
+    /// errors can contain server-controlled data or a request URL whose path
+    /// includes the license key.
+    pub(crate) fn redacted_log_summary(&self) -> String {
+        match self {
+            Self::Api { status, .. } => format!("API request rejected (HTTP {status})"),
+            Self::Network(error) if error.is_timeout() => "network timeout".into(),
+            Self::Network(error) if error.is_connect() => "network connection failure".into(),
+            Self::Network(_) => "network transport failure".into(),
+            Self::Configuration(_) | Self::ApiKeyRequired | Self::ProductSlugRequired => {
+                "invalid SDK configuration".into()
+            }
+            Self::NoActiveLicense => "no active license".into(),
+            Self::ResponseMismatch(_) => "response identity mismatch".into(),
+            Self::InvalidResponse(_) => "invalid API response".into(),
+            Self::OperationSuperseded { .. } => "operation superseded".into(),
+            Self::Json(_) => "invalid JSON response".into(),
+            Self::RequestTooLarge { .. } => "request exceeded safety limit".into(),
+            Self::ResponseTooLarge { .. } => "response exceeded safety limit".into(),
+            #[cfg(feature = "offline")]
+            Self::Crypto(_) => "cryptographic operation failed".into(),
+            Self::OfflineTokenExpired => "offline artifact expired".into(),
+            Self::OfflineVerificationFailed(_) => "offline verification failed".into(),
+            Self::ClockTamperingDetected => "clock rollback detected".into(),
+            Self::GracePeriodExceeded { .. } => "offline grace period exceeded".into(),
+            Self::Cache(_) => "durable cache operation failed".into(),
+            Self::Url(_) => "invalid URL".into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn automatic_log_summary_never_echoes_api_data() {
+        let error = Error::api(
+            422,
+            Some("SECRET-LICENSE-KEY".into()),
+            "server echoed SECRET-LICENSE-KEY",
+            None,
+        );
+        let summary = error.redacted_log_summary();
+
+        assert_eq!(summary, "API request rejected (HTTP 422)");
+        assert!(!summary.contains("SECRET"));
     }
 }
 

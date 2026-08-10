@@ -31,6 +31,8 @@ use licenseseat::{
     Config, EntitlementReason, EventKind, LicenseSeat, LicenseStatus, OfflineFallbackMode,
 };
 use std::env;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -83,6 +85,10 @@ enum ScenarioResult {
     Pass,
     Fail,
 }
+
+type ScenarioFuture = Pin<Box<dyn Future<Output = ScenarioResult> + Send>>;
+type ScenarioFunction = fn(TestContext) -> ScenarioFuture;
+type Scenario = (u32, &'static str, ScenarioFunction);
 
 impl ScenarioResult {
     fn symbol(&self) -> &'static str {
@@ -165,13 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_scenario: Option<u32> = env::var("RUN_SCENARIO").ok().and_then(|s| s.parse().ok());
 
     // Define scenarios
-    let scenarios: &[(
-        u32,
-        &str,
-        fn(
-            TestContext,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ScenarioResult> + Send>>,
-    )] = &[
+    let scenarios: &[Scenario] = &[
         (1, "Activation with telemetry", |ctx| {
             Box::pin(scenario_1_activation_telemetry(ctx))
         }),

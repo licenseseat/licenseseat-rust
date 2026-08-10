@@ -1,10 +1,20 @@
 //! Device telemetry collection for analytics.
 //!
-//! Collects non-personally identifiable device information for dashboard
-//! analytics (DAU/MAU, version adoption, platform distribution).
+//! Collects platform, coarse hardware-capacity, locale/timezone, SDK, and
+//! caller-provided app-version information for dashboard analytics. Hosts can
+//! disable this through `Config::telemetry_enabled` and remain responsible for
+//! describing the collection in their own privacy policy.
 
 use serde::Serialize;
 use std::env;
+#[cfg(target_os = "linux")]
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::path::Path;
+
+#[cfg(target_os = "linux")]
+const MAX_SYSTEM_FILE_BYTES: u64 = 64 * 1024;
+const MAX_ENVIRONMENT_VALUE_BYTES: usize = 128;
 
 /// Telemetry data collected from the device.
 #[derive(Debug, Clone, Serialize)]
@@ -92,68 +102,23 @@ fn os_name() -> String {
 
 /// Get the operating system version.
 fn os_version() -> String {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "linux")]
     {
-        // Try sw_vers to get macOS version
-        if let Ok(output) = std::process::Command::new("sw_vers")
-            .arg("-productVersion")
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(version) = String::from_utf8(output.stdout) {
-                    return version.trim().to_string();
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        // Try ver command or registry
-        if let Ok(output) = std::process::Command::new("cmd")
-            .args(["/C", "ver"])
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(version) = String::from_utf8(output.stdout) {
-                    // Parse version from "Microsoft Windows [Version X.X.X]"
-                    if let Some(start) = version.find('[') {
-                        if let Some(end) = version.find(']') {
-                            return version[start + 1..end]
-                                .replace("Version ", "")
-                                .trim()
-                                .to_string();
-                        }
+        if let Some(content) = read_text_file_limited(Path::new("/etc/os-release")) {
+            for line in content.lines() {
+                if let Some(version) = line.strip_prefix("VERSION_ID=") {
+                    let version = version
+                        .trim_start_matches("VERSION_ID=")
+                        .trim_matches('"')
+                        .trim();
+                    if let Some(version) = bounded_environment_text(version.to_string()) {
+                        return version;
                     }
                 }
             }
         }
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        // Try /etc/os-release
-        if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
-            for line in content.lines() {
-                if line.starts_with("VERSION_ID=") {
-                    return line
-                        .trim_start_matches("VERSION_ID=")
-                        .trim_matches('"')
-                        .to_string();
-                }
-            }
-        }
-        // Fallback to uname -r
-        if let Ok(output) = std::process::Command::new("uname").arg("-r").output() {
-            if output.status.success() {
-                if let Ok(version) = String::from_utf8(output.stdout) {
-                    return version.trim().to_string();
-                }
-            }
-        }
-    }
-
-    // Fallback
     "unknown".to_string()
 }
 
@@ -215,27 +180,9 @@ fn num_cpus() -> Option<usize> {
 
 /// Get system memory in GB.
 fn memory_gb() -> Option<u64> {
-    #[cfg(target_os = "macos")]
-    {
-        // Use sysctl to get memory size
-        if let Ok(output) = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(mem_str) = String::from_utf8(output.stdout) {
-                    if let Ok(bytes) = mem_str.trim().parse::<u64>() {
-                        return Some(bytes / (1024 * 1024 * 1024)); // Convert to GB
-                    }
-                }
-            }
-        }
-    }
-
     #[cfg(target_os = "linux")]
     {
-        // Read from /proc/meminfo
-        if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+        if let Some(content) = read_text_file_limited(Path::new("/proc/meminfo")) {
             for line in content.lines() {
                 if line.starts_with("MemTotal:") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -249,31 +196,15 @@ fn memory_gb() -> Option<u64> {
         }
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        // Use wmic to get memory
-        if let Ok(output) = std::process::Command::new("wmic")
-            .args(["ComputerSystem", "get", "TotalPhysicalMemory"])
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(mem_str) = String::from_utf8(output.stdout) {
-                    for line in mem_str.lines().skip(1) {
-                        if let Ok(bytes) = line.trim().parse::<u64>() {
-                            return Some(bytes / (1024 * 1024 * 1024));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     None
 }
 
 /// Get the system locale.
 fn locale() -> Option<String> {
-    env::var("LANG").ok().or_else(|| env::var("LC_ALL").ok())
+    env::var("LC_ALL")
+        .ok()
+        .and_then(bounded_environment_text)
+        .or_else(|| env::var("LANG").ok().and_then(bounded_environment_text))
 }
 
 /// Get the language code from locale.
@@ -287,7 +218,31 @@ fn language() -> Option<String> {
 
 /// Get the timezone.
 fn timezone() -> Option<String> {
-    env::var("TZ").ok()
+    env::var("TZ").ok().and_then(bounded_environment_text)
+}
+
+fn bounded_environment_text(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= MAX_ENVIRONMENT_VALUE_BYTES
+        && !value.bytes().any(|byte| byte.is_ascii_control()))
+    .then(|| value.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn read_text_file_limited(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_SYSTEM_FILE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_SYSTEM_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_SYSTEM_FILE_BYTES)
+        .then(|| String::from_utf8(bytes).ok())
+        .flatten()
 }
 
 /// Generate a stable device identifier.

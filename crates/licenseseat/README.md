@@ -1,587 +1,260 @@
-# LicenseSeat Rust SDK
+# `licenseseat`
 
-[![Crates.io](https://img.shields.io/crates/v/licenseseat.svg)](https://crates.io/crates/licenseseat)
-[![Documentation](https://docs.rs/licenseseat/badge.svg)](https://docs.rs/licenseseat)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](../../LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+Async Rust SDK for LicenseSeat. It supports online license lifecycle operations, fail-closed entitlement gates, signed offline operation, background validation/heartbeat workers, health diagnostics, and release/download-token discovery.
 
-Official Rust SDK for [LicenseSeat](https://licenseseat.com) — simple, secure software licensing for desktop apps, games, CLI tools, and plugins.
-
-## Table of Contents
-
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [License Lifecycle](#license-lifecycle)
-  - [Activation](#activation)
-  - [Validation](#validation)
-  - [Deactivation](#deactivation)
-- [Entitlements](#entitlements)
-- [Offline Validation](#offline-validation)
-- [Heartbeat & Seat Tracking](#heartbeat--seat-tracking)
-- [Event System](#event-system)
-- [Configuration](#configuration)
-- [Error Handling](#error-handling)
-- [Telemetry & Privacy](#telemetry--privacy)
-- [Examples](#examples)
-- [Feature Flags](#feature-flags)
-- [API Reference](#api-reference)
-
-## Installation
-
-Add to your `Cargo.toml`:
-
-```bash
-cargo add licenseseat
-```
-
-Or manually:
+## Install
 
 ```toml
 [dependencies]
-licenseseat = "0.5.3"
+licenseseat = "0.6.0"
 ```
 
-Offline support is included in the default build. If you disable default features
-and still want machine-file / offline-token verification, add `offline` back explicitly:
+Default features are `rustls` and `offline`. Rust 1.85 or newer is required.
 
-```bash
-cargo add licenseseat --no-default-features --features "native-tls,offline"
-```
-
-## Quick Start
-
-Use a `pk_*` publishable API key in client applications.
-Keep `sk_*` secret keys server-side only.
-
-```rust
-use licenseseat::{LicenseSeat, Config};
-
-#[tokio::main]
-async fn main() -> licenseseat::Result<()> {
-    // 1. Create SDK instance
-    let sdk = LicenseSeat::new(Config::new("pk_live_xxx", "your-product"));
-
-    // 2. Activate a license (typically on first launch)
-    let license = sdk.activate("USER-LICENSE-KEY").await?;
-    println!("Activated on device: {}", license.device_id);
-
-    // 3. Validate the license (on subsequent launches)
-    let result = sdk.validate().await?;
-    if result.valid {
-        println!("License valid until: {:?}", result.license.expires_at);
-    }
-
-    // 4. Check entitlements for feature gating
-    if sdk.has_entitlement("pro-features") {
-        enable_pro_features();
-    }
-
-    // 5. Deactivate when uninstalling (releases the seat)
-    sdk.deactivate().await?;
-
-    Ok(())
+```toml
+# Use the platform TLS backend instead.
+licenseseat = {
+  version = "0.6.0",
+  default-features = false,
+  features = ["native-tls", "offline"]
 }
 ```
 
-## License Lifecycle
+Remote endpoints require HTTPS and a TLS feature. A build with neither `rustls` nor `native-tls` is useful only for loopback HTTP tests. Plain HTTP and disabled certificate validation are rejected for non-loopback hosts.
 
-### Activation
+## Initialize safely
 
-Activation binds a license key to this device and consumes a seat:
+```rust,no_run
+use licenseseat::{Config, LicenseSeat, OfflineFallbackMode};
+use std::time::Duration;
 
-```rust
-use licenseseat::{LicenseSeat, Config, ActivationOptions};
-
-let sdk = LicenseSeat::new(Config::new("pk_live_xxx", "product"));
-
-// Simple activation
-let license = sdk.activate("USER-LICENSE-KEY").await?;
-println!("Fingerprint: {}", license.fingerprint());
-println!("Activation ID: {:?}", license.activation_id);
-
-// Activation with options
-let license = sdk.activate_with_options(
-    "USER-LICENSE-KEY",
-    ActivationOptions {
-        fingerprint: None,
-        device_name: Some("John's MacBook".into()),
+fn build_sdk() -> licenseseat::Result<LicenseSeat> {
+    LicenseSeat::try_new(Config {
+        api_key: "pk_live_your_publishable_key".into(),
+        product_slug: "your-product".into(),
+        offline_fallback_mode: OfflineFallbackMode::NetworkOnly,
+        auto_validate_interval: Duration::from_secs(60 * 60),
+        heartbeat_interval: Duration::from_secs(5 * 60),
+        signing_public_key: Some("BASE64_ED25519_PUBLIC_KEY".into()),
+        signing_key_id: Some("production-key-v1".into()),
         ..Default::default()
-    }
-).await?;
-```
-
-**When to activate:**
-- First app launch with a new license key
-- When the user enters a different license key
-- After a deactivation (switching devices)
-
-### Validation
-
-Validation checks the license status without consuming a new seat:
-
-```rust
-let result = sdk.validate().await?;
-
-if result.valid {
-    println!("License is valid!");
-    println!("Plan: {}", result.license.plan_key);
-    println!("Entitlements: {:?}", result.license.active_entitlements);
-} else {
-    match result.code.as_deref() {
-        Some("license_expired") => show_renewal_prompt(),
-        Some("device_limit_exceeded") => show_device_limit_error(),
-        Some("license_suspended") => show_suspension_notice(),
-        _ => show_generic_error(),
-    }
-}
-
-// Check for warnings (e.g., expiring soon)
-if let Some(warnings) = &result.warnings {
-    for warning in warnings {
-        println!("Warning: {}", warning);
-    }
+    })
 }
 ```
 
-**When to validate:**
-- On app launch (after initial activation)
-- Periodically in the background (SDK does this automatically)
-- Before performing license-gated operations
+Use a publishable `pk_*` key in a desktop/client binary. Never embed an `sk_*` secret key. `try_new` validates transport, identifiers, key pairing, timing, and storage before it constructs the client. It also creates or loads the durable installation identity. `new` performs the same work but panics if it fails.
 
-### Deactivation
+## Recommended lifecycle
 
-Deactivation releases the seat, allowing activation on another device:
+```rust,no_run
+# use licenseseat::{Config, LicenseSeat};
+# async fn example() -> licenseseat::Result<()> {
+let sdk = LicenseSeat::try_new(Config::new("pk_live_xxx", "your-product"))?;
 
-```rust
-// Deactivate current device
-sdk.deactivate().await?;
-println!("Seat released successfully");
-```
+let restore = sdk.restore_license().await;
+if !restore.restored {
+    sdk.activate("CUSTOMER-LICENSE-KEY").await?;
+}
 
-**When to deactivate:**
-- User clicks "Deactivate" in settings
-- During app uninstall (if you have an uninstaller)
-- When switching to a different license key
+match sdk.status() {
+    licenseseat::LicenseStatus::Active { .. }
+    | licenseseat::LicenseStatus::OfflineValid { .. } => {
+        // The current process has established a trusted grant.
+    }
+    _ => {
+        // Show activation/recovery UI and keep paid behavior disabled.
+    }
+}
 
-## Entitlements
-
-Entitlements provide fine-grained feature gating beyond simple license validity.
-
-### Quick Check
-
-```rust
-// Simple boolean check
 if sdk.has_entitlement("cloud-sync") {
-    enable_cloud_sync();
+    // Gate both UI and the value-producing operation.
 }
 
-if sdk.has_entitlement("api-access") {
-    enable_api_features();
-}
+// Send when appropriate for the product's seat semantics.
+sdk.heartbeat().await?;
+
+// Explicit sign-out/device release:
+sdk.deactivate().await?;
+# Ok(())
+# }
 ```
 
-### Detailed Status
+Activation itself is an authoritative online grant and becomes `Active` immediately. Validation and heartbeat refresh the trusted license metadata. Deactivation is idempotent only for recognized API codes; a generic/uncoded 404 does not erase the local activation.
 
-```rust
-use licenseseat::EntitlementReason;
+`restore_license` is serialized and idempotent. Concurrent setup/frontend callers share one restoration instead of superseding each other. A persisted unsigned online snapshot starts as `Pending`; it grants nothing until current online validation or signed-offline verification succeeds.
 
-let status = sdk.check_entitlement("pro-features");
+## Authorization APIs
 
-println!("Active: {}", status.active);
-println!("Expires: {:?}", status.expires_at);
+Use these for decisions:
 
-match status.reason {
-    None if status.active => enable_feature(),
-    Some(EntitlementReason::Expired) => {
-        // Was active, now expired
-        show_upgrade_prompt();
-    }
-    Some(EntitlementReason::NotFound) => {
-        // Not included in the user's plan
-        show_plan_upgrade_prompt();
-    }
-    Some(EntitlementReason::NoLicense) => {
-        // No license is active
-        show_activation_prompt();
-    }
-    _ => {}
-}
-```
+- `status()` / `get_client_status()`
+- `get_status()`
+- `current_authoritative_validation()` when an optional exact runtime decision
+  is preferable to `get_status()`'s fail-closed default result
+- `check_entitlement(key)` / `has_entitlement(key)`
+- `active_entitlements()`
+- `state_snapshot()` when a UI/IPC response needs one coherent observation of
+  status, client status, license, validation, trust source, and entitlements
+- `is_license_state_trusted()` when diagnostics need the trust distinction
 
-### List All Entitlements
+`has_entitlement` checks all of the following: this process established trust, validation is valid, the license key/product/status/time window still represents an active grant, the entitlement exists, and its own expiry is in the future.
 
-```rust
-if let Some(license) = sdk.current_license() {
-    if let Some(validation) = license.validation {
-        for entitlement in validation.license.active_entitlements {
-            println!("Key: {}", entitlement.key);
-            println!("Expires: {:?}", entitlement.expires_at);
-            println!("Metadata: {:?}", entitlement.metadata);
-        }
-    }
-}
-```
+`current_license()`, `current_machine_file()`, `current_offline_token()`, and cached signing-key accessors are diagnostic/cache APIs. The existence of one of those values is not authorization.
 
-## Offline Validation
+## State and concurrency guarantees
 
-The Rust SDK now matches the C++ SDK's machine-file-first offline flow.
+Before committing an API response, the SDK verifies the response object and binds it to the requested:
 
-```rust
-use licenseseat::{Config, OfflineFallbackMode};
+- product slug;
+- license key;
+- installation fingerprint;
+- activation identity where the protocol supplies one;
+- release channel/platform/product for distribution responses.
 
-let config = Config {
+Activation, validation, heartbeat, deactivation, reset, restoration, and offline refresh use operation generations plus a commit lock. A delayed response cannot overwrite a newer state-changing operation. `state_snapshot()` uses that same boundary to prevent a consumer from combining fields from different commits. Rejected or superseded responses leave the newer/last trusted state intact and return `ResponseMismatch` or `OperationSuperseded`.
+
+Recognized authoritative invalidation codes write a durable denial before removing cached grant artifacts. If cleanup is partially unavailable, the denial remains and authorization fails closed. Availability failures, malformed responses, and unrelated 4xx errors do not silently destroy a trusted in-process state.
+
+## Installation identity and storage
+
+When `device_identifier` is omitted, initialization creates a cryptographically random installation UUID and persists it. The default prefix is deterministically product-scoped so two products cannot accidentally share activation state. Existing legacy identifiers and cache locations are adopted/migrated where safe.
+
+The SDK does not derive its default identifier from the machine and does not send raw hardware components by default. Set `send_fingerprint_components = true` only for a deployment that explicitly needs legacy hardware-component interoperability. `MachineFileCheckoutOptions::fingerprint_components` can opt in for one request.
+
+Persisted files are placed under platform application data (or `storage_path`) and use:
+
+- private directory/file permissions where the OS supports them;
+- atomic same-directory replacement;
+- bounded reads and writes;
+- symlink and unsafe-path rejection;
+- safe normalized prefixes/key identifiers;
+- a monotonic last-seen timestamp for rollback detection.
+
+Initialization fails if durable storage cannot be used or existing license state is corrupt/unreadable; it never silently rotates to a hardware-derived identity or treats corruption as permission to consume another seat.
+
+## Offline validation
+
+Enable the `offline` feature (included by default). Machine files are preferred over legacy offline tokens.
+
+```rust,no_run
+# use licenseseat::{Config, LicenseSeat};
+# async fn example() -> licenseseat::Result<()> {
+let sdk = LicenseSeat::try_new(Config {
     api_key: "pk_live_xxx".into(),
     product_slug: "your-product".into(),
-
-    // Fall back to locally cached offline artifacts when the network is unavailable.
-    offline_fallback_mode: OfflineFallbackMode::Always,
-
-    // Maximum time the app may continue operating without a successful online validation.
+    signing_public_key: Some("BASE64_ED25519_PUBLIC_KEY".into()),
+    signing_key_id: Some("production-key-v1".into()),
     max_offline_days: 7,
-
-    // Optional pinned signing key. If omitted, the SDK fetches keys by `kid` on demand.
-    signing_public_key: None,
-    signing_key_id: None,
-
-    // Legacy offline tokens are disabled by default. Machine files are preferred.
-    enable_legacy_offline_tokens: false,
-
     ..Default::default()
-};
+})?;
 
-let sdk = LicenseSeat::new(config);
+sdk.activate("CUSTOMER-LICENSE-KEY").await?;
+sdk.sync_offline_assets().await?;
+# Ok(())
+# }
 ```
 
-### Fallback Modes
+### Trust anchor
 
-| Mode | Behavior |
-|------|----------|
-| `NetworkOnly` | Always require network. Fail if offline. (Default) |
-| `Always` | Try online first, then fall back to a cached machine file or legacy offline token |
+Both `signing_public_key` and `signing_key_id` must be supplied together. The SDK can fetch a key by `kid` while online, but a fetched/persisted key is not accepted as a trust anchor by a new process. Pin the public key pair into the release for offline startup.
 
-### How It Works
+This prevents mutable local cache from replacing the verifier key and authorizing an attacker-created artifact.
 
-1. Activation binds the license to a canonical device fingerprint.
-2. The SDK checks out a machine file from `/machine-file` after activation.
-3. The machine file is Ed25519-signed and AES-256-GCM encrypted using a key derived from `license_key || fingerprint`.
-4. When offline, the SDK verifies the signature, decrypts the payload, and enforces expiry / grace / fingerprint binding locally.
-5. Legacy offline tokens remain available only as an optional compatibility fallback via `enable_legacy_offline_tokens`.
+### Machine-file checks
 
-### Clock Tampering Protection
+The verifier checks:
 
-The SDK includes safeguards against clock manipulation:
-- Offline artifacts include `nbf` (not before) and `exp` (expiration) timestamps
-- Significant clock jumps are detected and flagged
-- Backward clock movement invalidates offline validation
+- PEM-like envelope shape and 4 MiB size bounds;
+- exact `aes-256-gcm+ed25519` algorithm and Ed25519 signature;
+- schema, key ID, canonical relationships, and positive signed lifetime;
+- license, product, fingerprint, and activation binding;
+- issue, not-before, expiry, grace period, and optional license expiry;
+- optional host `max_offline_days` and configured clock skew;
+- cached last-seen watermark against clock rollback;
+- embedded license status/product/time window and entitlement expiries.
 
-## Heartbeat & Seat Tracking
+Rich plan/product/entitlement metadata is restored only from the signed embedded license. If a valid machine file omits that object, it still proves the bound license/product/activation/time contract but restores a minimal identity-bound license with no plan or entitlements. Unsigned snapshots and cached online metadata are diagnostic restoration inputs, never offline grant enrichment. An online/local denial always outranks an older signed artifact.
 
-Heartbeats enable real-time seat tracking for concurrent user limits:
+Legacy token signatures use standard Base64, matching the Ruby core. Machine-file encrypted components/signatures use the format defined by the core service. Cross-language fixtures in `tests/fixtures/ruby_compat.json` are generated by the Ruby implementation and verified byte-for-byte in Rust tests.
 
-```rust
-use std::time::Duration;
+### Fallback policy
 
-let config = Config {
-    api_key: "pk_live_xxx".into(),
-    product_slug: "your-product".into(),
-    heartbeat_interval: Duration::from_secs(300), // 5 minutes
-    ..Default::default()
-};
+`OfflineFallbackMode::NetworkOnly` consults signed offline state only after transport failure, timeout, HTTP 408, or 5xx. `Always` additionally permits fallback after HTTP 429.
 
-let sdk = LicenseSeat::new(config);
+Neither mode permits an older offline artifact to override authentication/configuration failures, ordinary business/client errors, invalid JSON or response identity, or a superseded local operation.
 
-// Manual heartbeat
-let response = sdk.heartbeat().await?;
-println!("Acknowledged at: {}", response.received_at);
-```
+`network_recheck_interval = Duration::ZERO` disables connectivity probing. `offline_token_refresh_interval = Duration::ZERO` disables artifact refresh. The task launcher skips disabled intervals, so zero cannot create a tight loop.
 
-### Seat Release
+## Configuration reference
 
-If heartbeats stop (app crash, network loss, user closes app), the seat is released after the grace period configured in your LicenseSeat dashboard.
+| Field | Default | Notes |
+| --- | --- | --- |
+| `api_base_url` | `https://licenseseat.com/api/v1` | HTTPS required remotely; query, fragment, and embedded credentials rejected |
+| `api_key` | empty | Publishable client key; required for API operations |
+| `product_slug` | empty | Required product identity |
+| `storage_prefix` | product-scoped `licenseseat_` | Custom values are filename-normalized |
+| `storage_path` | platform app-data `licenseseat/` | Preflighted at startup |
+| `device_identifier` | durable random UUID | Explicit installation override |
+| `send_fingerprint_components` | `false` | Opt-in raw hardware component collection |
+| `signing_public_key` / `signing_key_id` | none | Must be a complete valid pair |
+| `auto_validate_interval` | 1 hour | Zero disables |
+| `heartbeat_interval` | 5 minutes | Zero disables |
+| `network_recheck_interval` | 30 seconds | Zero disables |
+| `request_timeout` | 30 seconds | Must be greater than zero |
+| `verify_ssl` | `true` | May be false only for loopback |
+| `max_retries` | 3 | Retries only retryable availability failures |
+| `retry_delay` | 1 second | Exponential delay is capped |
+| `offline_fallback_mode` | `NetworkOnly` | See policy above |
+| `offline_token_refresh_interval` | 72 hours | Zero disables |
+| `enable_legacy_offline_tokens` | `false` | Machine files remain preferred |
+| `max_offline_days` | 0 | No extra host-age cap; signed expiry still enforced |
+| `max_clock_skew` | 5 minutes | Used by signed time checks |
+| `telemetry_enabled` | `true` | See privacy section below |
+| `debug` | `false` | Credentials/keys/identity remain redacted |
+| `app_version` / `app_build` | none | Caller-provided telemetry fields |
 
-### Continuous Heartbeat Loop
+Request identifiers are 1–255 non-control characters without surrounding whitespace. API keys are bounded and must be valid HTTP header content. Request JSON and response bodies are bounded at 1 MiB and 4 MiB respectively.
 
-```rust
-use tokio::time::interval;
+## Telemetry
 
-let sdk = LicenseSeat::new(config);
-let sdk_clone = sdk.clone();
+When enabled, requests can include SDK name/version, OS name/version, native platform/device class, CPU architecture/core count, coarse memory capacity, locale/language/timezone, and caller-provided app version/build. It does not add raw hostname or hardware identifiers. Hosts remain responsible for their privacy disclosure and can set `telemetry_enabled = false`.
 
-tokio::spawn(async move {
-    let mut ticker = interval(Duration::from_secs(300));
+## Events
 
-    loop {
-        ticker.tick().await;
+`subscribe()` returns a Tokio broadcast receiver. Lifecycle operations emit a start (where defined) and a terminal success/failure event even when a well-formed server response is rejected during binding or local commit. Network-status and background-offline events are global and can interleave; consumers should filter by `EventKind`, not assume adjacent pairs.
 
-        match sdk_clone.heartbeat().await {
-            Ok(resp) => println!("Heartbeat OK: {}", resp.received_at),
-            Err(e) => eprintln!("Heartbeat failed: {}", e),
-        }
-    }
-});
-```
+The event model covers activation, validation, deactivation, heartbeat, offline token/machine-file fetch and verification, offline validation, background auto-validation, network status, revocation, reset, and SDK errors. A lagged broadcast receiver should resynchronize from `status()`/`get_status()`.
 
-## Event System
+## Errors and retries
 
-Subscribe to SDK events for reactive UI updates:
+`Error` preserves structured API status/code/details and adds explicit variants for response substitution, superseded state, request/response size bounds, cache failure, crypto failure, and offline timing.
 
-```rust
-use licenseseat::{LicenseSeat, Config, EventKind};
+API messages are bounded, control characters are normalized, and an HTML proxy page becomes a generic safe message. Reqwest URLs are removed from surfaced transport errors because license keys are API path segments. Debug logs do not print request paths or cached keys.
 
-let sdk = LicenseSeat::new(config);
+Retries apply to transport failures, HTTP 408, HTTP 429, and 5xx. Authentication, configuration, response parsing/binding, cache, crypto, and business errors are not retried.
 
-// Get event receiver
-let mut events = sdk.subscribe();
+## Releases and downloads
 
-// Spawn event handler
-tokio::spawn(async move {
-    while let Ok(event) = events.recv().await {
-        match event.kind {
-            EventKind::ActivationSuccess => {
-                update_ui_license_active();
-            }
-            EventKind::ActivationError => {
-                show_activation_error();
-            }
-            EventKind::ValidationSuccess => {
-                refresh_entitlements_ui();
-            }
-            EventKind::ValidationFailed => {
-                show_validation_error();
-            }
-            EventKind::DeactivationSuccess => {
-                reset_to_unlicensed_state();
-            }
-            EventKind::HeartbeatSuccess => {
-                update_connection_indicator(true);
-            }
-            EventKind::HeartbeatError => {
-                update_connection_indicator(false);
-            }
-            _ => {}
-        }
-    }
-});
-```
+`get_latest_release`, `list_releases`, and `generate_download_token` support LicenseSeat distribution metadata. Returned release product/channel/platform and download-token expiry are validated before use.
 
-### Event Types
+The SDK does not install updates or verify an artifact hash/signature in this release. A download service must verify each token cryptographically and bind its subject, product, release, and platform claims to the requested artifact.
 
-| Event | Description |
-|-------|-------------|
-| `ActivationSuccess` | License successfully activated |
-| `ActivationError` | Activation failed (invalid key, limit exceeded, etc.) |
-| `ValidationSuccess` | License validated successfully |
-| `ValidationFailed` | Validation failed (expired, suspended, etc.) |
-| `DeactivationSuccess` | License deactivated, seat released |
-| `DeactivationError` | Deactivation failed |
-| `HeartbeatSuccess` | Server acknowledged heartbeat |
-| `HeartbeatError` | Heartbeat failed (network error, etc.) |
-
-## Configuration
-
-### Full Configuration Example
-
-```rust
-use licenseseat::{Config, OfflineFallbackMode};
-use std::time::Duration;
-
-let config = Config {
-    // Required
-    api_key: "pk_live_xxx".into(),
-    product_slug: "your-product".into(),
-
-    // API endpoint (default: production)
-    api_base_url: "https://licenseseat.com/api/v1".into(),
-
-    // Background validation interval (default: 1 hour)
-    auto_validate_interval: Duration::from_secs(3600),
-
-    // Heartbeat interval (default: 5 minutes)
-    heartbeat_interval: Duration::from_secs(300),
-
-    // Offline validation (requires `offline` feature)
-    offline_fallback_mode: OfflineFallbackMode::AllowOffline,
-    max_offline_days: 7,
-
-    // Telemetry
-    telemetry_enabled: true,
-    app_version: Some("1.2.3".into()),
-
-    // Debug logging
-    debug: false,
-};
-
-let sdk = LicenseSeat::new(config);
-```
-
-### Configuration Reference
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `api_key` | `String` | — | Your publishable LicenseSeat API key (`pk_*`, required). Keep `sk_*` server-side only. |
-| `product_slug` | `String` | — | Your product slug (required) |
-| `api_base_url` | `String` | `https://licenseseat.com/api/v1` | API base URL |
-| `auto_validate_interval` | `Duration` | 1 hour | Background validation interval |
-| `heartbeat_interval` | `Duration` | 5 minutes | Heartbeat interval |
-| `offline_fallback_mode` | `OfflineFallbackMode` | `NetworkOnly` | Offline validation behavior |
-| `max_offline_days` | `u32` | `0` | Grace period for offline mode (days) |
-| `telemetry_enabled` | `bool` | `true` | Send device telemetry |
-| `app_version` | `Option<String>` | `None` | Your app version (for analytics) |
-| `debug` | `bool` | `false` | Enable debug logging |
-
-## Error Handling
-
-The SDK uses a unified `Error` type:
-
-```rust
-use licenseseat::{LicenseSeat, Config, Error};
-
-async fn activate_license(sdk: &LicenseSeat, key: &str) {
-    match sdk.activate(key).await {
-        Ok(license) => {
-            println!("Activated: {}", license.device_id);
-        }
-        Err(Error::InvalidLicenseKey) => {
-            show_error("Invalid license key");
-        }
-        Err(Error::DeviceLimitExceeded) => {
-            show_error("Too many devices. Deactivate one first.");
-        }
-        Err(Error::LicenseExpired) => {
-            show_error("License has expired");
-        }
-        Err(Error::NetworkError(e)) => {
-            show_error(&format!("Network error: {}", e));
-        }
-        Err(e) => {
-            show_error(&format!("Unexpected error: {}", e));
-        }
-    }
-}
-```
-
-### Error Types
-
-| Error | Description |
-|-------|-------------|
-| `InvalidLicenseKey` | The license key is invalid or doesn't exist |
-| `LicenseExpired` | The license has expired |
-| `LicenseSuspended` | The license has been suspended |
-| `DeviceLimitExceeded` | Maximum device limit reached |
-| `NotActivated` | Tried to validate/deactivate without activation |
-| `NetworkError` | Network request failed |
-| `OfflineValidationFailed` | Offline token invalid or expired |
-| `InvalidSignature` | Ed25519 signature verification failed |
-
-## Telemetry & Privacy
-
-The SDK collects minimal telemetry to help you understand your user base:
-
-**Collected automatically:**
-- Device ID (hardware-based, stable identifier)
-- OS name and version
-- Platform (e.g., "macos-arm64")
-- SDK version
-
-**You can add:**
-- App version via `config.app_version`
-
-**Not collected:**
-- Personal information
-- File system data
-- Network information beyond API calls
-- User behavior or analytics
-
-### Disabling Telemetry
-
-```rust
-let config = Config {
-    telemetry_enabled: false,
-    ..Default::default()
-};
-```
-
-## Examples
-
-### DevHeartbeat
-
-Simple demo showing the full license lifecycle:
+## Verification
 
 ```bash
-LICENSESEAT_API_KEY=your_key \
-LICENSESEAT_PRODUCT_SLUG=your_product \
-LICENSESEAT_LICENSE_KEY=your_license \
-cargo run --example dev_heartbeat
+cargo fmt --all -- --check
+cargo +1.85.0 check -p licenseseat --all-features --locked
+cargo +1.88.0 check -p tauri-plugin-licenseseat --all-features --locked
+cargo test --workspace --all-features --locked
+cargo test -p licenseseat --no-default-features --locked
+cargo test -p licenseseat --no-default-features --features rustls --locked
+cargo test -p licenseseat --no-default-features --features native-tls --locked
+cargo test -p licenseseat --no-default-features --features rustls,offline --locked
+cargo test -p licenseseat --no-default-features --features native-tls,offline --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+cargo package --workspace --locked --allow-dirty
+cargo audit
 ```
 
-### Stress Test
-
-Comprehensive test covering 12 scenarios:
-
-```bash
-cargo run --example stress_test
-```
-
-Scenarios tested:
-1. Activation with valid key
-2. Validation after activation
-3. Heartbeat functionality
-4. Telemetry collection
-5. Entitlement checking
-6. Non-existent entitlement handling
-7. Offline configuration
-8. Event subscription
-9. Multiple subscriptions
-10. Concurrent operations
-11. Full lifecycle
-12. SDK cloning
-
-## Feature Flags
-
-| Feature | Description | Dependencies Added |
-|---------|-------------|--------------------|
-| `default` | Uses rustls for TLS and enables offline machine-file support | `reqwest/rustls-tls`, `ed25519-dalek`, `sha2`, `base64`, `aes-gcm` |
-| `native-tls` | Use system TLS instead | `reqwest/native-tls` |
-| `offline` | Enable offline support when using `--no-default-features` | `ed25519-dalek`, `sha2`, `base64`, `aes-gcm` |
-
-## API Reference
-
-Full API documentation is available at [docs.rs/licenseseat](https://docs.rs/licenseseat).
-
-### Key Types
-
-```rust
-// Main SDK instance
-pub struct LicenseSeat { ... }
-
-// Configuration
-pub struct Config { ... }
-pub enum OfflineFallbackMode { NetworkOnly, Always }
-
-// License data
-pub struct License { ... }
-pub enum LicenseStatus { Active, Expired, Suspended, Revoked }
-
-// Entitlements
-pub struct Entitlement { ... }
-pub struct EntitlementStatus { ... }
-pub enum EntitlementReason { Expired, NotFound, NoLicense }
-
-// Events
-pub struct Event { ... }
-pub enum EventKind { ... }
-
-// Responses
-pub struct ValidationResult { ... }
-pub struct ActivationResponse { ... }
-pub struct DeactivationResponse { ... }
-pub struct HeartbeatResponse { ... }
-
-// Errors
-pub enum Error { ... }
-pub type Result<T> = std::result::Result<T, Error>;
-```
-
-## License
-
-MIT License. See [LICENSE](../../LICENSE) for details.
+See the workspace [production hardening audit](../../docs/releases/production-hardening-audit.md) for the threat model, regression inventory, compatibility evidence, residual framework warnings, and release checklist.

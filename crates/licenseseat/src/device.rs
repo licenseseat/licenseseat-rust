@@ -1,12 +1,13 @@
-//! Device fingerprinting helpers.
+//! Opt-in hardware fingerprinting helpers.
 //!
-//! This module intentionally mirrors the C++ reference fingerprinting strategy
-//! so mixed-SDK estates identify the same machine consistently by default.
+//! The SDK's default installation identity is a durable random, storage/product-
+//! scoped identifier. These helpers preserve the C++ component strategy only
+//! for deployments that explicitly opt into sending hardware components.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-/// Generate a stable device fingerprint.
+/// Generate the legacy C++-compatible hardware fingerprint.
 pub fn generate_fingerprint() -> String {
     fingerprint_from_components(&collect_fingerprint_components())
 }
@@ -17,7 +18,11 @@ pub fn generate_device_id() -> String {
     generate_fingerprint()
 }
 
-/// Collect structured fingerprint components for diagnostics and server-side matching.
+/// Collect raw structured hardware fingerprint components.
+///
+/// Values can include a hostname or platform machine identifier. They are sent
+/// only when `Config::send_fingerprint_components` is enabled or a caller
+/// explicitly supplies a component map.
 pub fn collect_fingerprint_components() -> HashMap<String, String> {
     let mut components = HashMap::new();
     components.insert("schema_version".into(), "1".into());
@@ -55,7 +60,14 @@ pub fn get_hostname() -> String {
     hostname::get()
         .ok()
         .and_then(|hostname| hostname.into_string().ok())
+        .filter(|hostname| safe_component(hostname, 255))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn safe_component(value: &str, maximum_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum_bytes
+        && !value.bytes().any(|byte| byte.is_ascii_control())
 }
 
 fn fingerprint_from_components(components: &HashMap<String, String>) -> String {
@@ -98,7 +110,7 @@ fn select_raw_identifier(components: &HashMap<String, String>) -> Option<&str> {
 fn populate_platform_components(components: &mut HashMap<String, String>) {
     if let Ok(platform_uuid) = machine_uid::get() {
         let trimmed = platform_uuid.trim();
-        if !trimmed.is_empty() {
+        if safe_component(trimmed, 1_024) {
             components.insert("platform_uuid".into(), trimmed.to_string());
             components.insert("primary_signal".into(), "platform_uuid".into());
         }
@@ -133,7 +145,7 @@ fn populate_platform_components(components: &mut HashMap<String, String>) {
 fn populate_platform_components(components: &mut HashMap<String, String>) {
     if let Ok(machine_guid) = machine_uid::get() {
         let trimmed = machine_guid.trim();
-        if !trimmed.is_empty() {
+        if safe_component(trimmed, 1_024) {
             components.insert("machine_guid".into(), trimmed.to_string());
             components.insert("primary_signal".into(), "machine_guid".into());
         }
@@ -145,9 +157,16 @@ fn populate_platform_components(_components: &mut HashMap<String, String>) {}
 
 #[cfg(target_os = "linux")]
 fn read_trimmed_file(path: &str) -> Option<String> {
-    let value = std::fs::read_to_string(path).ok()?;
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut value = String::new();
+    file.take(4_097).read_to_string(&mut value).ok()?;
+    if value.len() > 4_096 {
+        return None;
+    }
     let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    safe_component(trimmed, 1_024).then(|| trimmed.to_string())
 }
 
 #[cfg(test)]
