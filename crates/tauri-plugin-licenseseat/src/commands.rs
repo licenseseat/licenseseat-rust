@@ -1552,8 +1552,13 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn unique_storage_path(label: &str) -> PathBuf {
+        // Keep the directory component short enough for Windows' legacy path
+        // ceiling after the cache adds its opaque namespace and atomic-write
+        // temporary-file suffix. The nanosecond component retains per-test
+        // uniqueness; the label is diagnostic only.
+        let short_label: String = label.chars().take(24).collect();
         std::env::temp_dir().join(format!(
-            "{label}-{}",
+            "{short_label}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system time should be after unix epoch")
