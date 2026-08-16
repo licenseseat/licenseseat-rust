@@ -7,14 +7,18 @@
 
 use serde::Serialize;
 use std::env;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
 use std::io::Read;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
 use std::path::Path;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
 const MAX_SYSTEM_FILE_BYTES: u64 = 64 * 1024;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 128;
+/// Upper bound for string-valued `sysctl` reads, which are short identifiers
+/// such as `"15.5"`. Keeps a hostile or corrupt kernel value from allocating.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const MAX_SYSCTL_STRING_BYTES: usize = 128;
 
 /// Telemetry data collected from the device.
 #[derive(Debug, Clone, Serialize)]
@@ -102,6 +106,22 @@ fn os_name() -> String {
 
 /// Get the operating system version.
 fn os_version() -> String {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        // `kern.osproductversion` is the user-facing product version ("15.5"),
+        // available since macOS 10.13.4 / iOS 11.3. Deliberately not
+        // `kern.osrelease`, which reports the Darwin kernel version ("24.5.0").
+        if let Some(version) = sysctl_string("kern.osproductversion") {
+            return version;
+        }
+
+        // Older systems (and any kernel that hides the sysctl) still ship the
+        // product version in the system property list.
+        if let Some(version) = system_version_plist_product_version() {
+            return version;
+        }
+    }
+
     #[cfg(target_os = "linux")]
     {
         if let Some(content) = read_text_file_limited(Path::new("/etc/os-release")) {
@@ -180,6 +200,16 @@ fn num_cpus() -> Option<usize> {
 
 /// Get system memory in GB.
 fn memory_gb() -> Option<u64> {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        // `hw.memsize` is installed physical memory in bytes. Truncating
+        // division by 1024^3 keeps the same rounding as the Linux
+        // `/proc/meminfo` path below.
+        if let Some(bytes) = sysctl_u64("hw.memsize") {
+            return Some(bytes / (1024 * 1024 * 1024));
+        }
+    }
+
     #[cfg(target_os = "linux")]
     {
         if let Some(content) = read_text_file_limited(Path::new("/proc/meminfo")) {
@@ -229,7 +259,7 @@ fn bounded_environment_text(value: String) -> Option<String> {
     .then(|| value.to_string())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
 fn read_text_file_limited(path: &Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     let metadata = file.metadata().ok()?;
@@ -245,6 +275,104 @@ fn read_text_file_limited(path: &Path) -> Option<String> {
         .flatten()
 }
 
+/// Read a string-valued `sysctl` by name on Apple platforms.
+///
+/// Returns `None` when the name is unknown to the kernel, the value is empty,
+/// or the value is larger than [`MAX_SYSCTL_STRING_BYTES`].
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn sysctl_string(name: &str) -> Option<String> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut len: libc::size_t = 0;
+
+    // SAFETY: `name` is a valid NUL-terminated C string that outlives the call.
+    // A null value pointer asks the kernel for the size only, which it writes
+    // through `len`; no new value is written back (`newp` null, `newlen` 0).
+    let probe = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if probe != 0 || len == 0 || len > MAX_SYSCTL_STRING_BYTES {
+        return None;
+    }
+
+    let mut buffer = vec![0u8; len];
+    // SAFETY: as above, except the kernel now writes at most `len` bytes into
+    // `buffer`, which owns exactly `len` initialized bytes. `len` is updated to
+    // the number of bytes actually written; a value that grew between the two
+    // calls fails with `ENOMEM` instead of overflowing the buffer.
+    let read = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 || len == 0 || len > buffer.len() {
+        return None;
+    }
+
+    buffer.truncate(len);
+    // String sysctls are NUL-terminated; keep only the bytes before the first
+    // terminator.
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    buffer.truncate(end);
+
+    bounded_environment_text(String::from_utf8(buffer).ok()?)
+}
+
+/// Read a 64-bit integer `sysctl` by name on Apple platforms.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn sysctl_u64(name: &str) -> Option<u64> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut value: u64 = 0;
+    let mut len: libc::size_t = std::mem::size_of::<u64>();
+
+    // SAFETY: `name` is a valid NUL-terminated C string, and the kernel writes
+    // at most `len` bytes into `value`, which is exactly `size_of::<u64>()`
+    // bytes of owned, initialized storage. Nothing is written back to the
+    // kernel (`newp` null, `newlen` 0).
+    let read = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    (read == 0 && len == std::mem::size_of::<u64>()).then_some(value)
+}
+
+/// Parse `ProductVersion` out of the Apple system version property list.
+///
+/// Fallback for kernels without `kern.osproductversion` (macOS before 10.13.4).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn system_version_plist_product_version() -> Option<String> {
+    let content = read_text_file_limited(Path::new(
+        "/System/Library/CoreServices/SystemVersion.plist",
+    ))?;
+    let value = content
+        .split_once("<key>ProductVersion</key>")?
+        .1
+        .split_once("<string>")?
+        .1
+        .split_once("</string>")?
+        .0;
+
+    bounded_environment_text(value.to_string())
+}
+
 /// Generate a stable device identifier.
 ///
 /// This remains as a compatibility wrapper around the canonical fingerprint
@@ -252,4 +380,71 @@ fn read_text_file_limited(path: &Path) -> Option<String> {
 #[allow(dead_code)]
 pub fn generate_device_id() -> String {
     crate::device::generate_device_id()
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_os_version_reports_a_product_version() {
+        let version = os_version();
+        assert_ne!(
+            version, "unknown",
+            "macOS should resolve a product version through sysctl or SystemVersion.plist"
+        );
+
+        // Equivalent to matching `^\d+\.\d+`.
+        let mut components = version.split('.');
+        let major = components.next().unwrap_or_default();
+        let minor = components.next().unwrap_or_default();
+
+        assert!(
+            !major.is_empty() && major.bytes().all(|byte| byte.is_ascii_digit()),
+            "expected a numeric major version in {version:?}"
+        );
+        assert!(
+            !minor.is_empty() && minor.bytes().all(|byte| byte.is_ascii_digit()),
+            "expected a numeric minor version in {version:?}"
+        );
+        assert!(
+            major.parse::<u32>().is_ok_and(|major| major > 0),
+            "expected a non-zero macOS major version in {version:?}"
+        );
+    }
+
+    #[test]
+    fn macos_os_version_matches_the_product_version_sysctl() {
+        // Guards against regressing to `kern.osrelease`, which reports the
+        // Darwin kernel version rather than the user-facing product version.
+        let expected = sysctl_string("kern.osproductversion")
+            .expect("kern.osproductversion is available on macOS 10.13.4+");
+        assert_eq!(os_version(), expected);
+    }
+
+    #[test]
+    fn macos_system_version_plist_fallback_agrees_with_sysctl() {
+        let plist = system_version_plist_product_version()
+            .expect("SystemVersion.plist should expose ProductVersion");
+        assert_eq!(
+            Some(plist),
+            sysctl_string("kern.osproductversion"),
+            "plist fallback and sysctl should report the same product version"
+        );
+    }
+
+    #[test]
+    fn macos_memory_gb_is_reported() {
+        let memory = memory_gb().expect("hw.memsize should report installed memory on macOS");
+        assert!(memory > 0, "expected a positive GB reading, got {memory}");
+    }
+
+    #[test]
+    fn macos_architecture_uses_canonical_vocabulary() {
+        assert!(
+            matches!(architecture(), "aarch64" | "x86_64"),
+            "unexpected macOS architecture {:?}",
+            architecture()
+        );
+    }
 }
