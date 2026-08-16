@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Telemetry now reports the real macOS/iOS product version (for example
+  `15.7.3`) instead of `unknown`. It reads the `kern.osproductversion` sysctl
+  — not `kern.osrelease`, which is the Darwin kernel version — and falls back
+  to `ProductVersion` in `/System/Library/CoreServices/SystemVersion.plist` on
+  systems predating that sysctl.
+- Telemetry now reports `memory_gb` on macOS/iOS from the `hw.memsize` sysctl,
+  using the same truncating GB conversion as the Linux `/proc/meminfo` path.
+  The field was previously omitted on every non-Linux platform.
+
 ## [0.6.0] - 2026-08-10
 
 A minor version bump is required because the hardening adds fields to public
