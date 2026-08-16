@@ -23,6 +23,16 @@
   populated on every desktop platform the SDK supports.
 - `device_type` now distinguishes iPad from iPhone on iOS by reading the
   `hw.machine` model identifier, rather than always reporting `phone`.
+- `get_latest_release` and `list_releases` no longer reject releases whose
+  `platform` is `"any"`. The server's `by_platform` scope matches
+  `platform = ? OR platform = 'any'`, so a request filtered to a specific
+  platform legitimately resolves to a cross-platform release; the SDK failed
+  closed on products publishing a single universal artifact. Platforms outside
+  the requested filter are still rejected.
+- `list_releases_with_options` no longer errors when `has_more` is true and
+  `next_cursor` is absent or empty. The releases index derives `has_more` from
+  the page count while leaving `next_cursor` unset, so cross-checking the two
+  fields rejected valid paginated responses.
 
 ## [0.6.0] - 2026-08-10
 

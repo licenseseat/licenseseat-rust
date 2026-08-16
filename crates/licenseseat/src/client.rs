@@ -1636,8 +1636,13 @@ impl LicenseSeat {
         );
         let body: serde_json::Value = self.get(&path).await?;
         let releases = parse_release_list(&body)?;
+        // `has_more` and `next_cursor` are deliberately not cross-checked. The
+        // server's `releases_controller#index` derives `has_more` from the page
+        // count while hard-coding `next_cursor: nil`, so a truthful `has_more`
+        // with no cursor is the normal response for a paginated product.
+        // Requiring the pair to agree rejected valid responses; callers that
+        // need to page must treat a missing cursor as "no cursor available".
         if releases.object != "list"
-            || (releases.has_more && releases.next_cursor.as_deref().is_none_or(str::is_empty))
             || releases.data.iter().any(|release| {
                 verify_release_response(
                     release,
@@ -4652,6 +4657,18 @@ fn parse_release_list(body: &serde_json::Value) -> Result<ReleaseList> {
     ))))
 }
 
+/// Whether a release's platform satisfies a requested platform filter.
+///
+/// The server's `by_platform` scope is
+/// `where("platform = ? OR platform = 'any'")`, so a request filtered to, say,
+/// `macos` legitimately returns cross-platform (`"any"`) releases alongside the
+/// macOS-specific ones. Rejecting those was a false positive that made
+/// `get_latest_release`/`list_releases` fail against products that publish a
+/// single universal artifact.
+fn release_platform_matches(release_platform: &str, requested_platform: &str) -> bool {
+    release_platform == requested_platform || release_platform == "any"
+}
+
 fn verify_release_response(
     release: &Release,
     expected_product_slug: &str,
@@ -4664,7 +4681,7 @@ fn verify_release_response(
             .is_some_and(|channel| release.channel != channel)
         || expected_platform
             .filter(|value| !value.is_empty())
-            .is_some_and(|platform| release.platform != platform)
+            .is_some_and(|platform| !release_platform_matches(&release.platform, platform))
     {
         return Err(Error::ResponseMismatch(
             "release response did not match the requested product or filters".into(),
