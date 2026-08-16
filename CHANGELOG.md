@@ -12,6 +12,17 @@
 - Telemetry now reports `memory_gb` on macOS/iOS from the `hw.memsize` sysctl,
   using the same truncating GB conversion as the Linux `/proc/meminfo` path.
   The field was previously omitted on every non-Linux platform.
+- Telemetry now reports the real Windows version (for example `10.0.26100`)
+  instead of `unknown`. It reads `ntdll!RtlGetVersion`, which — unlike
+  `GetVersionExW` — is never shimmed to 6.2 for host applications whose
+  manifest omits a `supportedOS` entry, so the reading does not depend on how
+  the embedding application is manifested.
+- Telemetry now reports `memory_gb` on Windows from `GlobalMemoryStatusEx`
+  (`ullTotalPhys`), using the same truncating GB conversion as the macOS and
+  Linux paths. With this and the macOS fix, `os_version` and `memory_gb` are
+  populated on every desktop platform the SDK supports.
+- `device_type` now distinguishes iPad from iPhone on iOS by reading the
+  `hw.machine` model identifier, rather than always reporting `phone`.
 
 ## [0.6.0] - 2026-08-10
 

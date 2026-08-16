@@ -64,7 +64,14 @@ hostname = "0.4"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+# `Win32_Storage_FileSystem` backs the cache's reparse-point handling.
+# `Win32_System_SystemInformation` provides `GlobalMemoryStatusEx`/`OSVERSIONINFOW`
+# and `Wdk_System_SystemServices` provides `RtlGetVersion`, both used by telemetry.
+windows-sys = { version = "0.61", features = [
+    "Wdk_System_SystemServices",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

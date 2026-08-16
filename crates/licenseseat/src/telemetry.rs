@@ -139,6 +139,13 @@ fn os_version() -> String {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(version) = rtl_os_version() {
+            return version;
+        }
+    }
+
     "unknown".to_string()
 }
 
@@ -160,10 +167,18 @@ fn device_type() -> &'static str {
     return "desktop";
     #[cfg(target_os = "ios")]
     {
-        // iOS can be phone or tablet - check screen size or device model
-        // For now, default to phone (most common)
-        // TODO: Could use UIDevice.current.userInterfaceIdiom via FFI
-        return "phone";
+        // `hw.machine` is the hardware model identifier ("iPhone16,2",
+        // "iPad14,3"). Every iPad model identifier is prefixed "iPad", so the
+        // prefix separates the tablet idiom from the phone idiom without
+        // linking UIKit for `UIDevice.userInterfaceIdiom`. iPod touch and the
+        // simulator both fall through to "phone", which matches their idiom.
+        //
+        // Compile-gated to iOS, so the host test suite never exercises this
+        // branch; it is covered by the shared `sysctl_string` tests on macOS.
+        return match sysctl_string("hw.machine") {
+            Some(model) if model.starts_with("iPad") => "tablet",
+            _ => "phone",
+        };
     }
     #[cfg(target_os = "android")]
     {
@@ -226,7 +241,76 @@ fn memory_gb() -> Option<u64> {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        // `ullTotalPhys` is installed physical memory in bytes. Truncating
+        // division by 1024^3 keeps the same rounding as the macOS `hw.memsize`
+        // and Linux `/proc/meminfo` paths above.
+        if let Some(bytes) = total_physical_memory_bytes() {
+            return Some(bytes / (1024 * 1024 * 1024));
+        }
+    }
+
     None
+}
+
+/// Read installed physical memory in bytes from `GlobalMemoryStatusEx`.
+///
+/// Returns `None` when the call fails or reports zero, so callers fall back to
+/// omitting the field rather than publishing a bogus `0`.
+#[cfg(target_os = "windows")]
+fn total_physical_memory_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        // The API rejects the call unless the caller states the struct size it
+        // compiled against, which is how it version-checks the layout.
+        dwLength: u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?,
+        ..Default::default()
+    };
+
+    // SAFETY: `status` is owned, fully initialized, correctly aligned storage of
+    // exactly `size_of::<MEMORYSTATUSEX>()` bytes, and `dwLength` declares that
+    // same size, so the kernel writes only within the struct. The pointer is
+    // valid for the duration of the call and is not retained afterwards.
+    let populated = unsafe { GlobalMemoryStatusEx(&raw mut status) };
+
+    (populated != 0 && status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
+}
+
+/// Read the OS version through `ntdll!RtlGetVersion`, formatted
+/// "major.minor.build".
+///
+/// `RtlGetVersion` is used in preference to `GetVersionExW`, which is shimmed to
+/// report 6.2 (Windows 8) for processes whose application manifest lacks a
+/// `supportedOS` entry for the running release. `RtlGetVersion` is never shimmed,
+/// so the reading is correct regardless of how the host application is
+/// manifested — SDK consumers do not control that manifest.
+#[cfg(target_os = "windows")]
+fn rtl_os_version() -> Option<String> {
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    let mut info = OSVERSIONINFOW {
+        dwOSVersionInfoSize: u32::try_from(std::mem::size_of::<OSVERSIONINFOW>()).ok()?,
+        ..Default::default()
+    };
+
+    // SAFETY: `info` is owned, fully initialized, correctly aligned storage of
+    // exactly `size_of::<OSVERSIONINFOW>()` bytes, and `dwOSVersionInfoSize`
+    // declares that same size, so `ntdll` writes only within the struct. The
+    // pointer is valid for the duration of the call and is not retained.
+    let status = unsafe { RtlGetVersion(&raw mut info) };
+
+    // `STATUS_SUCCESS` is 0; any negative `NTSTATUS` is a failure.
+    if status != 0 {
+        return None;
+    }
+
+    bounded_environment_text(format!(
+        "{}.{}.{}",
+        info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber
+    ))
 }
 
 /// Get the system locale.
@@ -446,5 +530,74 @@ mod tests {
             "unexpected macOS architecture {:?}",
             architecture()
         );
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_os_version_reports_a_build_triple() {
+        let version = os_version();
+        assert_ne!(
+            version, "unknown",
+            "Windows should resolve a version through RtlGetVersion"
+        );
+
+        let components: Vec<&str> = version.split('.').collect();
+        assert_eq!(
+            components.len(),
+            3,
+            "expected a major.minor.build triple in {version:?}"
+        );
+        for component in &components {
+            assert!(
+                !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit()),
+                "expected numeric version components in {version:?}"
+            );
+        }
+
+        // Every supported Windows release reports major >= 6 (Vista and later);
+        // Windows 10 and 11 both report major 10 with a distinguishing build.
+        assert!(
+            components[0].parse::<u32>().is_ok_and(|major| major >= 6),
+            "expected a supported Windows major version in {version:?}"
+        );
+        assert!(
+            components[2].parse::<u32>().is_ok_and(|build| build > 0),
+            "expected a non-zero build number in {version:?}"
+        );
+    }
+
+    #[test]
+    fn windows_os_version_is_not_shimmed_to_windows_8() {
+        // `GetVersionExW` reports 6.2 for unmanifested processes. Test binaries
+        // are unmanifested, so a 6.2 reading here would mean the shimmed API
+        // leaked back in.
+        let version = os_version();
+        assert_ne!(
+            version.split('.').take(2).collect::<Vec<_>>().join("."),
+            "6.2",
+            "RtlGetVersion should bypass the GetVersionExW manifest shim, got {version:?}"
+        );
+    }
+
+    #[test]
+    fn windows_memory_gb_is_reported() {
+        let memory = memory_gb().expect("GlobalMemoryStatusEx should report installed memory");
+        assert!(memory > 0, "expected a positive GB reading, got {memory}");
+    }
+
+    #[test]
+    fn windows_memory_gb_truncates_like_the_unix_paths() {
+        let bytes = total_physical_memory_bytes().expect("physical memory should be readable");
+        assert_eq!(memory_gb(), Some(bytes / (1024 * 1024 * 1024)));
+    }
+
+    #[test]
+    fn windows_device_type_is_desktop() {
+        assert_eq!(device_type(), "desktop");
+        assert_eq!(os_name(), "Windows");
     }
 }
