@@ -600,7 +600,12 @@ async fn release_list_rejects_one_substituted_item() {
 }
 
 #[tokio::test]
-async fn release_list_requires_a_nonempty_cursor_when_more_pages_exist() {
+async fn release_list_tolerates_has_more_without_a_cursor() {
+    // Regression: the SDK used to require a non-empty `next_cursor` whenever
+    // `has_more` was true and rejected the pair otherwise. `releases_controller#index`
+    // derives `has_more` from the page count but hard-codes `next_cursor: nil`,
+    // so that combination is the server's normal paginated response, not an
+    // adversarial one. Cross-checking the two fields fails closed on valid data.
     for next_cursor in [None, Some("")] {
         let server = MockServer::start().await;
         let storage = tempfile::tempdir().unwrap();
@@ -611,6 +616,7 @@ async fn release_list_requires_a_nonempty_cursor_when_more_pages_exist() {
                 "version": "1.0.0",
                 "channel": "stable",
                 "platform": "macos",
+                "published_at": "2026-01-01T00:00:00Z",
                 "product_slug": "test-product"
             }],
             "has_more": true
@@ -625,11 +631,68 @@ async fn release_list_requires_a_nonempty_cursor_when_more_pages_exist() {
             .await;
 
         let sdk = LicenseSeat::try_new(test_config(&server, &storage)).unwrap();
-        assert!(matches!(
-            sdk.list_releases(None, Some("stable"), Some("macos")).await,
-            Err(Error::ResponseMismatch(_))
-        ));
+        let releases = sdk
+            .list_releases(None, Some("stable"), Some("macos"))
+            .await
+            .unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].version, "1.0.0");
     }
+}
+
+#[tokio::test]
+async fn release_list_still_rejects_a_platform_outside_the_requested_filter() {
+    // The `"any"` relaxation must not become a blanket pass: a concrete platform
+    // that is neither the requested one nor `"any"` is still a substitution.
+    let server = MockServer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    Mock::given(method("GET"))
+        .and(path("/products/test-product/releases"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{
+                "object": "release",
+                "version": "1.0.0",
+                "channel": "stable",
+                "platform": "windows",
+                "published_at": "2026-01-01T00:00:00Z",
+                "product_slug": "test-product"
+            }],
+            "has_more": false
+        })))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::try_new(test_config(&server, &storage)).unwrap();
+    assert!(matches!(
+        sdk.list_releases(None, Some("stable"), Some("macos")).await,
+        Err(Error::ResponseMismatch(_))
+    ));
+}
+
+#[tokio::test]
+async fn latest_release_still_rejects_a_platform_outside_the_requested_filter() {
+    let server = MockServer::start().await;
+    let storage = tempfile::tempdir().unwrap();
+    Mock::given(method("GET"))
+        .and(path("/products/test-product/releases/latest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "release",
+            "version": "1.0.0",
+            "channel": "stable",
+            "platform": "linux",
+            "published_at": "2026-01-01T00:00:00Z",
+            "product_slug": "test-product"
+        })))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::try_new(test_config(&server, &storage)).unwrap();
+    assert!(matches!(
+        sdk.get_latest_release(None, Some("stable"), Some("macos"))
+            .await,
+        Err(Error::ResponseMismatch(_))
+    ));
 }
 
 #[tokio::test]

@@ -1917,6 +1917,100 @@ async fn test_list_releases_with_options_returns_envelope() {
 }
 
 #[tokio::test]
+async fn test_get_latest_release_accepts_any_platform() {
+    // Regression: the server's `by_platform` scope is
+    // `where("platform = ? OR platform = 'any'")` (release.rb:50), so a request
+    // filtered to `macos` legitimately resolves to a cross-platform release.
+    // The SDK used to reject `platform: "any"` as a response mismatch.
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/products/test-product/releases/latest"))
+        .and(query_param("channel", "stable"))
+        .and(query_param("platform", "macos"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(release_response("3.0.0", "stable", "any")),
+        )
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    let result = sdk
+        .get_latest_release(None, Some("stable"), Some("macos"))
+        .await
+        .unwrap();
+
+    assert_eq!(result.version, "3.0.0");
+    assert_eq!(result.platform, "any");
+}
+
+#[tokio::test]
+async fn test_list_releases_accepts_any_platform_alongside_filtered_ones() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/products/test-product/releases"))
+        .and(query_param("platform", "windows"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [
+                release_response("3.0.0", "stable", "any"),
+                release_response("2.0.0", "stable", "windows")
+            ],
+            "has_more": false
+        })))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    let result = sdk
+        .list_releases(None, None, Some("windows"))
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].platform, "any");
+    assert_eq!(result[1].platform, "windows");
+}
+
+#[tokio::test]
+async fn test_list_releases_with_options_tolerates_has_more_without_cursor() {
+    // Regression: `releases_controller#index` sets `has_more` from the page
+    // count but hard-codes `next_cursor: nil`. The SDK used to reject that
+    // combination, which made every paginated product fail closed.
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/products/test-product/releases"))
+        .and(query_param("limit", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [release_response("2.1.0", "stable", "macos")],
+            "has_more": true,
+            "next_cursor": null
+        })))
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::new(test_config(&server.uri()));
+    let result = sdk
+        .list_releases_with_options(
+            None,
+            licenseseat::ReleaseListOptions {
+                channel: None,
+                platform: None,
+                limit: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.data.len(), 1);
+    assert!(result.has_more);
+    assert_eq!(result.next_cursor, None);
+}
+
+#[tokio::test]
 async fn test_generate_download_token() {
     let server = MockServer::start().await;
 
