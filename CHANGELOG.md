@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-17
+
 ### Fixed
 
 - Telemetry now reports the real macOS/iOS product version (for example
