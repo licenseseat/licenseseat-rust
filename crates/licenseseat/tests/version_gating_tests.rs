@@ -62,6 +62,36 @@ fn below_version_parses_and_older_payloads_stay_none() {
     assert_eq!(legacy.below_version, None);
 }
 
+/// `covers_version` is the client-side half of the server's gate and must
+/// match its rule exactly: exclusive, core versions, lenient parsing,
+/// fail-open on the unreadable.
+#[test]
+fn covers_version_matches_the_server_rule() {
+    let bounded = Entitlement {
+        key: "updates".into(),
+        expires_at: None,
+        below_version: Some("3.0.0".into()),
+        metadata: None,
+    };
+    assert!(bounded.covers_version("2.3"), "lenient: 2.3 counts as 2.3.0");
+    assert!(bounded.covers_version("2.9.9-beta.1"), "a prerelease below the ceiling is covered");
+    assert!(!bounded.covers_version("3.0"), "the ceiling is exclusive: 3.0 is not below 3.0.0");
+    assert!(
+        !bounded.covers_version("3.0.0-beta.1"),
+        "a prerelease OF the ceiling is not below it — same rule as the server"
+    );
+    assert!(!bounded.covers_version("4.1.0"));
+    assert!(bounded.covers_version("nightly-build"), "unparseable fails open — never brick the app");
+
+    let unbounded = Entitlement {
+        key: "updates".into(),
+        expires_at: None,
+        below_version: None,
+        metadata: None,
+    };
+    assert!(unbounded.covers_version("99.0.0"), "no ceiling covers everything");
+}
+
 /// A version-gated refusal is a normal `valid: false` envelope carrying the
 /// `version_not_entitled` code — the SDK must store it like any other
 /// invalid result, code intact, bounded entitlement parsed.

@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-08-19
+
+### Added
+
+- `Entitlement::covers_version`: the client-side half of the server's
+  version gate, so apps enforcing the ceiling locally (belt-and-suspenders
+  for requests that never declared a version) share one tested comparison
+  instead of hand-rolling it. Matches the server's rule exactly —
+  exclusive, core versions, lenient parsing (`"3.0"` counts as `3.0.0`),
+  fail-open on unparseable strings.
+
 ## [0.6.2] - 2026-08-19
 
 ### Added
