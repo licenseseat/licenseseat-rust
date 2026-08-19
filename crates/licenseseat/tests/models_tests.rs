@@ -156,6 +156,7 @@ fn test_entitlement_creation() {
     let entitlement = Entitlement {
         key: "pro-features".into(),
         expires_at: Some(expiry),
+        below_version: None,
         metadata: None,
     };
 
@@ -169,6 +170,7 @@ fn test_entitlement_permanent() {
     let entitlement = Entitlement {
         key: "lifetime".into(),
         expires_at: None, // No expiration = permanent
+        below_version: None,
         metadata: None,
     };
 
@@ -182,6 +184,7 @@ fn test_entitlement_is_expired() {
     let entitlement = Entitlement {
         key: "expired-feature".into(),
         expires_at: Some(past),
+        below_version: None,
         metadata: None,
     };
 
@@ -195,6 +198,7 @@ fn test_entitlement_is_active() {
     let entitlement = Entitlement {
         key: "active-feature".into(),
         expires_at: Some(future),
+        below_version: None,
         metadata: None,
     };
 
@@ -217,6 +221,7 @@ fn test_machine_file_payload_entitlement_check_enforces_grant_lifetime() {
         active_entitlements: vec![Entitlement {
             key: "pro-feature".into(),
             expires_at: entitlement_expiry,
+            below_version: None,
             metadata: None,
         }],
         metadata: None,
@@ -272,6 +277,7 @@ fn test_entitlement_status_active() {
         entitlement: Some(Entitlement {
             key: "pro".into(),
             expires_at: None,
+            below_version: None,
             metadata: None,
         }),
         expires_at: None,
@@ -304,6 +310,7 @@ fn test_entitlement_status_expired() {
         entitlement: Some(Entitlement {
             key: "trial".into(),
             expires_at: Some(past),
+            below_version: None,
             metadata: None,
         }),
         expires_at: Some(past),

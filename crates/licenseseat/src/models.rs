@@ -38,6 +38,12 @@ pub struct Entitlement {
     /// Expiration date (if applicable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    /// Exclusive core-semver version ceiling (server-enforced on the
+    /// `updates` entitlement since LicenseSeat API 2026-08-19): the license
+    /// covers app versions strictly below this. `None` means unbounded, and
+    /// servers older than the field never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub below_version: Option<String>,
     /// Additional metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
