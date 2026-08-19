@@ -189,6 +189,10 @@ pub fn token_to_validation_result(token: &OfflineTokenResponse) -> Result<Valida
                     .expires_at
                     .map(timestamp_to_datetime)
                     .transpose()?,
+                // Offline envelopes deliberately do not carry version
+                // ceilings yet (their verifiers fail closed on unknown
+                // fields; server ships them online-only for now).
+                below_version: None,
                 metadata: None,
             })
         })
@@ -886,6 +890,9 @@ fn parse_included_license(
             Ok(Entitlement {
                 key,
                 expires_at,
+                // Machine files do not carry version ceilings yet — see the
+                // online-only note on the sibling constructor above.
+                below_version: None,
                 metadata: None,
             })
         })

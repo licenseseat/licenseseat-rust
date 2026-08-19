@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "licenseseat"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -3406,7 +3406,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-licenseseat"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "chrono",
  "dirs 5.0.1",

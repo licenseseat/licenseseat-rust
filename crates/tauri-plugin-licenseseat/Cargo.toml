@@ -21,7 +21,7 @@ tauri-plugin = { version = "2", features = ["build"] }
 
 [dependencies]
 # Core SDK (re-exported) - use path for workspace, version for publishing
-licenseseat = { path = "../licenseseat", version = "0.6.1", features = ["offline"] }
+licenseseat = { path = "../licenseseat", version = "0.6.2", features = ["offline"] }
 
 # Tauri
 tauri = { version = "2", default-features = false }

@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-08-19
+
+### Added
+
+- `Entitlement.below_version`: the server's exclusive core-semver version
+  ceiling on the `updates` entitlement (LicenseSeat API 2026-08-19). `None`
+  from older servers; offline artifacts do not carry it yet by design.
+- Version-gating compatibility tests pinning the three contracts the
+  server-side gate stands on: `below_version` parses (and its absence stays
+  `None`), a `version_not_entitled` validation refusal surfaces its code
+  through the SDK, and `telemetry.app_version` — which the server's gate
+  reads — actually rides licensing request bodies when telemetry is enabled.
+
 ## [0.6.1] - 2026-08-17
 
 ### Fixed
