@@ -49,6 +49,48 @@ pub struct Entitlement {
     pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
+impl Entitlement {
+    /// Whether this entitlement's version ceiling covers the given app
+    /// version — the client-side half of the server's version gate, for
+    /// apps that want to enforce locally as well (belt-and-suspenders when
+    /// the server was never told the app's version).
+    ///
+    /// No ceiling covers everything. The comparison matches the server's
+    /// rule exactly: **exclusive**, on **core** versions (`"3.0"` counts as
+    /// `3.0.0`; a prerelease OF the ceiling is not below it), failing
+    /// **open** on unparseable strings — local gating is a second line of
+    /// defense and must never brick an app; the server stays authoritative.
+    pub fn covers_version(&self, version: &str) -> bool {
+        let Some(ceiling) = self.below_version.as_deref() else {
+            return true;
+        };
+        match (core_components(version), core_components(ceiling)) {
+            (Some(lhs), Some(rhs)) => lhs < rhs,
+            _ => true,
+        }
+    }
+}
+
+/// Lenient core-version parse: `"3.0"` pads to `[3, 0, 0]`, prerelease and
+/// build metadata are ignored, anything else is `None`.
+fn core_components(version: &str) -> Option<[u64; 3]> {
+    let core = version
+        .trim()
+        .split(['-', '+'])
+        .next()
+        .filter(|part| !part.is_empty())?;
+    let mut numbers = [0u64; 3];
+    let mut count = 0;
+    for part in core.split('.') {
+        if count >= 3 {
+            return None;
+        }
+        numbers[count] = part.parse().ok()?;
+        count += 1;
+    }
+    (count >= 1).then_some(numbers)
+}
+
 /// License object as returned by the API.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct LicenseResponse {
