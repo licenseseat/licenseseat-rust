@@ -531,14 +531,10 @@ impl LicenseSeat {
 
                 #[cfg(feature = "offline")]
                 {
-                    let sdk = self.clone();
+                    let weak = Arc::downgrade(&self.inner);
+                    let generation = self.inner.support_tasks_generation.load(Ordering::SeqCst);
                     tokio::spawn(async move {
-                        if let Err(error) = sdk.sync_offline_assets().await {
-                            warn!(
-                                "Failed to sync offline assets: {}",
-                                error.redacted_log_summary()
-                            );
-                        }
+                        Self::sync_offline_assets_after_activation(weak, generation).await;
                     });
                 }
 
@@ -2269,6 +2265,79 @@ impl LicenseSeat {
         }
     }
 
+    /// Fetch the offline artifact right after activation, retrying briefly.
+    ///
+    /// This was a single attempt whose failure was logged and dropped. The only
+    /// other chance was `offline_refresh_loop`, one whole
+    /// `offline_token_refresh_interval` later — 72 hours on hosts that raise it
+    /// from the default. So an activation that happened to land in a network
+    /// gap left the install with no cached artifact for days, and any
+    /// validation in that window had nothing to fall back on: exactly the
+    /// state that used to surface as a bogus denial.
+    ///
+    /// Short, bounded, and front-loaded, because a gap at activation is
+    /// normally over in seconds. Anything still failing after this belongs to
+    /// the refresh loop rather than to a task kept alive indefinitely.
+    #[cfg(feature = "offline")]
+    async fn sync_offline_assets_after_activation(weak: Weak<LicenseSeatInner>, generation: u64) {
+        const RETRY_DELAYS: [Duration; 4] = [
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Duration::from_secs(120),
+            Duration::from_secs(600),
+        ];
+
+        let mut delays = RETRY_DELAYS.iter().copied();
+        let mut attempt = 1usize;
+
+        loop {
+            // Rebuilt per attempt from a Weak so a retry schedule can never be
+            // what keeps the SDK alive after the host drops it.
+            let outcome = {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let sdk = Self { inner };
+                if !sdk.support_tasks_should_continue(generation) {
+                    debug!("Offline asset sync stopping: background tasks superseded");
+                    return;
+                }
+                sdk.sync_offline_assets().await
+            };
+
+            match outcome {
+                Ok(()) => return,
+                // The activation this artifact would belong to is gone or has
+                // been replaced. Whatever replaced it runs its own sync.
+                Err(error @ (Error::NoActiveLicense | Error::OperationSuperseded { .. })) => {
+                    debug!(
+                        "Offline asset sync stopping: {}",
+                        error.redacted_log_summary()
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let Some(delay) = delays.next() else {
+                        warn!(
+                            "Failed to sync offline assets after {} attempts, leaving it to the refresh loop: {}",
+                            attempt,
+                            error.redacted_log_summary()
+                        );
+                        return;
+                    };
+                    warn!(
+                        "Offline asset sync attempt {} failed, retrying in {:?}: {}",
+                        attempt,
+                        delay,
+                        error.redacted_log_summary()
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
     /// Offline asset refresh loop.
     #[cfg(feature = "offline")]
     async fn offline_refresh_loop(
@@ -3242,12 +3311,19 @@ impl LicenseSeat {
             }
         }
 
-        let mut result = last_invalid.unwrap_or_else(|| {
-            offline_invalid_result(
-                Some("no_offline_artifact".into()),
-                Some("No cached machine file or offline token available".into()),
-            )
-        });
+        // Nothing to inspect at all. Every branch above examined an artifact
+        // and rejected it, which is a verdict; this is the absence of one.
+        //
+        // `OfflineFallbackMode`'s contract is explicit that "only specifically
+        // recognized authoritative license denials clear the last trusted
+        // grant", so committing this as a denial — which is what
+        // `finalize_offline_validation` does with any invalid result — would
+        // revoke a perfectly good license because the network happened to be
+        // down before the first machine-file sync succeeded. Report it as an
+        // error instead and leave the established grant exactly as it was.
+        let Some(mut result) = last_invalid else {
+            return Err(Error::NoOfflineArtifact);
+        };
         self.finalize_offline_validation(
             expected_identity,
             expected_state_operation,

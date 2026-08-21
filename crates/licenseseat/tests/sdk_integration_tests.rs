@@ -3083,3 +3083,88 @@ async fn test_duplicate_keys_in_nested_api_metadata_are_rejected() {
     ));
     assert!(sdk.current_license().is_none());
 }
+
+/// A network blip before the first machine-file sync landed used to revoke a
+/// perfectly valid license.
+///
+/// `perform_offline_validation` ends in a fallback for "there is no artifact to
+/// check", and `finalize_offline_validation` committed *any* invalid result
+/// with `trusted_license = None` and `TrustedLicenseSource::FailClosedDenial`.
+/// That contradicts `OfflineFallbackMode`'s own contract — "only specifically
+/// recognized authoritative license denials clear the last trusted grant" —
+/// because an absent artifact is not a denial, it is the absence of a verdict.
+/// Downstream, a paid perpetual license read as revoked and the host app
+/// dropped the user onto its paywall until the network came back.
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn no_cached_artifact_does_not_revoke_an_established_grant() {
+    let server = MockServer::start().await;
+    let license_key = "PERPETUAL-KEY-0001";
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response_with_license(
+                license_key,
+                "device-123",
+                license_json(
+                    license_key,
+                    "active",
+                    "perpetual",
+                    "hardware_locked",
+                    &["unlimited_history"],
+                    "Test App",
+                ),
+            )),
+        )
+        .mount(&server)
+        .await;
+
+    let sdk = LicenseSeat::try_new(test_config(&server.uri())).unwrap();
+    sdk.activate(license_key).await.expect("activation");
+    assert!(matches!(sdk.status(), LicenseStatus::Active { .. }));
+    assert!(
+        sdk.current_authoritative_validation()
+            .expect("activation establishes an authoritative grant")
+            .valid
+    );
+
+    // No machine file was ever checked out — this server never offered one,
+    // which is the position an install is in when its post-activation sync
+    // failed and the 72h refresh has not come round yet.
+    assert!(
+        sdk.current_machine_file().is_none(),
+        "precondition: nothing cached to validate against"
+    );
+
+    // Make the service unavailable. NetworkOnly is documented to fall back to
+    // offline validation for availability errors — transport failures,
+    // timeouts, 408, and 5xx — which is the situation this test is about.
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let error = sdk
+        .validate()
+        .await
+        .expect_err("offline validation cannot reach a verdict with no artifact");
+    assert!(
+        matches!(error, licenseseat::Error::NoOfflineArtifact),
+        "expected an inconclusive outcome, got {error:?}"
+    );
+
+    // The point of the test: the grant established online is still standing.
+    assert!(
+        matches!(sdk.status(), LicenseStatus::Active { .. }),
+        "an absent artifact must not revoke an established grant, got {:?}",
+        sdk.status()
+    );
+    assert!(
+        sdk.current_authoritative_validation()
+            .expect("authoritative grant must survive an inconclusive offline check")
+            .valid
+    );
+    assert!(sdk.has_entitlement("unlimited_history"));
+}
