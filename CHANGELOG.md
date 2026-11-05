@@ -48,6 +48,14 @@
   longer depends on scheduling: it subscribes before activating, stamps the
   expiry when the mock server responds, waits on the wall clock instead of a
   fixed sleep, and asserts emitted events synchronously. (#9)
+- Three more tests asserted inside fixed wall-clock budgets that durable
+  cache commits (`File::sync_all` is `F_FULLFSYNC` on macOS) overran under
+  parallel load: `revoked_auto_validation_does_not_send_a_followup_heartbeat`
+  now waits for `license:revoked`;
+  `test_support_tasks_do_not_duplicate_after_restart` checks request
+  spacing instead of counting inside 40 ms windows; and
+  `signed_offline_runtime_grant_expires_without_process_restart` stamps its
+  5 s machine-file window when the file is first served. (#12)
 
 ## [0.6.3] - 2026-08-19
 
