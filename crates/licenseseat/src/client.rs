@@ -113,12 +113,15 @@ struct RuntimeLicenseState {
     /// Wall-clock anchor paired with a monotonic process clock. Authorization
     /// time never moves backwards while the process remains alive, even if the
     /// system clock is rolled back after offline verification.
-    observed_wall_time: i64,
+    observed_wall_time: chrono::DateTime<Utc>,
     observed_monotonic: Instant,
-    /// Greatest effective authorization timestamp observed in this process.
-    /// This closes the forward-then-backward clock sequence that a fixed
-    /// monotonic floor alone cannot detect.
-    last_effective_timestamp: i64,
+    /// Greatest effective authorization time observed in this process, at
+    /// full precision. This closes the forward-then-backward clock sequence
+    /// that a fixed monotonic floor alone cannot detect. It is also the `now`
+    /// of the most recent observation: callers of `runtime_license_state`
+    /// read it through [`Self::observed_now`] so the transition check and the
+    /// answer they return use one and the same instant.
+    last_effective: chrono::DateTime<Utc>,
     /// Next active-entitlement expiry that should notify state subscribers.
     /// Kept at full precision: entitlement expiries carry sub-second parts,
     /// and every observation compares them against a full-precision `now`.
@@ -130,28 +133,20 @@ struct RuntimeLicenseState {
 }
 
 impl RuntimeLicenseState {
-    fn effective_now(&self) -> chrono::DateTime<Utc> {
-        let wall_now = Utc::now();
-        let elapsed =
-            i64::try_from(self.observed_monotonic.elapsed().as_secs()).unwrap_or(i64::MAX);
-        let effective_timestamp = effective_runtime_timestamp(
-            wall_now.timestamp(),
+    fn observe_effective_now(&mut self) -> chrono::DateTime<Utc> {
+        let now = effective_runtime_time(
+            Utc::now(),
             self.observed_wall_time,
-            elapsed,
-            self.last_effective_timestamp,
+            self.observed_monotonic.elapsed(),
+            self.last_effective,
         );
-        if effective_timestamp > wall_now.timestamp() {
-            chrono::DateTime::from_timestamp(effective_timestamp, 0)
-                .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC)
-        } else {
-            wall_now
-        }
+        self.last_effective = now;
+        now
     }
 
-    fn observe_effective_now(&mut self) -> chrono::DateTime<Utc> {
-        let now = self.effective_now();
-        self.last_effective_timestamp = now.timestamp();
-        now
+    /// The instant of the observation that produced this snapshot.
+    fn observed_now(&self) -> chrono::DateTime<Utc> {
+        self.last_effective
     }
 }
 
@@ -1160,7 +1155,7 @@ impl LicenseSeat {
                 entitlement: None,
             };
         };
-        let now = runtime_state.effective_now();
+        let now = runtime_state.observed_now();
         let license = runtime_state.license;
 
         let Some(validation) = &license.validation else {
@@ -1301,7 +1296,7 @@ impl LicenseSeat {
             };
         };
 
-        let now = runtime_state.effective_now();
+        let now = runtime_state.observed_now();
         let status = license_status_for_observation(
             &runtime_state.license,
             &self.inner.config.product_slug,
@@ -3556,9 +3551,9 @@ impl LicenseSeat {
             .recovery_license
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let observed_at = Utc::now();
-        let observed_wall_time = observed_at.timestamp();
-        let next_entitlement_transition_at = next_entitlement_transition(&license, &observed_at);
+        let observed_wall_time = Utc::now();
+        let next_entitlement_transition_at =
+            next_entitlement_transition(&license, &observed_wall_time);
         *self
             .inner
             .runtime_license_state
@@ -3569,7 +3564,7 @@ impl LicenseSeat {
             authorization_expires_at,
             observed_wall_time,
             observed_monotonic: Instant::now(),
-            last_effective_timestamp: observed_wall_time,
+            last_effective: observed_wall_time,
             next_entitlement_transition_at,
         });
     }
@@ -3597,7 +3592,7 @@ impl LicenseSeat {
         &self,
     ) -> Option<(ValidationResult, TrustedLicenseSource)> {
         let state = self.runtime_license_state()?;
-        let now = state.effective_now();
+        let now = state.observed_now();
         state
             .license
             .validation
@@ -4146,16 +4141,23 @@ fn validation_for_observation(
     validation
 }
 
-fn effective_runtime_timestamp(
-    wall_now: i64,
-    observed_wall_time: i64,
-    elapsed: i64,
-    last_effective_timestamp: i64,
-) -> i64 {
-    wall_now
-        .max(observed_wall_time.saturating_add(elapsed.max(0)))
-        .max(last_effective_timestamp)
-        .min(chrono::DateTime::<Utc>::MAX_UTC.timestamp())
+/// Authorization time for one observation: the wall clock, floored by the
+/// monotonic time elapsed since the state was installed and by the greatest
+/// time already observed, all at full precision. Truncating the floors to
+/// whole seconds let a wall-clock rollback move effective time back to the
+/// start of the current second, reviving an entitlement whose sub-second
+/// expiry had already been observed and announced (licenseseat-rust#9 review).
+fn effective_runtime_time(
+    wall_now: chrono::DateTime<Utc>,
+    observed_wall_time: chrono::DateTime<Utc>,
+    elapsed: Duration,
+    last_effective: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    let monotonic_floor = chrono::Duration::from_std(elapsed)
+        .ok()
+        .and_then(|elapsed| observed_wall_time.checked_add_signed(elapsed))
+        .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
+    wall_now.max(monotonic_floor).max(last_effective)
 }
 
 /// Options for license activation.
@@ -5348,16 +5350,60 @@ mod entitlement_transition_tests {
 
 #[cfg(test)]
 mod runtime_clock_tests {
-    use super::effective_runtime_timestamp;
+    use super::effective_runtime_time;
+    use chrono::{DateTime, TimeZone, Utc};
+    use std::time::Duration;
+
+    fn at(seconds: i64, millis: u32) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, millis * 1_000_000).unwrap()
+    }
 
     #[test]
     fn runtime_authorization_clock_never_moves_backwards() {
-        assert_eq!(effective_runtime_timestamp(900, 1_000, 20, 1_000), 1_020);
-        assert_eq!(effective_runtime_timestamp(1_100, 1_000, 20, 1_000), 1_100);
-        assert_eq!(effective_runtime_timestamp(900, 1_000, -20, 1_000), 1_000);
+        let secs = Duration::from_secs;
+        assert_eq!(
+            effective_runtime_time(at(900, 0), at(1_000, 0), secs(20), at(1_000, 0)),
+            at(1_020, 0)
+        );
+        assert_eq!(
+            effective_runtime_time(at(1_100, 0), at(1_000, 0), secs(20), at(1_000, 0)),
+            at(1_100, 0)
+        );
+        assert_eq!(
+            effective_runtime_time(at(900, 0), at(1_000, 0), Duration::ZERO, at(1_000, 0)),
+            at(1_000, 0)
+        );
 
         // A previously observed forward wall-clock jump remains authoritative
         // after the wall clock is moved backwards again.
-        assert_eq!(effective_runtime_timestamp(950, 1_000, 21, 1_100), 1_100);
+        assert_eq!(
+            effective_runtime_time(at(950, 0), at(1_000, 0), secs(21), at(1_100, 0)),
+            at(1_100, 0)
+        );
+    }
+
+    /// A rollback must not move effective time back to the start of the
+    /// current second: an entitlement expiring at x.700 and observed expired at
+    /// x.800 would otherwise read as active again until x+1.
+    #[test]
+    fn runtime_clock_floors_keep_sub_second_precision() {
+        let observed = at(1_002, 800);
+        assert_eq!(
+            effective_runtime_time(at(990, 0), at(1_000, 0), Duration::ZERO, observed),
+            observed
+        );
+        assert_eq!(
+            effective_runtime_time(
+                at(990, 0),
+                at(1_000, 100),
+                Duration::from_millis(2_750),
+                at(1_000, 100)
+            ),
+            at(1_002, 850)
+        );
+        assert_eq!(
+            effective_runtime_time(at(1_000, 0), at(1_000, 0), Duration::MAX, at(1_000, 0)),
+            DateTime::<Utc>::MAX_UTC
+        );
     }
 }

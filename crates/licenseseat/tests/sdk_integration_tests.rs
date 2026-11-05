@@ -1356,10 +1356,18 @@ async fn entitlement_expiry_notifies_subscribers_and_revokes_access_in_process()
     let sdk = LicenseSeat::try_new(test_config(&server.uri())).unwrap();
     let mut events = sdk.subscribe();
     let activated = sdk.activate(license_key).await.unwrap();
+    // The SDK installs its runtime state (and the entitlement deadline)
+    // before `activate` returns, so if we are still before the expiry here,
+    // the entitlement was live when installed and its expiry must be
+    // announced exactly once. Only if the machine stalled past the expiry
+    // during activation is "already expired on arrival, never announced"
+    // also correct.
+    let activation_returned_at = Utc::now();
     let expiry = stamped_expiry
         .lock()
         .unwrap()
         .expect("activation responded");
+    let installed_before_expiry_is_certain = activation_returned_at < expiry;
     let activated_entitlements = &activated
         .validation
         .as_ref()
@@ -1392,25 +1400,30 @@ async fn entitlement_expiry_notifies_subscribers_and_revokes_access_in_process()
     assert!(sdk.active_entitlements().is_empty());
     assert!(matches!(sdk.status(), LicenseStatus::Active { .. }));
 
-    let mut changes = early_changes;
-    changes.extend(drain_state_changes(&mut events));
-    assert_eq!(
-        changes.len(),
-        1,
-        "exactly one state change for one expiry: {changes:?}"
-    );
-    let licenseseat::EventData::Validation(event_validation) = changes
-        .pop()
-        .unwrap()
-        .data
-        .expect("state change validation payload")
-    else {
-        panic!("state change should carry the current validation");
-    };
-    assert!(
-        event_validation.license.active_entitlements.is_empty(),
-        "the state change must announce the lapsed entitlement as gone"
-    );
+    let changes: Vec<_> = early_changes
+        .into_iter()
+        .chain(drain_state_changes(&mut events))
+        .collect();
+    if installed_before_expiry_is_certain {
+        assert_eq!(
+            changes.len(),
+            1,
+            "exactly one state change for one expiry: {changes:?}"
+        );
+    } else {
+        assert!(changes.len() <= 1, "at most one state change: {changes:?}");
+    }
+    for change in changes {
+        let licenseseat::EventData::Validation(event_validation) =
+            change.data.expect("state change validation payload")
+        else {
+            panic!("state change should carry the current validation");
+        };
+        assert!(
+            event_validation.license.active_entitlements.is_empty(),
+            "the state change must announce the lapsed entitlement as gone"
+        );
+    }
     assert!(
         sdk.current_authoritative_validation()
             .expect("authoritative validation")

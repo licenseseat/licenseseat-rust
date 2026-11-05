@@ -6,24 +6,32 @@
 
 ### Fixed
 
-- Entitlement-expiry state changes now fire at the entitlement's actual
-  expiry. The `license:state-changed` deadline was truncated to whole seconds
-  while every entitlement check compares the full-precision `expires_at`, so
-  an observation in the last partial second before expiry announced a state
-  change that still listed the entitlement as active, cleared the deadline,
-  and then announced nothing when the entitlement really lapsed. Subscribers
-  could keep showing an expired entitlement as active until some unrelated
-  state change. Entitlement checks themselves (`check_entitlement`,
-  `has_entitlement`, `active_entitlements`) were always correct.
-  (#9, #12)
+- Entitlement-expiry `license:state-changed` events are now emitted by the
+  first observation at or after the entitlement's real expiry. The SDK
+  detects entitlement transitions when its license state is observed
+  (`check_entitlement`, `has_entitlement`, `status`, snapshots, ...); the
+  transition deadline was truncated to whole seconds while observations
+  compare the full-precision `expires_at`, so an observation in the last
+  partial second before expiry announced a state change that still listed
+  the entitlement as active, cleared the deadline, and then announced nothing
+  when the entitlement really lapsed. Subscribers could keep showing an
+  expired entitlement until some unrelated state change. (#9)
+- One observation now uses one instant: the transition check and the answer
+  returned to the caller share the same `now`. Previously the caller
+  re-sampled the clock, so an observation straddling the expiry could return
+  "expired" while leaving the notification pending.
+- The in-process anti-rollback clock (monotonic floor and high-water mark)
+  keeps sub-second precision. Truncating it let a wall-clock rollback move
+  effective time back to the start of the current second, so an entitlement
+  already observed (and announced) as expired could read as active again for
+  up to a second, then lapse with no event.
 
 ### Tests
 
 - `entitlement_expiry_notifies_subscribers_and_revokes_access_in_process` no
   longer depends on scheduling: it subscribes before activating, stamps the
   expiry when the mock server responds, waits on the wall clock instead of a
-  fixed sleep, and asserts emitted events synchronously. It was the flaky
-  test behind #9 and the unnamed full-suite failure in #12.
+  fixed sleep, and asserts emitted events synchronously. (#9)
 
 ## [0.6.3] - 2026-08-19
 
