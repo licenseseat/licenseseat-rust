@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [0.6.4] - Unreleased (proposed)
+
+### Fixed
+
+- Entitlement-expiry state changes now fire at the entitlement's actual
+  expiry. The `license:state-changed` deadline was truncated to whole seconds
+  while every entitlement check compares the full-precision `expires_at`, so
+  an observation in the last partial second before expiry announced a state
+  change that still listed the entitlement as active, cleared the deadline,
+  and then announced nothing when the entitlement really lapsed. Subscribers
+  could keep showing an expired entitlement as active until some unrelated
+  state change. Entitlement checks themselves (`check_entitlement`,
+  `has_entitlement`, `active_entitlements`) were always correct.
+  (#9, #12)
+
+### Tests
+
+- `entitlement_expiry_notifies_subscribers_and_revokes_access_in_process` no
+  longer depends on scheduling: it subscribes before activating, stamps the
+  expiry when the mock server responds, waits on the wall clock instead of a
+  fixed sleep, and asserts emitted events synchronously. It was the flaky
+  test behind #9 and the unnamed full-suite failure in #12.
+
 ## [0.6.3] - 2026-08-19
 
 ### Added

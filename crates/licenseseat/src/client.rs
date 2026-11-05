@@ -120,7 +120,13 @@ struct RuntimeLicenseState {
     /// monotonic floor alone cannot detect.
     last_effective_timestamp: i64,
     /// Next active-entitlement expiry that should notify state subscribers.
-    next_entitlement_transition_at: Option<i64>,
+    /// Kept at full precision: entitlement expiries carry sub-second parts,
+    /// and every observation compares them against a full-precision `now`.
+    /// Truncating the deadline to whole seconds fired the state-change event
+    /// up to one second before the entitlement actually lapsed (with the
+    /// entitlement still in the payload) and then never fired at the real
+    /// expiry (licenseseat-rust#9).
+    next_entitlement_transition_at: Option<chrono::DateTime<Utc>>,
 }
 
 impl RuntimeLicenseState {
@@ -3507,12 +3513,9 @@ impl LicenseSeat {
                     state.license.trusted_license = None;
                     state.authorization_expires_at = None;
                     state.next_entitlement_transition_at = None;
-                } else if state
-                    .next_entitlement_transition_at
-                    .is_some_and(|deadline| now.timestamp() >= deadline)
-                {
+                } else if entitlement_transition_due(state.next_entitlement_transition_at, &now) {
                     state.next_entitlement_transition_at =
-                        next_entitlement_transition(&state.license, now.timestamp());
+                        next_entitlement_transition(&state.license, &now);
                     if let Some(validation) = state
                         .license
                         .validation
@@ -3553,9 +3556,9 @@ impl LicenseSeat {
             .recovery_license
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let observed_wall_time = Utc::now().timestamp();
-        let next_entitlement_transition_at =
-            next_entitlement_transition(&license, observed_wall_time);
+        let observed_at = Utc::now();
+        let observed_wall_time = observed_at.timestamp();
+        let next_entitlement_transition_at = next_entitlement_transition(&license, &observed_at);
         *self
             .inner
             .runtime_license_state
@@ -4106,16 +4109,30 @@ fn license_status_for_observation(
     }
 }
 
-fn next_entitlement_transition(license: &License, after: i64) -> Option<i64> {
+/// Earliest active-entitlement expiry strictly after `after`, at full
+/// precision. An entitlement is active while `expires_at > now`
+/// ([`validation_for_observation`], [`LicenseSeat::check_entitlement`]), so the
+/// transition is due exactly when `now >= expires_at`.
+fn next_entitlement_transition(
+    license: &License,
+    after: &chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
     license
         .validation
         .as_ref()
         .filter(|validation| validation.valid)
         .into_iter()
         .flat_map(|validation| validation.license.active_entitlements.iter())
-        .filter_map(|entitlement| entitlement.expires_at.map(|expiry| expiry.timestamp()))
-        .filter(|expiry| *expiry > after)
+        .filter_map(|entitlement| entitlement.expires_at)
+        .filter(|expiry| expiry > after)
         .min()
+}
+
+fn entitlement_transition_due(
+    deadline: Option<chrono::DateTime<Utc>>,
+    now: &chrono::DateTime<Utc>,
+) -> bool {
+    deadline.is_some_and(|deadline| *now >= deadline)
 }
 
 fn validation_for_observation(
@@ -5228,6 +5245,105 @@ fn parse_rfc3339(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+#[cfg(test)]
+mod entitlement_transition_tests {
+    use super::{
+        entitlement_transition_due, next_entitlement_transition, validation_for_observation,
+    };
+    use crate::models::License;
+    use chrono::{DateTime, TimeZone, Utc};
+
+    fn license_with_entitlement_expiring_at(expiry: DateTime<Utc>) -> License {
+        serde_json::from_value(serde_json::json!({
+            "license_key": "KEY",
+            "device_id": "device",
+            "activation_id": "act_1",
+            "activated_at": "2026-01-01T00:00:00Z",
+            "last_validated": "2026-01-01T00:00:00Z",
+            "validation": {
+                "object": "validation_result",
+                "valid": true,
+                "license": {
+                    "object": "license",
+                    "key": "KEY",
+                    "status": "active",
+                    "mode": "hardware_locked",
+                    "plan_key": "pro",
+                    "active_seats": 1,
+                    "active_entitlements": [
+                        { "key": "short-lived", "expires_at": expiry.to_rfc3339() }
+                    ],
+                    "product": { "slug": "test-product", "name": "Test" }
+                },
+                "offline": false
+            }
+        }))
+        .expect("test license fixture")
+    }
+
+    fn still_listed(license: &License, now: &DateTime<Utc>) -> bool {
+        !validation_for_observation(license.validation.clone().unwrap(), now)
+            .license
+            .active_entitlements
+            .is_empty()
+    }
+
+    /// licenseseat-rust#9: the deadline used to be truncated to whole seconds,
+    /// so an observation inside `[floor(expiry), expiry)` fired the state
+    /// change while the entitlement was still listed and cleared the deadline,
+    /// leaving subscribers without any event at the real expiry.
+    #[test]
+    fn sub_second_expiry_fires_exactly_once_when_the_entitlement_lapses() {
+        let whole_second = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        let expiry = whole_second + chrono::Duration::milliseconds(700);
+        let license = license_with_entitlement_expiring_at(expiry);
+        let activated_at = whole_second - chrono::Duration::seconds(2);
+
+        let deadline = next_entitlement_transition(&license, &activated_at);
+        assert_eq!(
+            deadline,
+            Some(expiry),
+            "deadline keeps sub-second precision"
+        );
+
+        let inside_the_last_second = whole_second + chrono::Duration::milliseconds(300);
+        assert!(still_listed(&license, &inside_the_last_second));
+        assert!(
+            !entitlement_transition_due(deadline, &inside_the_last_second),
+            "no state change while the entitlement is still active"
+        );
+
+        for at_or_after in [expiry, expiry + chrono::Duration::milliseconds(1)] {
+            assert!(!still_listed(&license, &at_or_after));
+            assert!(entitlement_transition_due(deadline, &at_or_after));
+            assert_eq!(
+                next_entitlement_transition(&license, &at_or_after),
+                None,
+                "a lapsed entitlement is not rescheduled"
+            );
+        }
+    }
+
+    #[test]
+    fn transition_is_due_iff_the_observation_prunes_an_entitlement() {
+        let base = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        for expiry_ms in [0_i64, 1, 499, 500, 999] {
+            let expiry = base + chrono::Duration::milliseconds(expiry_ms);
+            let license = license_with_entitlement_expiring_at(expiry);
+            let deadline =
+                next_entitlement_transition(&license, &(base - chrono::Duration::seconds(1)));
+            for now_ms in -1_000_i64..=1_000 {
+                let now = base + chrono::Duration::milliseconds(now_ms);
+                assert_eq!(
+                    entitlement_transition_due(deadline, &now),
+                    !still_listed(&license, &now),
+                    "expiry +{expiry_ms}ms observed at {now_ms}ms"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

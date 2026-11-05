@@ -1266,71 +1266,151 @@ fn assert_coherent_snapshot(sdk: &LicenseSeat) {
     }
 }
 
+/// Wait until the wall clock (which the SDK reads for entitlement expiry)
+/// has reached `instant`. This is a condition wait, not a timing guess: it
+/// returns as soon as the condition holds, however loaded the machine is.
+async fn wait_for_wall_clock(instant: chrono::DateTime<Utc>) {
+    loop {
+        let remaining = instant - Utc::now();
+        if remaining <= chrono::Duration::zero() {
+            return;
+        }
+        tokio::time::sleep(remaining.to_std().unwrap_or(Duration::from_millis(1))).await;
+    }
+}
+
+fn drain_state_changes(
+    events: &mut tokio::sync::broadcast::Receiver<licenseseat::Event>,
+) -> Vec<licenseseat::Event> {
+    let mut changes = Vec::new();
+    loop {
+        match events.try_recv() {
+            Ok(event) if event.kind == licenseseat::EventKind::LicenseStateChanged => {
+                changes.push(event)
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return changes,
+            Err(error) => panic!("event stream broke: {error:?}"),
+        }
+    }
+}
+
+/// licenseseat-rust#9. Entitlement expiries carry sub-second precision; the
+/// state-change deadline used to be truncated to whole seconds, so a read in
+/// `[floor(expiry), expiry)` emitted the change early (entitlement still
+/// listed) and nothing was emitted at the real expiry. Under load that read
+/// was usually the test's own pre-subscribe `has_entitlement`, and the test
+/// timed out waiting for an event that had already gone to no subscriber.
+///
+/// The test no longer depends on scheduling: it subscribes before
+/// activation, stamps the expiry when the server responds, waits on the wall
+/// clock rather than a fixed sleep, and asserts the emitted events
+/// synchronously (emission happens inside the observing call).
 #[tokio::test]
 async fn entitlement_expiry_notifies_subscribers_and_revokes_access_in_process() {
-    let server = MockServer::start().await;
-    let license_key = "EXPIRING-ENTITLEMENT-LICENSE";
-    let entitlement_expiry = Utc::now() + chrono::Duration::seconds(2);
-    let mut license = license_json(
-        license_key,
-        "active",
-        "pro",
-        "hardware_locked",
-        &[],
-        "Test App",
-    );
-    license["active_entitlements"] = json!([{
-        "key": "short-lived-feature",
-        "expires_at": entitlement_expiry.to_rfc3339(),
-        "metadata": null
-    }]);
+    struct ExpiringEntitlementActivation {
+        license_key: &'static str,
+        expiry: std::sync::Arc<std::sync::Mutex<Option<chrono::DateTime<Utc>>>>,
+    }
 
-    Mock::given(method("POST"))
-        .and(path_regex(r"/products/.*/licenses/activate"))
-        .respond_with(
+    impl wiremock::Respond for ExpiringEntitlementActivation {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            // A deliberate sub-second component puts the old truncated
+            // deadline a full 500ms ahead of the real expiry.
+            let next_second = Utc::now().timestamp() + 1;
+            let expiry = chrono::DateTime::from_timestamp(next_second + 2, 500_000_000).unwrap();
+            *self.expiry.lock().unwrap() = Some(expiry);
+            let mut license = license_json(
+                self.license_key,
+                "active",
+                "pro",
+                "hardware_locked",
+                &[],
+                "Test App",
+            );
+            license["active_entitlements"] = json!([{
+                "key": "short-lived-feature",
+                "expires_at": expiry.to_rfc3339(),
+                "metadata": null
+            }]);
             ResponseTemplate::new(201).set_body_json(activation_response_with_license(
-                license_key,
+                self.license_key,
                 "device-123",
                 license,
-            )),
-        )
+            ))
+        }
+    }
+
+    let server = MockServer::start().await;
+    let license_key = "EXPIRING-ENTITLEMENT-LICENSE";
+    let stamped_expiry = std::sync::Arc::new(std::sync::Mutex::new(None));
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(ExpiringEntitlementActivation {
+            license_key,
+            expiry: stamped_expiry.clone(),
+        })
         .mount(&server)
         .await;
 
     let sdk = LicenseSeat::try_new(test_config(&server.uri())).unwrap();
-    sdk.activate(license_key).await.unwrap();
-    assert!(sdk.has_entitlement("short-lived-feature"));
     let mut events = sdk.subscribe();
+    let activated = sdk.activate(license_key).await.unwrap();
+    let expiry = stamped_expiry
+        .lock()
+        .unwrap()
+        .expect("activation responded");
+    let activated_entitlements = &activated
+        .validation
+        .as_ref()
+        .expect("activation validation")
+        .license
+        .active_entitlements;
+    assert_eq!(activated_entitlements.len(), 1);
+    assert_eq!(activated_entitlements[0].expires_at, Some(expiry));
 
-    let wait_seconds = entitlement_expiry
-        .timestamp()
-        .saturating_sub(Utc::now().timestamp())
-        .saturating_add(1)
-        .max(1) as u64;
-    tokio::time::sleep(Duration::from_secs(wait_seconds)).await;
+    // Observe inside the last (partial) second before expiry. Whenever this
+    // observation lands before the real expiry, the entitlement must still be
+    // active and no state change may have been announced.
+    let truncated_deadline = chrono::DateTime::from_timestamp(expiry.timestamp(), 0).unwrap();
+    wait_for_wall_clock(truncated_deadline).await;
+    let observed = sdk.check_entitlement("short-lived-feature");
+    let observed_before_expiry = Utc::now() < expiry;
+    let early_changes = drain_state_changes(&mut events);
+    if observed_before_expiry {
+        assert!(observed.active, "entitlement is active until its expiry");
+        assert!(
+            early_changes.is_empty(),
+            "no state change before the entitlement lapses: {early_changes:?}"
+        );
+    }
 
+    wait_for_wall_clock(expiry).await;
     let entitlement = sdk.check_entitlement("short-lived-feature");
     assert!(!entitlement.active);
     assert_eq!(entitlement.reason, Some(EntitlementReason::Expired));
     assert!(sdk.active_entitlements().is_empty());
     assert!(matches!(sdk.status(), LicenseStatus::Active { .. }));
 
-    let transition = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let event = events.recv().await.unwrap();
-            if event.kind == licenseseat::EventKind::LicenseStateChanged {
-                break event;
-            }
-        }
-    })
-    .await
-    .expect("entitlement expiry state-change event");
-    let licenseseat::EventData::Validation(event_validation) =
-        transition.data.expect("state change validation payload")
+    let mut changes = early_changes;
+    changes.extend(drain_state_changes(&mut events));
+    assert_eq!(
+        changes.len(),
+        1,
+        "exactly one state change for one expiry: {changes:?}"
+    );
+    let licenseseat::EventData::Validation(event_validation) = changes
+        .pop()
+        .unwrap()
+        .data
+        .expect("state change validation payload")
     else {
         panic!("state change should carry the current validation");
     };
-    assert!(event_validation.license.active_entitlements.is_empty());
+    assert!(
+        event_validation.license.active_entitlements.is_empty(),
+        "the state change must announce the lapsed entitlement as gone"
+    );
     assert!(
         sdk.current_authoritative_validation()
             .expect("authoritative validation")
@@ -1339,11 +1419,11 @@ async fn entitlement_expiry_notifies_subscribers_and_revokes_access_in_process()
             .is_empty(),
         "every public authoritative snapshot must prune expired entitlements"
     );
+
+    // Further observations must not re-announce the same expiry.
     sdk.check_entitlement("short-lived-feature");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    while let Ok(event) = events.try_recv() {
-        assert_ne!(event.kind, licenseseat::EventKind::LicenseStateChanged);
-    }
+    sdk.status();
+    assert!(drain_state_changes(&mut events).is_empty());
 }
 
 // ============================================================================
