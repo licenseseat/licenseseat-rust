@@ -36,6 +36,26 @@ fn test_config(base_url: &str) -> Config {
     }
 }
 
+/// Wait until `kind` is emitted. The cap is a hang guard for a genuinely
+/// missing event, not a timing expectation: the wait returns as soon as the
+/// event arrives, however slow the machine is.
+async fn wait_for_event(
+    events: &mut tokio::sync::broadcast::Receiver<licenseseat::Event>,
+    kind: EventKind,
+) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match events.recv().await {
+                Ok(event) if event.kind == kind => return,
+                Ok(_) => {}
+                Err(error) => panic!("event stream broke before {kind:?}: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{kind:?} was never emitted"));
+}
+
 fn activation_response() -> serde_json::Value {
     json!({
         "object": "activation",
@@ -519,9 +539,51 @@ async fn test_heartbeat_emits_error_event() {
     assert!(error_count.load(Ordering::SeqCst) >= 1);
 }
 
+/// Records the arrival instant of every machine-file request.
+#[cfg(feature = "offline")]
+struct RecordingMachineFile {
+    arrivals: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    body: serde_json::Value,
+}
+
+#[cfg(feature = "offline")]
+impl wiremock::Respond for RecordingMachineFile {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        self.arrivals
+            .lock()
+            .unwrap()
+            .push(std::time::Instant::now());
+        ResponseTemplate::new(201).set_body_json(self.body.clone())
+    }
+}
+
+/// Wait until `condition` holds. The cap is a hang guard for a genuinely
+/// missing request, not a timing expectation.
+#[cfg(feature = "offline")]
+async fn wait_until(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("condition never held");
+}
+
+/// A restarted support-task set must replace the old refresh loop, not run
+/// beside it.
+///
+/// This used to count requests inside fixed 40 ms windows, which failed under
+/// parallel load whenever a window slipped past the next legitimate tick
+/// (licenseseat-rust#12). It now relies on a property of a single loop that
+/// holds however slow the machine is: the loop sleeps `interval` only after
+/// its previous fetch has completed, so one loop's consecutive requests
+/// arrive more than `interval` apart. A surviving old loop would put a
+/// second request well inside that spacing.
 #[cfg(feature = "offline")]
 #[tokio::test]
 async fn test_support_tasks_do_not_duplicate_after_restart() {
+    const INTERVAL: Duration = Duration::from_secs(1);
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -530,69 +592,70 @@ async fn test_support_tasks_do_not_duplicate_after_restart() {
         .mount(&server)
         .await;
 
+    let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/machine-file"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-            "data": {
-                "type": "machine-files",
-                "attributes": {
-                    "certificate": "not-a-real-machine-file",
-                    "algorithm": "aes-256-gcm+ed25519",
-                    "ttl": 2592000,
-                    "issued": "2025-01-01T00:00:00Z",
-                    "expiry": "2025-02-01T00:00:00Z"
-                },
-                "relationships": {
-                    "license": { "data": { "type": "licenses", "id": "TEST-KEY" } },
-                    "machine": { "data": { "type": "machines", "id": "device-123" } }
+        .respond_with(RecordingMachineFile {
+            arrivals: arrivals.clone(),
+            body: json!({
+                "data": {
+                    "type": "machine-files",
+                    "attributes": {
+                        "certificate": "not-a-real-machine-file",
+                        "algorithm": "aes-256-gcm+ed25519",
+                        "ttl": 2592000,
+                        "issued": "2025-01-01T00:00:00Z",
+                        "expiry": "2025-02-01T00:00:00Z"
+                    },
+                    "relationships": {
+                        "license": { "data": { "type": "licenses", "id": "TEST-KEY" } },
+                        "machine": { "data": { "type": "machines", "id": "device-123" } }
+                    }
                 }
-            }
-        })))
+            }),
+        })
         .mount(&server)
         .await;
 
     let mut config = test_config(&server.uri());
     config.network_recheck_interval = Duration::ZERO;
-    config.offline_token_refresh_interval = Duration::from_millis(120);
+    config.offline_token_refresh_interval = INTERVAL;
     config.max_offline_days = 7;
 
     let sdk = LicenseSeat::new(config);
+    let before_activation = std::time::Instant::now();
     sdk.activate("TEST-KEY").await.unwrap();
 
-    // Let the one-shot activation sync finish, then restart support tasks while
-    // the old refresh loop is still sleeping.
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    // The activation-time one-shot sync_offline_assets() request.
+    wait_until(|| !arrivals.lock().unwrap().is_empty()).await;
+    // Restart while the first refresh loop is (normally) still sleeping.
     sdk.stop_background_tasks();
     sdk.start_background_tasks();
+    let restarted = std::time::Instant::now();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    let machine_file_requests = loop {
-        let requests = server.received_requests().await.unwrap();
-        let count = requests
-            .iter()
-            .filter(|request| request.url.path().contains("/machine-file"))
-            .count();
-        if count >= 2 || tokio::time::Instant::now() >= deadline {
-            break count;
+    // One-shot plus three ticks of the replacement loop (a surviving old loop
+    // would pair with each of them).
+    wait_until(|| arrivals.lock().unwrap().len() >= 4).await;
+    let arrivals = arrivals.lock().unwrap().clone();
+
+    // If the restart completed less than one interval after activation began,
+    // the first loop (started inside activate) cannot have sent anything
+    // before it was stopped, and arrivals[0] is the one-shot sync. Otherwise
+    // a pre-stop tick of the old loop is legitimate and the arrivals cannot
+    // be attributed; only liveness (above) is asserted.
+    if restarted.duration_since(before_activation) < INTERVAL {
+        assert!(
+            arrivals[0] < restarted,
+            "one-shot sync precedes the restart"
+        );
+        for pair in arrivals.windows(2) {
+            assert!(
+                pair[1].duration_since(pair[0]) > INTERVAL,
+                "two refreshes {:?} apart: a stopped refresh loop is still running",
+                pair[1].duration_since(pair[0])
+            );
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
-
-    // One request comes from activation-time sync_offline_assets(). After the
-    // restart there should only be one refresh-loop request, not two.
-    assert_eq!(machine_file_requests, 2);
-
-    // A duplicate old loop would fire at the same cadence as the replacement.
-    // Check shortly after the first refresh, before either valid loop's next tick.
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.url.path().contains("/machine-file"))
-            .count(),
-        2
-    );
+    }
 }
 
 #[tokio::test]
@@ -640,12 +703,14 @@ async fn revoked_auto_validation_does_not_send_a_followup_heartbeat() {
         config.offline_token_refresh_interval = Duration::ZERO;
     }
     let sdk = LicenseSeat::new(config);
+    let mut events = sdk.subscribe();
     sdk.activate("TEST-KEY").await.unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while sdk.current_license().is_some() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // Wait for the SDK to report that the revocation was committed rather
+    // than polling against a 2 s budget: under parallel load activation alone
+    // took over 2 s (licenseseat-rust#12). `license:revoked` is emitted only
+    // after the denial has been written and background tasks stopped.
+    wait_for_event(&mut events, EventKind::LicenseRevoked).await;
 
     let requests = server.received_requests().await.unwrap();
     assert!(

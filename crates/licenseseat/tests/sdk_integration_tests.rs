@@ -1637,6 +1637,41 @@ async fn test_offline_restore_does_not_reuse_unsigned_heartbeat_metadata() {
     assert!(!snapshot_path.exists());
 }
 
+/// Serves one machine file whose short validity window starts when the first
+/// machine-file request arrives, not when the test started. Under parallel
+/// load activation alone (durable cache commits use F_FULLFSYNC on macOS) can
+/// take seconds, which used to consume a window stamped up front
+/// (licenseseat-rust#12).
+#[cfg(feature = "offline")]
+struct MachineFileStampedOnFirstRequest {
+    license_key: &'static str,
+    fingerprint: &'static str,
+    embedded_license: serde_json::Value,
+    ttl: i64,
+    issued: std::sync::Arc<std::sync::Mutex<Option<(serde_json::Value, i64)>>>,
+}
+
+#[cfg(feature = "offline")]
+impl wiremock::Respond for MachineFileStampedOnFirstRequest {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        let mut issued = self.issued.lock().unwrap();
+        let (response, _) = issued.get_or_insert_with(|| {
+            let issued_at = Utc::now() - chrono::Duration::seconds(1);
+            let (response, _) = build_machine_file_fixture_with_timing(
+                self.license_key,
+                self.fingerprint,
+                Some(self.embedded_license.clone()),
+                issued_at,
+                self.ttl,
+                0,
+                None,
+            );
+            (response, issued_at.timestamp() + self.ttl)
+        });
+        ResponseTemplate::new(201).set_body_json(response.clone())
+    }
+}
+
 #[cfg(feature = "offline")]
 #[tokio::test]
 async fn signed_offline_runtime_grant_expires_without_process_restart() {
@@ -1651,18 +1686,17 @@ async fn signed_offline_runtime_grant_expires_without_process_restart() {
         &["pro-features"],
         "Test Product",
     );
-    let issued_at = Utc::now() - chrono::Duration::seconds(1);
-    let ttl = 6;
-    let authorization_deadline = issued_at.timestamp() + ttl;
-    let (machine_file_response, public_key_b64) = build_machine_file_fixture_with_timing(
+    // Only for the (fixed) public key; the served file is stamped later.
+    let (_, public_key_b64) = build_machine_file_fixture_with_timing(
         license_key,
         fingerprint,
-        Some(embedded_license.clone()),
-        issued_at,
-        ttl,
+        None,
+        Utc::now(),
+        6,
         0,
         None,
     );
+    let issued = std::sync::Arc::new(std::sync::Mutex::new(None));
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
@@ -1670,14 +1704,20 @@ async fn signed_offline_runtime_grant_expires_without_process_restart() {
             ResponseTemplate::new(201).set_body_json(activation_response_with_license(
                 license_key,
                 fingerprint,
-                embedded_license,
+                embedded_license.clone(),
             )),
         )
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/products/test-product/licenses/machine-file"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
+        .respond_with(MachineFileStampedOnFirstRequest {
+            license_key,
+            fingerprint,
+            embedded_license,
+            ttl: 6,
+            issued: issued.clone(),
+        })
         .mount(&server)
         .await;
 
@@ -1688,10 +1728,25 @@ async fn signed_offline_runtime_grant_expires_without_process_restart() {
 
     let online_sdk = LicenseSeat::try_new(online_config.clone()).unwrap();
     online_sdk.activate(license_key).await.unwrap();
-    online_sdk
+    let checkout = online_sdk
         .checkout_machine_file(license_key, Some(fingerprint), Some(30))
-        .await
-        .unwrap();
+        .await;
+    let authorization_deadline = issued
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("machine file served")
+        .1;
+    let checkout_returned_at = Utc::now().timestamp();
+    if checkout_returned_at < authorization_deadline {
+        checkout.unwrap();
+    } else {
+        // The machine stalled past the 5 s window between serving and
+        // verifying the file; refusing it is the correct outcome and nothing
+        // below can be exercised.
+        assert!(checkout.is_err());
+        return;
+    }
     drop(online_sdk);
 
     let mut offline_config = online_config;
@@ -1699,21 +1754,32 @@ async fn signed_offline_runtime_grant_expires_without_process_restart() {
     offline_config.max_retries = 0;
     offline_config.retry_delay = Duration::ZERO;
     let offline_sdk = LicenseSeat::try_new(offline_config).unwrap();
-    let restored = offline_sdk.restore_license().await;
-    assert!(restored.restored);
-    assert!(matches!(
-        restored.status,
-        LicenseStatus::OfflineValid { .. }
-    ));
-    assert!(offline_sdk.has_entitlement("pro-features"));
     let mut expiry_events = offline_sdk.subscribe();
+    let restored = offline_sdk.restore_license().await;
+    let entitled_after_restore = offline_sdk.has_entitlement("pro-features");
+    // Each comparison below is only claimed for instants the test can prove
+    // were before the (whole-second) authorization deadline.
+    let observed_before_deadline = Utc::now().timestamp() < authorization_deadline;
+    if observed_before_deadline {
+        assert!(restored.restored);
+        assert!(matches!(
+            restored.status,
+            LicenseStatus::OfflineValid { .. }
+        ));
+        assert!(entitled_after_restore);
+    }
 
-    let seconds_until_expired = authorization_deadline
-        .saturating_sub(Utc::now().timestamp())
-        .saturating_add(1)
-        .max(1) as u64;
-    tokio::time::sleep(Duration::from_secs(seconds_until_expired)).await;
+    wait_for_wall_clock(
+        chrono::DateTime::from_timestamp(authorization_deadline, 0).expect("deadline"),
+    )
+    .await;
 
+    assert!(!offline_sdk.has_entitlement("pro-features"));
+    assert!(offline_sdk.active_entitlements().is_empty());
+    assert!(!offline_sdk.get_status().valid);
+    if !observed_before_deadline {
+        return;
+    }
     assert!(offline_sdk.is_license_state_trusted());
     assert!(matches!(
         offline_sdk.status(),
@@ -1724,24 +1790,30 @@ async fn signed_offline_runtime_grant_expires_without_process_restart() {
         ClientStatus::OfflineInvalid
     );
     let validation = offline_sdk.get_status();
-    assert!(!validation.valid);
     assert!(validation.offline);
     assert_eq!(validation.code.as_deref(), Some("offline_artifact_expired"));
-    assert!(!offline_sdk.has_entitlement("pro-features"));
-    assert!(offline_sdk.active_entitlements().is_empty());
     assert_eq!(
         offline_sdk.current_trusted_license_source(),
         Some(licenseseat::TrustedLicenseSource::SignedOfflineArtifact)
     );
+    let failures: Vec<_> = std::iter::from_fn(|| expiry_events.try_recv().ok())
+        .map(|event| event.kind)
+        .filter(|kind| {
+            matches!(
+                kind,
+                licenseseat::EventKind::OfflineValidationFailed
+                    | licenseseat::EventKind::ValidationOfflineFailed
+            )
+        })
+        .collect();
     assert_eq!(
-        expiry_events.recv().await.unwrap().kind,
-        licenseseat::EventKind::OfflineValidationFailed
+        failures,
+        vec![
+            licenseseat::EventKind::OfflineValidationFailed,
+            licenseseat::EventKind::ValidationOfflineFailed,
+        ],
+        "one terminal expiry announcement"
     );
-    assert_eq!(
-        expiry_events.recv().await.unwrap().kind,
-        licenseseat::EventKind::ValidationOfflineFailed
-    );
-    assert!(expiry_events.try_recv().is_err());
 }
 
 #[cfg(feature = "offline")]
