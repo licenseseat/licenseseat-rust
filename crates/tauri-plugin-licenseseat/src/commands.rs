@@ -1598,6 +1598,7 @@ mod tests {
                 active_entitlements: vec![Entitlement {
                     key: "pro".into(),
                     expires_at: None,
+                    below_version: None,
                     metadata: None,
                 }],
                 metadata: None,
@@ -2003,6 +2004,7 @@ mod tests {
             active_entitlements: vec![licenseseat::Entitlement {
                 key: "enterprise".into(),
                 expires_at: None,
+                below_version: None,
                 metadata: None,
             }],
             metadata: None,
