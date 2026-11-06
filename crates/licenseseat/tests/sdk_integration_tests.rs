@@ -3083,3 +3083,234 @@ async fn test_duplicate_keys_in_nested_api_metadata_are_rejected() {
     ));
     assert!(sdk.current_license().is_none());
 }
+
+// ============================================================================
+// Authoritative denials never fall back to the offline grant
+// ============================================================================
+
+/// The cross-SDK contract (licenseseat-swift#26): a denial with one of these
+/// codes, thrown or returned as `200 valid:false`, is the current decision.
+/// It must never be answered by the cached offline grant, in either fallback
+/// mode, now or after a later outage or relaunch. The grant itself is kept
+/// (a later online `valid:true` restores it); only revocation purges.
+#[cfg(feature = "offline")]
+const AUTHORITATIVE_DENIALS: [(u16, &str); 5] = [
+    (403, "version_not_entitled"),
+    (403, "not_entitled"),
+    (422, "product_mismatch"),
+    (501, "floating_not_implemented"),
+    (501, "named_user_not_implemented"),
+];
+
+/// Activate and check out a long-lived signed machine file, so the offline
+/// grant is present and valid; returns the online SDK and its config.
+#[cfg(feature = "offline")]
+async fn sdk_with_valid_offline_grant(
+    server: &MockServer,
+    mode: OfflineFallbackMode,
+) -> (LicenseSeat, Config) {
+    let license_key = "DENIAL-LICENSE";
+    let fingerprint = "denial-installation";
+    let embedded_license = license_json(
+        license_key,
+        "active",
+        "pro",
+        "hardware_locked",
+        &["pro-features"],
+        "Test Product",
+    );
+    let (machine_file_response, public_key_b64) = build_machine_file_fixture_with_timing(
+        license_key,
+        fingerprint,
+        Some(embedded_license.clone()),
+        Utc::now() - chrono::Duration::minutes(1),
+        86_400,
+        0,
+        None,
+    );
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response_with_license(
+                license_key,
+                fingerprint,
+                embedded_license,
+            )),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/licenses/machine-file"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
+        .mount(server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    config.device_identifier = Some(fingerprint.into());
+    config.signing_public_key = Some(public_key_b64);
+    config.signing_key_id = Some("key-2026".into());
+    config.offline_fallback_mode = mode;
+    config.max_retries = 0;
+    config.retry_delay = Duration::ZERO;
+
+    let sdk = LicenseSeat::try_new(config.clone()).unwrap();
+    sdk.activate(license_key).await.unwrap();
+    sdk.checkout_machine_file(license_key, Some(fingerprint), Some(30))
+        .await
+        .unwrap();
+    assert!(sdk.has_entitlement("pro-features"));
+    (sdk, config)
+}
+
+/// After a denial: the SDK is not entitled, the grant is still on disk, a
+/// later outage (5xx without a denial code, which normally falls back in
+/// both modes) answers with the denial, and a relaunch while offline does not
+/// restore the license.
+#[cfg(feature = "offline")]
+async fn assert_denial_is_the_current_decision(
+    server: &MockServer,
+    sdk: &LicenseSeat,
+    config: &Config,
+    label: &str,
+) {
+    assert!(
+        !sdk.has_entitlement("pro-features"),
+        "{label}: entitled after denial"
+    );
+    assert!(!sdk.status().is_active(), "{label}: active after denial");
+    assert!(
+        cache_path_for(&config.storage_prefix, "machine_file").exists(),
+        "{label}: an authoritative denial must not purge the offline grant"
+    );
+
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(server)
+        .await;
+    if let Ok(validation) = sdk.validate().await {
+        assert!(
+            !validation.valid,
+            "{label}: outage revived the offline grant"
+        );
+    }
+    assert!(
+        !sdk.has_entitlement("pro-features"),
+        "{label}: entitled after outage"
+    );
+
+    let mut offline_config = config.clone();
+    offline_config.api_base_url = "http://127.0.0.1:9".into();
+    let relaunched = LicenseSeat::try_new(offline_config).unwrap();
+    let restore = relaunched.restore_license().await;
+    assert!(
+        !restore.restored,
+        "{label}: relaunch revived the offline grant"
+    );
+    assert!(
+        !relaunched.has_entitlement("pro-features"),
+        "{label}: entitled after relaunch"
+    );
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn thrown_authoritative_denials_never_fall_back_to_the_offline_grant() {
+    for mode in [
+        OfflineFallbackMode::NetworkOnly,
+        OfflineFallbackMode::Always,
+    ] {
+        for (status, code) in AUTHORITATIVE_DENIALS {
+            // Mixed case: the contract compares codes case-insensitively.
+            let wire_code = if status == 501 {
+                code.to_ascii_uppercase()
+            } else {
+                code.to_string()
+            };
+            let label = format!("{mode:?} {status} {wire_code}");
+            let server = MockServer::start().await;
+            let (sdk, config) = sdk_with_valid_offline_grant(&server, mode).await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/products/.*/licenses/validate"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(api_error_response(&wire_code, "denied")),
+                )
+                .mount(&server)
+                .await;
+
+            match sdk.validate().await {
+                Err(error) => assert_eq!(
+                    error.code().map(str::to_ascii_lowercase).as_deref(),
+                    Some(code),
+                    "{label}"
+                ),
+                Ok(validation) => panic!("{label}: fell back to {validation:?}"),
+            }
+            assert_denial_is_the_current_decision(&server, &sdk, &config, &label).await;
+        }
+    }
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn valid_false_authoritative_denials_keep_the_grant_but_never_revive_it() {
+    for (_, code) in AUTHORITATIVE_DENIALS {
+        let label = format!("200 valid:false {code}");
+        let server = MockServer::start().await;
+        let (sdk, config) =
+            sdk_with_valid_offline_grant(&server, OfflineFallbackMode::Always).await;
+        let mut denied = license_json(
+            "DENIAL-LICENSE",
+            "active",
+            "pro",
+            "hardware_locked",
+            &[],
+            "Test Product",
+        );
+        denied["active_seats"] = json!(1);
+        Mock::given(method("POST"))
+            .and(path_regex(r"/products/.*/licenses/validate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "validation_result",
+                "valid": false,
+                "code": code,
+                "message": "denied",
+                "warnings": null,
+                "license": denied,
+                "activation": null
+            })))
+            .mount(&server)
+            .await;
+
+        let validation = sdk.validate().await.expect(&label);
+        assert!(!validation.valid, "{label}");
+        assert_denial_is_the_current_decision(&server, &sdk, &config, &label).await;
+    }
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn codeless_server_failures_still_fall_back_to_the_offline_grant() {
+    for (status, mode) in [
+        (503, OfflineFallbackMode::NetworkOnly),
+        (501, OfflineFallbackMode::NetworkOnly),
+        (429, OfflineFallbackMode::Always),
+    ] {
+        let label = format!("{mode:?} {status}");
+        let server = MockServer::start().await;
+        let (sdk, _config) = sdk_with_valid_offline_grant(&server, mode).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/products/.*/licenses/validate"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        let validation = sdk.validate().await.expect(&label);
+        assert!(
+            validation.valid && validation.offline,
+            "{label}: {validation:?}"
+        );
+        assert!(sdk.has_entitlement("pro-features"), "{label}");
+    }
+}
