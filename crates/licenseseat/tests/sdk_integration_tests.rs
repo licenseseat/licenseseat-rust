@@ -3783,7 +3783,6 @@ async fn codeless_server_failures_still_fall_back_to_the_offline_grant() {
     }
 }
 
-
 /// A network blip before the first machine-file sync landed used to revoke a
 /// perfectly valid license.
 ///
