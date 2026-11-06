@@ -48,6 +48,23 @@
   longer depends on scheduling: it subscribes before activating, stamps the
   expiry when the mock server responds, waits on the wall clock instead of a
   fixed sleep, and asserts emitted events synchronously. (#9)
+- Three more tests asserted inside fixed wall-clock budgets that durable
+  cache commits (`File::sync_all` is `F_FULLFSYNC` on macOS) overran under
+  parallel load: `revoked_auto_validation_does_not_send_a_followup_heartbeat`
+  now waits for `license:revoked`;
+  `test_support_tasks_do_not_duplicate_after_restart` checks request
+  spacing instead of counting inside 40 ms windows; and
+  `signed_offline_runtime_grant_expires_without_process_restart` stamps its
+  5 s machine-file window when the file is first served. (#12)
+- Review follow-ups for those tests (#12): the duplicate-loop test now
+  bounds the number of short request gaps after the restart instead of
+  skipping its check when activation is slow; the revocation test uses the
+  event stream closing after the SDK is dropped as a barrier for the whole
+  auto-validation cycle; the offline-expiry test accepts a successful
+  checkout whenever it returns and only accepts a refusal once the window
+  has provably closed; and the in-process expiry of a signed offline grant
+  is now also covered deterministically by
+  `runtime_state_tests::signed_offline_grant_expires_in_process`.
 
 ## [0.6.3] - 2026-08-19
 

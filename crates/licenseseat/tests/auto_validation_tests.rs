@@ -36,6 +36,26 @@ fn test_config(base_url: &str) -> Config {
     }
 }
 
+/// Wait until `kind` is emitted. The cap is a hang guard for a genuinely
+/// missing event, not a timing expectation: the wait returns as soon as the
+/// event arrives, however slow the machine is.
+async fn wait_for_event(
+    events: &mut tokio::sync::broadcast::Receiver<licenseseat::Event>,
+    kind: EventKind,
+) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match events.recv().await {
+                Ok(event) if event.kind == kind => return,
+                Ok(_) => {}
+                Err(error) => panic!("event stream broke before {kind:?}: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{kind:?} was never emitted"));
+}
+
 fn activation_response() -> serde_json::Value {
     json!({
         "object": "activation",
@@ -519,9 +539,65 @@ async fn test_heartbeat_emits_error_event() {
     assert!(error_count.load(Ordering::SeqCst) >= 1);
 }
 
+/// Records the arrival instant of every machine-file request.
+#[cfg(feature = "offline")]
+struct RecordingMachineFile {
+    arrivals: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    body: serde_json::Value,
+}
+
+#[cfg(feature = "offline")]
+impl wiremock::Respond for RecordingMachineFile {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        self.arrivals
+            .lock()
+            .unwrap()
+            .push(std::time::Instant::now());
+        ResponseTemplate::new(201).set_body_json(self.body.clone())
+    }
+}
+
+/// Wait until `condition` holds. The cap is a hang guard for a genuinely
+/// missing request, not a timing expectation.
+#[cfg(feature = "offline")]
+async fn wait_until(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("condition never held");
+}
+
+/// A restarted support-task set must replace the old refresh loop, not run
+/// beside it.
+///
+/// This used to count requests inside fixed 40 ms windows, which failed under
+/// parallel load whenever a window slipped past the next legitimate tick
+/// (licenseseat-rust#12). It now relies only on facts that hold however slow
+/// the machine is:
+///
+/// - One refresh loop sleeps `INTERVAL` only after its previous fetch has
+///   completed, so its own requests arrive more than `INTERVAL` apart.
+/// - After the restart, at most two requests can come from anywhere else:
+///   the activation-time one-shot sync (a single request), and at most one
+///   request the old loop had already sent before it was stopped (it awaits
+///   each fetch, so it never has two in flight).
+/// - Inserting one stray request into a correctly spaced sequence creates at
+///   most two gaps shorter than `INTERVAL`, so a correct SDK shows at most
+///   four short gaps among the requests that arrive after the restart.
+///
+/// A surviving old loop interleaves with the new one and creates a short gap
+/// at nearly every tick, so with `AFTER_RESTART` requests it exceeds that
+/// bound by a wide margin. No assertion depends on how long activation or the
+/// restart took.
 #[cfg(feature = "offline")]
 #[tokio::test]
 async fn test_support_tasks_do_not_duplicate_after_restart() {
+    const INTERVAL: Duration = Duration::from_millis(300);
+    const AFTER_RESTART: usize = 16;
+    const MAX_LEGITIMATE_SHORT_GAPS: usize = 4;
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -530,68 +606,65 @@ async fn test_support_tasks_do_not_duplicate_after_restart() {
         .mount(&server)
         .await;
 
+    let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/machine-file"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-            "data": {
-                "type": "machine-files",
-                "attributes": {
-                    "certificate": "not-a-real-machine-file",
-                    "algorithm": "aes-256-gcm+ed25519",
-                    "ttl": 2592000,
-                    "issued": "2025-01-01T00:00:00Z",
-                    "expiry": "2025-02-01T00:00:00Z"
-                },
-                "relationships": {
-                    "license": { "data": { "type": "licenses", "id": "TEST-KEY" } },
-                    "machine": { "data": { "type": "machines", "id": "device-123" } }
+        .respond_with(RecordingMachineFile {
+            arrivals: arrivals.clone(),
+            body: json!({
+                "data": {
+                    "type": "machine-files",
+                    "attributes": {
+                        "certificate": "not-a-real-machine-file",
+                        "algorithm": "aes-256-gcm+ed25519",
+                        "ttl": 2592000,
+                        "issued": "2025-01-01T00:00:00Z",
+                        "expiry": "2025-02-01T00:00:00Z"
+                    },
+                    "relationships": {
+                        "license": { "data": { "type": "licenses", "id": "TEST-KEY" } },
+                        "machine": { "data": { "type": "machines", "id": "device-123" } }
+                    }
                 }
-            }
-        })))
+            }),
+        })
         .mount(&server)
         .await;
 
     let mut config = test_config(&server.uri());
     config.network_recheck_interval = Duration::ZERO;
-    config.offline_token_refresh_interval = Duration::from_millis(120);
+    config.offline_token_refresh_interval = INTERVAL;
     config.max_offline_days = 7;
 
     let sdk = LicenseSeat::new(config);
     sdk.activate("TEST-KEY").await.unwrap();
-
-    // Let the one-shot activation sync finish, then restart support tasks while
-    // the old refresh loop is still sleeping.
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    // Restart while the first refresh loop is (normally) still sleeping.
     sdk.stop_background_tasks();
     sdk.start_background_tasks();
+    let restarted = std::time::Instant::now();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    let machine_file_requests = loop {
-        let requests = server.received_requests().await.unwrap();
-        let count = requests
+    let after_restart = |arrivals: &[std::time::Instant]| -> Vec<std::time::Instant> {
+        arrivals
             .iter()
-            .filter(|request| request.url.path().contains("/machine-file"))
-            .count();
-        if count >= 2 || tokio::time::Instant::now() >= deadline {
-            break count;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+            .copied()
+            .filter(|arrival| *arrival > restarted)
+            .collect()
     };
+    wait_until(|| after_restart(&arrivals.lock().unwrap()).len() >= AFTER_RESTART).await;
+    sdk.stop_background_tasks();
+    let observed = after_restart(&arrivals.lock().unwrap());
 
-    // One request comes from activation-time sync_offline_assets(). After the
-    // restart there should only be one refresh-loop request, not two.
-    assert_eq!(machine_file_requests, 2);
-
-    // A duplicate old loop would fire at the same cadence as the replacement.
-    // Check shortly after the first refresh, before either valid loop's next tick.
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.url.path().contains("/machine-file"))
-            .count(),
-        2
+    let short_gaps: Vec<_> = observed
+        .windows(2)
+        .map(|pair| pair[1].duration_since(pair[0]))
+        .filter(|gap| *gap <= INTERVAL)
+        .collect();
+    assert!(
+        short_gaps.len() <= MAX_LEGITIMATE_SHORT_GAPS,
+        "{} of {} refreshes arrived less than {INTERVAL:?} apart ({short_gaps:?}): \
+         a stopped refresh loop is still running",
+        short_gaps.len(),
+        observed.len()
     );
 }
 
@@ -640,12 +713,33 @@ async fn revoked_auto_validation_does_not_send_a_followup_heartbeat() {
         config.offline_token_refresh_interval = Duration::ZERO;
     }
     let sdk = LicenseSeat::new(config);
+    let mut events = sdk.subscribe();
     sdk.activate("TEST-KEY").await.unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while sdk.current_license().is_some() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // Wait for the SDK to report that the revocation was committed rather
+    // than polling against a 2 s budget: under parallel load activation alone
+    // took over 2 s (licenseseat-rust#12). `license:revoked` is emitted only
+    // after the denial has been written and background tasks stopped.
+    wait_for_event(&mut events, EventKind::LicenseRevoked).await;
+    assert!(sdk.current_license().is_none());
+
+    // `license:revoked` is emitted inside validate_key, before the
+    // auto-validation cycle finishes, so it does not prove that no heartbeat
+    // follows in the same cycle. The cycle holds a strong SDK handle until it
+    // ends; once ours is dropped, the event stream closes only after every
+    // background cycle (and the activation-time sync) has released the SDK.
+    // That is the barrier: any follow-up heartbeat happens before it.
+    drop(sdk);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match events.recv().await {
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            }
+        }
+    })
+    .await
+    .expect("a background task kept the SDK alive (hang guard)");
 
     let requests = server.received_requests().await.unwrap();
     assert!(
@@ -658,7 +752,6 @@ async fn revoked_auto_validation_does_not_send_a_followup_heartbeat() {
             .iter()
             .all(|request| !request.url.path().ends_with("/heartbeat"))
     );
-    assert!(sdk.current_license().is_none());
 }
 
 // ============================================================================

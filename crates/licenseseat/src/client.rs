@@ -5569,6 +5569,51 @@ mod runtime_state_tests {
         assert!(!sdk.status().is_active());
     }
 
+    /// The runtime half of "a signed offline grant expires without a process
+    /// restart", without waiting on the wall clock: the installed state's
+    /// effective time is advanced past the artifact deadline (as elapsed
+    /// monotonic time would), and the next observation must revoke the grant
+    /// and announce it exactly once (#19 review: the integration test cannot
+    /// guarantee it exercises this transition on a stalled machine).
+    #[test]
+    fn signed_offline_grant_expires_in_process() {
+        let sdk = sdk();
+        let mut license = license_with_entitlements(&[]);
+        license.validation.as_mut().unwrap().offline = true;
+        let deadline = Utc::now() + chrono::Duration::minutes(10);
+        sdk.set_runtime_license_state_until(
+            license,
+            TrustedLicenseSource::SignedOfflineArtifact,
+            Some(deadline.timestamp()),
+        );
+        assert!(sdk.status().is_active());
+        let mut events = sdk.subscribe();
+
+        sdk.inner
+            .runtime_license_state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .last_effective = deadline + chrono::Duration::seconds(1);
+
+        assert!(!sdk.status().is_active());
+        let validation = sdk.current_authoritative_validation().expect("validation");
+        assert!(!validation.valid);
+        assert_eq!(validation.code.as_deref(), Some("offline_artifact_expired"));
+        sdk.status();
+        let kinds: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| event.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::OfflineValidationFailed,
+                EventKind::ValidationOfflineFailed
+            ]
+        );
+    }
+
     /// Concurrent observers claim transitions under the state lock; the
     /// announcements must reach subscribers in the same order. Each event
     /// carries the entitlements still active, so across one license's
