@@ -73,15 +73,27 @@ fn covers_version_matches_the_server_rule() {
         below_version: Some("3.0.0".into()),
         metadata: None,
     };
-    assert!(bounded.covers_version("2.3"), "lenient: 2.3 counts as 2.3.0");
-    assert!(bounded.covers_version("2.9.9-beta.1"), "a prerelease below the ceiling is covered");
-    assert!(!bounded.covers_version("3.0"), "the ceiling is exclusive: 3.0 is not below 3.0.0");
+    assert!(
+        bounded.covers_version("2.3"),
+        "lenient: 2.3 counts as 2.3.0"
+    );
+    assert!(
+        bounded.covers_version("2.9.9-beta.1"),
+        "a prerelease below the ceiling is covered"
+    );
+    assert!(
+        !bounded.covers_version("3.0"),
+        "the ceiling is exclusive: 3.0 is not below 3.0.0"
+    );
     assert!(
         !bounded.covers_version("3.0.0-beta.1"),
         "a prerelease OF the ceiling is not below it — same rule as the server"
     );
     assert!(!bounded.covers_version("4.1.0"));
-    assert!(bounded.covers_version("nightly-build"), "unparseable fails open — never brick the app");
+    assert!(
+        bounded.covers_version("nightly-build"),
+        "unparseable fails open — never brick the app"
+    );
 
     let unbounded = Entitlement {
         key: "updates".into(),
@@ -89,7 +101,10 @@ fn covers_version_matches_the_server_rule() {
         below_version: None,
         metadata: None,
     };
-    assert!(unbounded.covers_version("99.0.0"), "no ceiling covers everything");
+    assert!(
+        unbounded.covers_version("99.0.0"),
+        "no ceiling covers everything"
+    );
 }
 
 /// A version-gated refusal is a normal `valid: false` envelope carrying the
@@ -138,7 +153,9 @@ async fn version_not_entitled_validation_surfaces_code() {
         .await;
 
     let sdk = LicenseSeat::new(test_config(&server.uri()));
-    sdk.activate("TEST-KEY").await.expect("activation below the ceiling succeeds");
+    sdk.activate("TEST-KEY")
+        .await
+        .expect("activation below the ceiling succeeds");
 
     let _ = sdk.validate().await;
     let license = sdk.current_license().expect("license cached");
@@ -168,9 +185,9 @@ async fn telemetry_app_version_rides_the_validate_body() {
     config.app_version = Some("2.9.9".into());
 
     let sdk = LicenseSeat::new(config);
-    sdk.activate("TEST-KEY")
-        .await
-        .expect("the activate body must carry telemetry.app_version — the server's version gate reads it");
+    sdk.activate("TEST-KEY").await.expect(
+        "the activate body must carry telemetry.app_version — the server's version gate reads it",
+    );
 
     server.verify().await;
 }
