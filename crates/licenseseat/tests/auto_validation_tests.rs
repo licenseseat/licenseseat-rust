@@ -575,15 +575,29 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
 ///
 /// This used to count requests inside fixed 40 ms windows, which failed under
 /// parallel load whenever a window slipped past the next legitimate tick
-/// (licenseseat-rust#12). It now relies on a property of a single loop that
-/// holds however slow the machine is: the loop sleeps `interval` only after
-/// its previous fetch has completed, so one loop's consecutive requests
-/// arrive more than `interval` apart. A surviving old loop would put a
-/// second request well inside that spacing.
+/// (licenseseat-rust#12). It now relies only on facts that hold however slow
+/// the machine is:
+///
+/// - One refresh loop sleeps `INTERVAL` only after its previous fetch has
+///   completed, so its own requests arrive more than `INTERVAL` apart.
+/// - After the restart, at most two requests can come from anywhere else:
+///   the activation-time one-shot sync (a single request), and at most one
+///   request the old loop had already sent before it was stopped (it awaits
+///   each fetch, so it never has two in flight).
+/// - Inserting one stray request into a correctly spaced sequence creates at
+///   most two gaps shorter than `INTERVAL`, so a correct SDK shows at most
+///   four short gaps among the requests that arrive after the restart.
+///
+/// A surviving old loop interleaves with the new one and creates a short gap
+/// at nearly every tick, so with `AFTER_RESTART` requests it exceeds that
+/// bound by a wide margin. No assertion depends on how long activation or the
+/// restart took.
 #[cfg(feature = "offline")]
 #[tokio::test]
 async fn test_support_tasks_do_not_duplicate_after_restart() {
-    const INTERVAL: Duration = Duration::from_secs(1);
+    const INTERVAL: Duration = Duration::from_millis(300);
+    const AFTER_RESTART: usize = 16;
+    const MAX_LEGITIMATE_SHORT_GAPS: usize = 4;
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -623,39 +637,35 @@ async fn test_support_tasks_do_not_duplicate_after_restart() {
     config.max_offline_days = 7;
 
     let sdk = LicenseSeat::new(config);
-    let before_activation = std::time::Instant::now();
     sdk.activate("TEST-KEY").await.unwrap();
-
-    // The activation-time one-shot sync_offline_assets() request.
-    wait_until(|| !arrivals.lock().unwrap().is_empty()).await;
     // Restart while the first refresh loop is (normally) still sleeping.
     sdk.stop_background_tasks();
     sdk.start_background_tasks();
     let restarted = std::time::Instant::now();
 
-    // One-shot plus three ticks of the replacement loop (a surviving old loop
-    // would pair with each of them).
-    wait_until(|| arrivals.lock().unwrap().len() >= 4).await;
-    let arrivals = arrivals.lock().unwrap().clone();
+    let after_restart = |arrivals: &[std::time::Instant]| -> Vec<std::time::Instant> {
+        arrivals
+            .iter()
+            .copied()
+            .filter(|arrival| *arrival > restarted)
+            .collect()
+    };
+    wait_until(|| after_restart(&arrivals.lock().unwrap()).len() >= AFTER_RESTART).await;
+    sdk.stop_background_tasks();
+    let observed = after_restart(&arrivals.lock().unwrap());
 
-    // If the restart completed less than one interval after activation began,
-    // the first loop (started inside activate) cannot have sent anything
-    // before it was stopped, and arrivals[0] is the one-shot sync. Otherwise
-    // a pre-stop tick of the old loop is legitimate and the arrivals cannot
-    // be attributed; only liveness (above) is asserted.
-    if restarted.duration_since(before_activation) < INTERVAL {
-        assert!(
-            arrivals[0] < restarted,
-            "one-shot sync precedes the restart"
-        );
-        for pair in arrivals.windows(2) {
-            assert!(
-                pair[1].duration_since(pair[0]) > INTERVAL,
-                "two refreshes {:?} apart: a stopped refresh loop is still running",
-                pair[1].duration_since(pair[0])
-            );
-        }
-    }
+    let short_gaps: Vec<_> = observed
+        .windows(2)
+        .map(|pair| pair[1].duration_since(pair[0]))
+        .filter(|gap| *gap <= INTERVAL)
+        .collect();
+    assert!(
+        short_gaps.len() <= MAX_LEGITIMATE_SHORT_GAPS,
+        "{} of {} refreshes arrived less than {INTERVAL:?} apart ({short_gaps:?}): \
+         a stopped refresh loop is still running",
+        short_gaps.len(),
+        observed.len()
+    );
 }
 
 #[tokio::test]
@@ -711,6 +721,25 @@ async fn revoked_auto_validation_does_not_send_a_followup_heartbeat() {
     // took over 2 s (licenseseat-rust#12). `license:revoked` is emitted only
     // after the denial has been written and background tasks stopped.
     wait_for_event(&mut events, EventKind::LicenseRevoked).await;
+    assert!(sdk.current_license().is_none());
+
+    // `license:revoked` is emitted inside validate_key, before the
+    // auto-validation cycle finishes, so it does not prove that no heartbeat
+    // follows in the same cycle. The cycle holds a strong SDK handle until it
+    // ends; once ours is dropped, the event stream closes only after every
+    // background cycle (and the activation-time sync) has released the SDK.
+    // That is the barrier: any follow-up heartbeat happens before it.
+    drop(sdk);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match events.recv().await {
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            }
+        }
+    })
+    .await
+    .expect("a background task kept the SDK alive (hang guard)");
 
     let requests = server.received_requests().await.unwrap();
     assert!(
@@ -723,7 +752,6 @@ async fn revoked_auto_validation_does_not_send_a_followup_heartbeat() {
             .iter()
             .all(|request| !request.url.path().ends_with("/heartbeat"))
     );
-    assert!(sdk.current_license().is_none());
 }
 
 // ============================================================================

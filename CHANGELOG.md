@@ -56,6 +56,15 @@
   spacing instead of counting inside 40 ms windows; and
   `signed_offline_runtime_grant_expires_without_process_restart` stamps its
   5 s machine-file window when the file is first served. (#12)
+- Review follow-ups for those tests (#12): the duplicate-loop test now
+  bounds the number of short request gaps after the restart instead of
+  skipping its check when activation is slow; the revocation test uses the
+  event stream closing after the SDK is dropped as a barrier for the whole
+  auto-validation cycle; the offline-expiry test accepts a successful
+  checkout whenever it returns and only accepts a refusal once the window
+  has provably closed; and the in-process expiry of a signed offline grant
+  is now also covered deterministically by
+  `runtime_state_tests::signed_offline_grant_expires_in_process`.
 
 ## [0.6.3] - 2026-08-19
 

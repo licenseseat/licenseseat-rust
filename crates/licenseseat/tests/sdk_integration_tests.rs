@@ -1737,14 +1737,18 @@ async fn signed_offline_runtime_grant_expires_without_process_restart() {
         .as_ref()
         .expect("machine file served")
         .1;
-    let checkout_returned_at = Utc::now().timestamp();
-    if checkout_returned_at < authorization_deadline {
-        checkout.unwrap();
-    } else {
-        // The machine stalled past the 5 s window between serving and
-        // verifying the file; refusing it is the correct outcome and nothing
-        // below can be exercised.
-        assert!(checkout.is_err());
+    if let Err(error) = checkout {
+        // Checkout verifies the file before persisting it, so its return time
+        // says nothing about when verification ran; a successful checkout is
+        // accepted whenever it returns. A refusal is only correct once the
+        // window has closed, which this check proves after the fact. A stall
+        // that long leaves nothing below to exercise; the in-process
+        // transition itself is covered deterministically by
+        // `client::runtime_state_tests::signed_offline_grant_expires_in_process`.
+        assert!(
+            Utc::now().timestamp() >= authorization_deadline,
+            "checkout refused a machine file inside its validity window: {error}"
+        );
         return;
     }
     drop(online_sdk);
@@ -1758,7 +1762,10 @@ async fn signed_offline_runtime_grant_expires_without_process_restart() {
     let restored = offline_sdk.restore_license().await;
     let entitled_after_restore = offline_sdk.has_entitlement("pro-features");
     // Each comparison below is only claimed for instants the test can prove
-    // were before the (whole-second) authorization deadline.
+    // were before the (whole-second) authorization deadline. If the machine
+    // stalled past it, only the expired side is asserted; the in-process
+    // transition is covered deterministically by
+    // `client::runtime_state_tests::signed_offline_grant_expires_in_process`.
     let observed_before_deadline = Utc::now().timestamp() < authorization_deadline;
     if observed_before_deadline {
         assert!(restored.restored);
