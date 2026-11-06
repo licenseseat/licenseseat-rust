@@ -25,6 +25,22 @@
   effective time back to the start of the current second, so an entitlement
   already observed (and announced) as expired could read as active again for
   up to a second, then lapse with no event.
+- The anti-rollback clock now holds across runtime-state replacements in
+  one process. Re-installing state from a signed offline artifact (for
+  example an offline revalidation during an outage) used to anchor a fresh
+  clock at the wall clock, so after a wall-clock rollback an artifact whose
+  deadline had already passed in process time verified again. Offline and
+  denial installs now inherit the process-wide floor, and offline
+  revalidation judges the artifact's deadline at that time; an
+  authenticated online answer still re-anchors to the wall clock, as it
+  re-anchors the persisted watermark.
+- State-change announcements reach subscribers in the order they were
+  claimed. Concurrent observers released the state lock before publishing,
+  so a later "nothing left" announcement could overtake an earlier one
+  that still listed an entitlement, leaving subscribers on stale state.
+- `restore_license` on an already-established state answers from one
+  observation; it returned the raw validation (still listing a lapsed
+  entitlement) beside a status computed at another instant.
 
 ### Tests
 

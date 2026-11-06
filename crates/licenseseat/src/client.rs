@@ -85,6 +85,12 @@ struct LicenseSeatInner {
     // process as if it were its own current license.
     recovery_license: Mutex<Option<License>>,
     runtime_license_state: Mutex<Option<RuntimeLicenseState>>,
+    /// Process-wide anti-rollback floor: the greatest effective time observed
+    /// in this process and the monotonic instant it was observed at. It
+    /// outlives individual runtime states, so re-installing state from an
+    /// offline artifact cannot re-anchor authorization time to a rolled-back
+    /// wall clock (#16 review, round 2).
+    runtime_clock_floor: Mutex<Option<(chrono::DateTime<Utc>, Instant)>>,
     is_online: AtomicBool,
     /// Flag to stop support/background tasks.
     background_tasks_running: AtomicBool,
@@ -371,6 +377,7 @@ impl LicenseSeat {
             // Persisted online validation is unsigned cache data. Only this
             // process-local snapshot may drive status and entitlement grants.
             runtime_license_state: Mutex::new(None),
+            runtime_clock_floor: Mutex::new(None),
             // Reachability is unknown until this process completes an API
             // request. An optimistic `true` is misleading during startup.
             is_online: AtomicBool::new(false),
@@ -1444,13 +1451,17 @@ impl LicenseSeat {
         // the already-established runtime state instead of superseding the
         // first caller's validation operation.
         let _restore_guard = self.inner.restore_lock.lock().await;
-        if let Some(license) = self.runtime_license() {
-            let status = self.status();
+        // One observation for the whole answer: status and validation must
+        // describe the same instant (an expiry between two separate reads
+        // used to return an invalid status beside a still-valid, unpruned
+        // validation).
+        let established = self.state_snapshot();
+        if established.trusted_source.is_some() {
             return RestoreResult {
-                restored: status.is_active(),
-                status,
-                validation: license.validation.clone(),
-                license: Some(license),
+                restored: established.status.is_active(),
+                status: established.status,
+                validation: established.validation,
+                license: established.license,
                 error: None,
             };
         }
@@ -1528,14 +1539,16 @@ impl LicenseSeat {
         // Return the state that actually survived response binding and the
         // final commit, not branch-local guesses or the stale cache snapshot
         // captured before network or offline verification began.
-        result.status = self.status();
-        result.restored = result.status.is_active();
-        result.license = self.current_license();
         // `current_license` intentionally exposes the persisted restoration
         // candidate for diagnostics while the state is pending. Its embedded
         // validation is unsigned and must never be returned as the decision
-        // that drove this restore result.
-        result.validation = self.current_authoritative_validation();
+        // that drove this restore result; status and validation come from one
+        // snapshot (one observation).
+        let snapshot = self.state_snapshot();
+        result.status = snapshot.status;
+        result.restored = result.status.is_active();
+        result.license = self.current_license();
+        result.validation = snapshot.validation;
 
         result
     }
@@ -3299,12 +3312,27 @@ impl LicenseSeat {
             }
         }
 
+        // Artifact verification reads the wall clock; the process may already
+        // have observed a later time (rollback after a longer run). Judge the
+        // grant at the process-effective time.
+        let effective_now = self.process_effective_now();
+        let mut authorization_expires_at = authorization_expires_at;
+        if result.valid
+            && authorization_expires_at
+                .is_some_and(|deadline| effective_now.timestamp() >= deadline)
+        {
+            *result = offline_invalid_result(
+                Some("offline_artifact_expired".into()),
+                Some("Signed offline authorization has expired".into()),
+            );
+            authorization_expires_at = None;
+        }
         if result.valid {
             if !license_response_matches_active_grant(
                 &result.license,
                 &expected_identity.license_key,
                 self.require_product_slug()?,
-                &Utc::now(),
+                &effective_now,
             ) {
                 *result = offline_invalid_result(
                     Some("offline_identity_mismatch".into()),
@@ -3430,7 +3458,7 @@ impl LicenseSeat {
     }
 
     fn runtime_license_state(&self) -> Option<RuntimeLicenseState> {
-        let (state, transition_events) = {
+        let state = {
             let mut guard = self
                 .inner
                 .runtime_license_state
@@ -3438,6 +3466,7 @@ impl LicenseSeat {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let state = guard.as_mut()?;
             let now = state.observe_effective_now();
+            self.raise_runtime_clock_floor(now);
             let mut transition_events = Vec::new();
             let artifact_expired = state
                 .authorization_expires_at
@@ -3524,12 +3553,56 @@ impl LicenseSeat {
                     }
                 }
             }
-            (state.clone(), transition_events)
+            // Publish while still holding the state lock. The transition was
+            // claimed under this lock; releasing it first let a later claim
+            // (e.g. "nothing left") reach subscribers before an earlier one
+            // ("B still active"), leaving them on stale state for good.
+            // `broadcast::Sender::send` never blocks or calls back into the
+            // SDK, so this cannot deadlock.
+            for event in transition_events {
+                self.emit(event);
+            }
+            state.clone()
         };
-        for event in transition_events {
-            self.emit(event);
-        }
         Some(state)
+    }
+
+    /// Wall time, floored by the process-wide anti-rollback clock.
+    fn process_effective_now(&self) -> chrono::DateTime<Utc> {
+        let floor = *self
+            .inner
+            .runtime_clock_floor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wall_now = Utc::now();
+        match floor {
+            Some((observed, at)) => {
+                effective_runtime_time(wall_now, observed, at.elapsed(), observed)
+            }
+            None => wall_now,
+        }
+    }
+
+    fn raise_runtime_clock_floor(&self, observed: chrono::DateTime<Utc>) {
+        let mut floor = self
+            .inner
+            .runtime_clock_floor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = floor.map(|(previous, at)| {
+            effective_runtime_time(previous, previous, at.elapsed(), previous)
+        });
+        if current.is_none_or(|current| observed >= current) {
+            *floor = Some((observed, Instant::now()));
+        }
+    }
+
+    fn reset_runtime_clock_floor(&self, observed: chrono::DateTime<Utc>) {
+        *self
+            .inner
+            .runtime_clock_floor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((observed, Instant::now()));
     }
 
     fn runtime_license(&self) -> Option<License> {
@@ -3551,7 +3624,19 @@ impl LicenseSeat {
             .recovery_license
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let observed_wall_time = Utc::now();
+        // An authenticated online answer re-anchors process time to the wall
+        // clock (as it re-anchors the persisted watermark); every other
+        // source inherits the process floor, so an offline re-verification
+        // under a rolled-back clock cannot restart authorization time.
+        let observed_wall_time = if source == TrustedLicenseSource::OnlineResponse {
+            let now = Utc::now();
+            self.reset_runtime_clock_floor(now);
+            now
+        } else {
+            let now = self.process_effective_now();
+            self.raise_runtime_clock_floor(now);
+            now
+        };
         let next_entitlement_transition_at =
             next_entitlement_transition(&license, &observed_wall_time);
         *self
@@ -5345,6 +5430,191 @@ mod entitlement_transition_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_state_tests {
+    use super::{LicenseSeat, TrustedLicenseSource};
+    use crate::config::Config;
+    use crate::events::{EventData, EventKind};
+    use crate::models::License;
+    use chrono::{DateTime, Utc};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn sdk() -> LicenseSeat {
+        let mut config = Config::new("test-api-key", "test-product");
+        config.api_base_url = "http://127.0.0.1:9".into();
+        config.storage_prefix = format!(
+            "runtime_state_tests_{}_{}_",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        );
+        config.auto_validate_interval = std::time::Duration::ZERO;
+        config.heartbeat_interval = std::time::Duration::ZERO;
+        config.network_recheck_interval = std::time::Duration::ZERO;
+        config.offline_token_refresh_interval = std::time::Duration::ZERO;
+        LicenseSeat::try_new(config).expect("test sdk")
+    }
+
+    pub(super) fn license_with_entitlements(expiries: &[DateTime<Utc>]) -> License {
+        let entitlements: Vec<_> = expiries
+            .iter()
+            .enumerate()
+            .map(|(index, expiry)| {
+                serde_json::json!({ "key": format!("feature-{index}"), "expires_at": expiry.to_rfc3339() })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "license_key": "KEY",
+            "device_id": "device",
+            "activation_id": "act_1",
+            "activated_at": "2026-01-01T00:00:00Z",
+            "last_validated": "2026-01-01T00:00:00Z",
+            "validation": {
+                "object": "validation_result",
+                "valid": true,
+                "license": {
+                    "object": "license",
+                    "key": "KEY",
+                    "status": "active",
+                    "mode": "hardware_locked",
+                    "plan_key": "pro",
+                    "active_seats": 1,
+                    "active_entitlements": entitlements,
+                    "product": { "slug": "test-product", "name": "Test" }
+                },
+                "offline": false
+            }
+        }))
+        .expect("test license fixture")
+    }
+
+    fn license_without_expiring_entitlements() -> License {
+        license_with_entitlements(&[])
+    }
+
+    /// Sol r2 finding 1: re-installing runtime state from a signed offline
+    /// artifact used to anchor a fresh clock at the wall clock, discarding the
+    /// time this process had already observed. A rolled-back wall clock (here:
+    /// the process has observed a time one hour ahead of the wall) could then
+    /// revive an artifact whose deadline had already passed in process time.
+    #[test]
+    fn offline_reinstall_inherits_the_process_clock_floor() {
+        let sdk = sdk();
+        let wall = Utc::now();
+        sdk.reset_runtime_clock_floor(wall + chrono::Duration::hours(1));
+        sdk.set_runtime_license_state_until(
+            license_without_expiring_entitlements(),
+            TrustedLicenseSource::SignedOfflineArtifact,
+            Some((wall + chrono::Duration::minutes(10)).timestamp()),
+        );
+        let validation = sdk
+            .runtime_license_state()
+            .and_then(|state| state.license.validation)
+            .expect("runtime validation");
+        assert!(
+            !validation.valid,
+            "rolled-back clock revived an expired artifact"
+        );
+        assert_eq!(validation.code.as_deref(), Some("offline_artifact_expired"));
+    }
+
+    /// An authenticated online answer re-anchors process time to the wall
+    /// clock, mirroring how it re-anchors the persisted watermark.
+    #[test]
+    fn online_answer_reanchors_the_process_clock() {
+        let sdk = sdk();
+        let wall = Utc::now();
+        sdk.reset_runtime_clock_floor(wall + chrono::Duration::hours(1));
+        sdk.set_runtime_license_state(
+            license_with_entitlements(&[wall + chrono::Duration::minutes(10)]),
+            TrustedLicenseSource::OnlineResponse,
+        );
+        assert!(sdk.has_entitlement("feature-0"));
+    }
+
+    /// The same at the offline-verification boundary: the result handed back
+    /// to the caller of an offline revalidation is judged at process time.
+    #[cfg(feature = "offline")]
+    #[test]
+    fn offline_revalidation_judges_the_artifact_at_process_time() {
+        let sdk = sdk();
+        let license = license_without_expiring_entitlements();
+        sdk.inner
+            .cache
+            .commit_activation(&license, Utc::now().timestamp())
+            .expect("persist activation");
+        let wall = Utc::now();
+        sdk.reset_runtime_clock_floor(wall + chrono::Duration::hours(1));
+        let mut result = license.validation.clone().expect("validation");
+        let operation = sdk
+            .inner
+            .current_license_state_operation
+            .load(Ordering::SeqCst);
+        sdk.finalize_offline_validation(
+            &license.identity(),
+            operation,
+            &mut result,
+            Some((wall + chrono::Duration::minutes(10)).timestamp()),
+        )
+        .expect("finalize");
+        assert!(
+            !result.valid,
+            "offline revalidation revived an expired artifact"
+        );
+        assert_eq!(result.code.as_deref(), Some("offline_artifact_expired"));
+        assert!(!sdk.status().is_active());
+    }
+
+    /// Concurrent observers claim transitions under the state lock; the
+    /// announcements must reach subscribers in the same order. Each event
+    /// carries the entitlements still active, so across one license's
+    /// lifetime the announced count can only shrink.
+    #[test]
+    fn concurrent_observers_announce_transitions_in_claim_order() {
+        let sdk = sdk();
+        let mut reordered = Vec::new();
+        for iteration in 0..1_500 {
+            let base = Utc::now() + chrono::Duration::milliseconds(2);
+            let expiries: Vec<_> = (0..4)
+                .map(|step| base + chrono::Duration::microseconds(150 * step))
+                .collect();
+            let end = *expiries.last().unwrap() + chrono::Duration::milliseconds(1);
+            let mut events = sdk.subscribe();
+            sdk.set_runtime_license_state(
+                license_with_entitlements(&expiries),
+                TrustedLicenseSource::OnlineResponse,
+            );
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| {
+                        while Utc::now() < end {
+                            let _ = sdk.runtime_license_state();
+                        }
+                        let _ = sdk.runtime_license_state();
+                    });
+                }
+            });
+            let mut announced = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if event.kind == EventKind::LicenseStateChanged {
+                    let Some(EventData::Validation(validation)) = event.data else {
+                        panic!("state change without validation");
+                    };
+                    announced.push(validation.license.active_entitlements.len());
+                }
+            }
+            if announced.windows(2).any(|pair| pair[1] > pair[0]) {
+                reordered.push((iteration, announced));
+            }
+        }
+        assert!(
+            reordered.is_empty(),
+            "transitions announced out of order: {reordered:?}"
+        );
     }
 }
 

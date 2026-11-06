@@ -1353,7 +1353,11 @@ async fn entitlement_expiry_notifies_subscribers_and_revokes_access_in_process()
         .mount(&server)
         .await;
 
-    let sdk = LicenseSeat::try_new(test_config(&server.uri())).unwrap();
+    let mut config = test_config(&server.uri());
+    // No background observers: only this test's own calls observe state.
+    config.network_recheck_interval = Duration::ZERO;
+    config.offline_token_refresh_interval = Duration::ZERO;
+    let sdk = LicenseSeat::try_new(config).unwrap();
     let mut events = sdk.subscribe();
     let activated = sdk.activate(license_key).await.unwrap();
     // The SDK installs its runtime state (and the entitlement deadline)
@@ -1383,9 +1387,12 @@ async fn entitlement_expiry_notifies_subscribers_and_revokes_access_in_process()
     let truncated_deadline = chrono::DateTime::from_timestamp(expiry.timestamp(), 0).unwrap();
     wait_for_wall_clock(truncated_deadline).await;
     let observed = sdk.check_entitlement("short-lived-feature");
-    let observed_before_expiry = Utc::now() < expiry;
     let early_changes = drain_state_changes(&mut events);
-    if observed_before_expiry {
+    // Sampled after the drain: if even the drain finished before the expiry,
+    // no observer (ours or a background task) can legitimately have announced
+    // it yet, so any drained state change is the early-announcement bug.
+    let drained_before_expiry = Utc::now() < expiry;
+    if drained_before_expiry {
         assert!(observed.active, "entitlement is active until its expiry");
         assert!(
             early_changes.is_empty(),
@@ -1437,6 +1444,60 @@ async fn entitlement_expiry_notifies_subscribers_and_revokes_access_in_process()
     sdk.check_entitlement("short-lived-feature");
     sdk.status();
     assert!(drain_state_changes(&mut events).is_empty());
+}
+
+/// `restore_license` on an already-established state answers from one
+/// observation: after an entitlement lapses, the returned validation must not
+/// still list it beside a status that excludes it (#16 review, round 2).
+#[tokio::test]
+async fn restore_on_an_established_state_answers_from_one_observation() {
+    let server = MockServer::start().await;
+    let license_key = "RESTORE-OBSERVATION-LICENSE";
+    let expiry = Utc::now() + chrono::Duration::milliseconds(1_500);
+    let mut license = license_json(
+        license_key,
+        "active",
+        "pro",
+        "hardware_locked",
+        &[],
+        "Test App",
+    );
+    license["active_entitlements"] = json!([{
+        "key": "short-lived-feature",
+        "expires_at": expiry.to_rfc3339(),
+        "metadata": null
+    }]);
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response_with_license(
+                license_key,
+                "device-123",
+                license,
+            )),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    config.network_recheck_interval = Duration::ZERO;
+    config.offline_token_refresh_interval = Duration::ZERO;
+    let sdk = LicenseSeat::try_new(config).unwrap();
+    sdk.activate(license_key).await.unwrap();
+    wait_for_wall_clock(expiry).await;
+
+    let restore = sdk.restore_license().await;
+    assert!(restore.restored, "the license itself is still active");
+    let LicenseStatus::Active { details } = &restore.status else {
+        panic!("unexpected status {:?}", restore.status);
+    };
+    assert!(details.entitlements.is_empty());
+    let validation = restore.validation.expect("established validation");
+    assert!(validation.valid);
+    assert!(
+        validation.license.active_entitlements.is_empty(),
+        "restore returned a validation that still lists a lapsed entitlement"
+    );
 }
 
 // ============================================================================
