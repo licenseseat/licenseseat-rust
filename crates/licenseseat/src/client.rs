@@ -85,6 +85,12 @@ struct LicenseSeatInner {
     // process as if it were its own current license.
     recovery_license: Mutex<Option<License>>,
     runtime_license_state: Mutex<Option<RuntimeLicenseState>>,
+    /// Process-wide anti-rollback floor: the greatest effective time observed
+    /// in this process and the monotonic instant it was observed at. It
+    /// outlives individual runtime states, so re-installing state from an
+    /// offline artifact cannot re-anchor authorization time to a rolled-back
+    /// wall clock (#16 review, round 2).
+    runtime_clock_floor: Mutex<Option<(chrono::DateTime<Utc>, Instant)>>,
     is_online: AtomicBool,
     /// Flag to stop support/background tasks.
     background_tasks_running: AtomicBool,
@@ -113,39 +119,40 @@ struct RuntimeLicenseState {
     /// Wall-clock anchor paired with a monotonic process clock. Authorization
     /// time never moves backwards while the process remains alive, even if the
     /// system clock is rolled back after offline verification.
-    observed_wall_time: i64,
+    observed_wall_time: chrono::DateTime<Utc>,
     observed_monotonic: Instant,
-    /// Greatest effective authorization timestamp observed in this process.
-    /// This closes the forward-then-backward clock sequence that a fixed
-    /// monotonic floor alone cannot detect.
-    last_effective_timestamp: i64,
+    /// Greatest effective authorization time observed in this process, at
+    /// full precision. This closes the forward-then-backward clock sequence
+    /// that a fixed monotonic floor alone cannot detect. It is also the `now`
+    /// of the most recent observation: callers of `runtime_license_state`
+    /// read it through [`Self::observed_now`] so the transition check and the
+    /// answer they return use one and the same instant.
+    last_effective: chrono::DateTime<Utc>,
     /// Next active-entitlement expiry that should notify state subscribers.
-    next_entitlement_transition_at: Option<i64>,
+    /// Kept at full precision: entitlement expiries carry sub-second parts,
+    /// and every observation compares them against a full-precision `now`.
+    /// Truncating the deadline to whole seconds fired the state-change event
+    /// up to one second before the entitlement actually lapsed (with the
+    /// entitlement still in the payload) and then never fired at the real
+    /// expiry (licenseseat-rust#9).
+    next_entitlement_transition_at: Option<chrono::DateTime<Utc>>,
 }
 
 impl RuntimeLicenseState {
-    fn effective_now(&self) -> chrono::DateTime<Utc> {
-        let wall_now = Utc::now();
-        let elapsed =
-            i64::try_from(self.observed_monotonic.elapsed().as_secs()).unwrap_or(i64::MAX);
-        let effective_timestamp = effective_runtime_timestamp(
-            wall_now.timestamp(),
+    fn observe_effective_now(&mut self) -> chrono::DateTime<Utc> {
+        let now = effective_runtime_time(
+            Utc::now(),
             self.observed_wall_time,
-            elapsed,
-            self.last_effective_timestamp,
+            self.observed_monotonic.elapsed(),
+            self.last_effective,
         );
-        if effective_timestamp > wall_now.timestamp() {
-            chrono::DateTime::from_timestamp(effective_timestamp, 0)
-                .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC)
-        } else {
-            wall_now
-        }
+        self.last_effective = now;
+        now
     }
 
-    fn observe_effective_now(&mut self) -> chrono::DateTime<Utc> {
-        let now = self.effective_now();
-        self.last_effective_timestamp = now.timestamp();
-        now
+    /// The instant of the observation that produced this snapshot.
+    fn observed_now(&self) -> chrono::DateTime<Utc> {
+        self.last_effective
     }
 }
 
@@ -370,6 +377,7 @@ impl LicenseSeat {
             // Persisted online validation is unsigned cache data. Only this
             // process-local snapshot may drive status and entitlement grants.
             runtime_license_state: Mutex::new(None),
+            runtime_clock_floor: Mutex::new(None),
             // Reachability is unknown until this process completes an API
             // request. An optimistic `true` is misleading during startup.
             is_online: AtomicBool::new(false),
@@ -451,6 +459,12 @@ impl LicenseSeat {
         self.validate_request_fingerprint(&device_id)?;
         validate_optional_text_input(options.device_name.as_deref(), 255, "device_name")?;
         validate_metadata_input(options.metadata.as_ref(), "metadata")?;
+        // The activation this request would renew, if any: a denial for it is
+        // recorded like a validate denial.
+        let current_identity = self
+            .current_license()
+            .filter(|license| license.license_key == license_key && license.device_id == device_id)
+            .map(|license| license.identity());
         debug!("Starting activation request");
 
         self.emit(Event::new(EventKind::ActivationStart));
@@ -540,10 +554,24 @@ impl LicenseSeat {
 
                 debug!("License activated successfully");
             }
-            Err(error) => self.emit(Event::with_error(
-                EventKind::ActivationError,
-                error.to_string(),
-            )),
+            Err(error) => {
+                // Re-activating the current activation and being told "not
+                // entitled" is the same decision as a validate denial.
+                if let Some(identity) = current_identity.as_ref() {
+                    if let Err(record_error) =
+                        self.record_lifecycle_authoritative_denial(identity, error)
+                    {
+                        self.emit(Event::with_error(
+                            EventKind::SdkError,
+                            record_error.to_string(),
+                        ));
+                    }
+                }
+                self.emit(Event::with_error(
+                    EventKind::ActivationError,
+                    error.to_string(),
+                ))
+            }
         }
         let _ = self.inner.current_activation_operation.compare_exchange(
             operation,
@@ -628,11 +656,33 @@ impl LicenseSeat {
                 )?;
                 let observed_at = Utc::now();
                 if let Some(identity) = cached_identity.as_ref() {
-                    if !self
-                        .inner
-                        .cache
-                        .update_validation(identity, &result, observed_at)?
-                    {
+                    let persisted =
+                        self.inner
+                            .cache
+                            .update_validation(identity, &result, observed_at);
+                    if let Err(error) = persisted {
+                        if !result.valid {
+                            // The server's denial stands even if it cannot be
+                            // written: install it here and retire the grant.
+                            self.inner
+                                .current_offline_sync_operation
+                                .store(0, Ordering::SeqCst);
+                            self.stop_background_tasks();
+                            self.retire_offline_grant_after_unpersisted_denial();
+                            let mut denied_license = cached_license
+                                .clone()
+                                .expect("cached identity requires a cached license");
+                            denied_license.validation = Some(result.clone());
+                            denied_license.last_validated = observed_at;
+                            denied_license.trusted_license = None;
+                            self.set_runtime_license_state(
+                                denied_license,
+                                TrustedLicenseSource::FailClosedDenial,
+                            );
+                        }
+                        return Err(error);
+                    }
+                    if !persisted? {
                         return Err(Error::OperationSuperseded {
                             operation: "validation",
                         });
@@ -652,8 +702,17 @@ impl LicenseSeat {
                         // Persist the authoritative denial before deleting any
                         // older signed grant. If deletion fails, the denial
                         // remains the fail-closed state observed on restart.
-                        if let Err(error) = self.inner.cache.clear_offline_assets() {
-                            self.emit(Event::with_error(EventKind::SdkError, error.to_string()));
+                        // An entitlement/mode denial is the current decision,
+                        // not proof the grant is void: it is recorded (and
+                        // blocks every offline fallback) but the grant is kept
+                        // for the next online `valid:true`.
+                        if !is_authoritative_denial_code(result.code.as_deref()) {
+                            if let Err(error) = self.inner.cache.clear_offline_assets() {
+                                self.emit(Event::with_error(
+                                    EventKind::SdkError,
+                                    error.to_string(),
+                                ));
+                            }
                         }
                         self.stop_background_tasks();
                     }
@@ -763,6 +822,19 @@ impl LicenseSeat {
                     ));
                 }
                 self.emit(Event::with_error(EventKind::ValidationError, e.to_string()));
+
+                if is_authoritative_denial_error(&e) {
+                    self.record_thrown_authoritative_denial(
+                        &self.inner.current_validation_operation,
+                        operation,
+                        stateful,
+                        "validation",
+                        cached_identity.as_ref(),
+                        cached_license.as_ref(),
+                        &e,
+                    )?;
+                    return Err(e);
+                }
 
                 if is_authoritative_invalidation_error(&e) {
                     let _state_guard = self.lock_state_for_commit();
@@ -956,6 +1028,103 @@ impl LicenseSeat {
         outcome
     }
 
+    /// Record a thrown authoritative denial (see `is_authoritative_denial_code`)
+    /// as the current decision: persisted as a `valid: false` validation, runtime
+    /// state `FailClosedDenial`, background tasks stopped. The offline grant is
+    /// kept; it is not a revocation. No-op without a cached identity.
+    #[allow(clippy::too_many_arguments)]
+    fn record_thrown_authoritative_denial(
+        &self,
+        slot: &AtomicU64,
+        operation: u64,
+        stateful: bool,
+        operation_name: &'static str,
+        cached_identity: Option<&LicenseIdentity>,
+        cached_license: Option<&License>,
+        error: &Error,
+    ) -> Result<()> {
+        let Some(identity) = cached_identity else {
+            return Ok(());
+        };
+        let _state_guard = self.lock_state_for_commit();
+        self.ensure_current_target_operation(slot, operation, stateful, operation_name)?;
+        let license = cached_license
+            .cloned()
+            .expect("cached identity requires a cached license");
+        if !self.commit_thrown_authoritative_denial_locked(identity, license, error)? {
+            return Err(Error::OperationSuperseded {
+                operation: operation_name,
+            });
+        }
+        Ok(())
+    }
+
+    /// Record an authoritative denial returned by a lifecycle request that has
+    /// no operation slot of its own (activation, machine-file checkout, offline
+    /// token) when it concerns the exact current activation.
+    #[cfg_attr(not(feature = "offline"), allow(dead_code))]
+    fn record_lifecycle_authoritative_denial(
+        &self,
+        identity: &LicenseIdentity,
+        error: &Error,
+    ) -> Result<()> {
+        if !is_authoritative_denial_error(error) {
+            return Ok(());
+        }
+        let _state_guard = self.lock_state_for_commit();
+        let Some(license) = self
+            .current_license()
+            .filter(|license| license.identity() == *identity)
+        else {
+            return Ok(());
+        };
+        self.commit_thrown_authoritative_denial_locked(identity, license, error)
+            .map(|_| ())
+    }
+
+    /// Caller holds the state-commit lock. Returns `Ok(false)` when the cached
+    /// activation is no longer `identity`. If the decision cannot be persisted,
+    /// the denial is still installed for this process and the signed offline
+    /// grant is retired, so neither this process nor a relaunch can revive it.
+    fn commit_thrown_authoritative_denial_locked(
+        &self,
+        identity: &LicenseIdentity,
+        mut denied_license: License,
+        error: &Error,
+    ) -> Result<bool> {
+        let denial = thrown_denial_validation(&denied_license, error);
+        let observed_at = Utc::now();
+        let persisted = self
+            .inner
+            .cache
+            .update_validation(identity, &denial, observed_at);
+        if matches!(persisted, Ok(false)) {
+            return Ok(false);
+        }
+        self.inner
+            .current_offline_sync_operation
+            .store(0, Ordering::SeqCst);
+        self.stop_background_tasks();
+        if persisted.is_err() {
+            self.retire_offline_grant_after_unpersisted_denial();
+        }
+        denied_license.validation = Some(denial.clone());
+        denied_license.last_validated = observed_at;
+        denied_license.trusted_license = None;
+        self.set_runtime_license_state(denied_license, TrustedLicenseSource::FailClosedDenial);
+        self.emit(Event::with_validation(EventKind::ValidationFailed, denial));
+        persisted
+    }
+
+    /// A denial that could not be written must not leave a signed offline grant
+    /// that a later outage or relaunch would accept.
+    fn retire_offline_grant_after_unpersisted_denial(&self) {
+        #[cfg(feature = "offline")]
+        if let Err(error) = self.inner.cache.clear_offline_assets() {
+            self.emit(Event::with_error(EventKind::SdkError, error.to_string()));
+        }
+    }
+
     /// Send a heartbeat for the current license.
     pub async fn heartbeat(&self) -> Result<HeartbeatResponse> {
         let license = self.current_license().ok_or(Error::NoActiveLicense)?;
@@ -1110,6 +1279,27 @@ impl LicenseSeat {
                     return Err(superseded);
                 }
                 self.set_last_heartbeat_error(Some(e.to_string()));
+                if is_authoritative_denial_error(&e) {
+                    // The same server decision as a validate denial: record it,
+                    // keep the grant, never restart support tasks for it.
+                    if let Err(record_error) = self.record_thrown_authoritative_denial(
+                        &self.inner.current_heartbeat_operation,
+                        operation,
+                        stateful,
+                        "heartbeat",
+                        cached_identity.as_ref(),
+                        cached_license.as_ref(),
+                        &e,
+                    ) {
+                        self.emit(Event::with_error(
+                            EventKind::HeartbeatError,
+                            record_error.to_string(),
+                        ));
+                        return Err(record_error);
+                    }
+                    self.emit(Event::with_error(EventKind::HeartbeatError, e.to_string()));
+                    return Err(e);
+                }
                 if is_authoritative_invalidation_error(&e) {
                     if let Some(identity) = cached_identity.as_ref() {
                         self.invalidate_license_operations();
@@ -1150,7 +1340,7 @@ impl LicenseSeat {
                 entitlement: None,
             };
         };
-        let now = runtime_state.effective_now();
+        let now = runtime_state.observed_now();
         let license = runtime_state.license;
 
         let Some(validation) = &license.validation else {
@@ -1291,7 +1481,7 @@ impl LicenseSeat {
             };
         };
 
-        let now = runtime_state.effective_now();
+        let now = runtime_state.observed_now();
         let status = license_status_for_observation(
             &runtime_state.license,
             &self.inner.config.product_slug,
@@ -1439,13 +1629,17 @@ impl LicenseSeat {
         // the already-established runtime state instead of superseding the
         // first caller's validation operation.
         let _restore_guard = self.inner.restore_lock.lock().await;
-        if let Some(license) = self.runtime_license() {
-            let status = self.status();
+        // One observation for the whole answer: status and validation must
+        // describe the same instant (an expiry between two separate reads
+        // used to return an invalid status beside a still-valid, unpruned
+        // validation).
+        let established = self.state_snapshot();
+        if established.trusted_source.is_some() {
             return RestoreResult {
-                restored: status.is_active(),
-                status,
-                validation: license.validation.clone(),
-                license: Some(license),
+                restored: established.status.is_active(),
+                status: established.status,
+                validation: established.validation,
+                license: established.license,
                 error: None,
             };
         }
@@ -1523,14 +1717,16 @@ impl LicenseSeat {
         // Return the state that actually survived response binding and the
         // final commit, not branch-local guesses or the stale cache snapshot
         // captured before network or offline verification began.
-        result.status = self.status();
-        result.restored = result.status.is_active();
-        result.license = self.current_license();
         // `current_license` intentionally exposes the persisted restoration
         // candidate for diagnostics while the state is pending. Its embedded
         // validation is unsigned and must never be returned as the decision
-        // that drove this restore result.
-        result.validation = self.current_authoritative_validation();
+        // that drove this restore result; status and validation come from one
+        // snapshot (one observation).
+        let snapshot = self.state_snapshot();
+        result.status = snapshot.status;
+        result.restored = result.status.is_active();
+        result.license = self.current_license();
+        result.validation = snapshot.validation;
 
         result
     }
@@ -2486,10 +2682,22 @@ impl LicenseSeat {
                 self.emit(Event::new(EventKind::OfflineTokenFetched));
                 self.emit(Event::new(EventKind::OfflineTokenReady));
             }
-            Err(error) => self.emit(Event::with_error(
-                EventKind::OfflineTokenFetchError,
-                error.to_string(),
-            )),
+            Err(error) => {
+                if let Some(identity) = cached_identity.as_ref() {
+                    if let Err(record_error) =
+                        self.record_lifecycle_authoritative_denial(identity, error)
+                    {
+                        self.emit(Event::with_error(
+                            EventKind::SdkError,
+                            record_error.to_string(),
+                        ));
+                    }
+                }
+                self.emit(Event::with_error(
+                    EventKind::OfflineTokenFetchError,
+                    error.to_string(),
+                ))
+            }
         }
         outcome
     }
@@ -2640,10 +2848,22 @@ impl LicenseSeat {
                 self.emit(Event::new(EventKind::MachineFileFetched));
                 self.emit(Event::new(EventKind::MachineFileReady));
             }
-            Err(error) => self.emit(Event::with_error(
-                EventKind::MachineFileFetchError,
-                error.to_string(),
-            )),
+            Err(error) => {
+                if let Some(identity) = cached_identity.as_ref() {
+                    if let Err(record_error) =
+                        self.record_lifecycle_authoritative_denial(identity, error)
+                    {
+                        self.emit(Event::with_error(
+                            EventKind::SdkError,
+                            record_error.to_string(),
+                        ));
+                    }
+                }
+                self.emit(Event::with_error(
+                    EventKind::MachineFileFetchError,
+                    error.to_string(),
+                ))
+            }
         }
         outcome
     }
@@ -2667,6 +2887,10 @@ impl LicenseSeat {
     }
 
     /// Verify a legacy offline token locally.
+    ///
+    /// This checks the artifact (signature, claims, binding, validity window). It
+    /// does not consult recorded server denials (e.g. `not_entitled`); use
+    /// `validate()` / the license state for licensing decisions.
     #[cfg(feature = "offline")]
     pub fn verify_offline_token(
         &self,
@@ -2829,6 +3053,10 @@ impl LicenseSeat {
     }
 
     /// Verify a machine file locally and emit the standard SDK verification events.
+    ///
+    /// This checks the artifact (signature, claims, binding, validity window). It
+    /// does not consult recorded server denials (e.g. `not_entitled`); use
+    /// `validate()` / the license state for licensing decisions.
     #[cfg(feature = "offline")]
     pub fn verify_machine_file(
         &self,
@@ -2897,7 +3125,9 @@ impl LicenseSeat {
             Err(error) => error,
         };
 
-        if !self.inner.config.enable_legacy_offline_tokens {
+        if !self.inner.config.enable_legacy_offline_tokens
+            || is_authoritative_denial_error(&machine_file_error)
+        {
             return Err(machine_file_error);
         }
 
@@ -3119,6 +3349,11 @@ impl LicenseSeat {
     }
 
     fn should_fallback_offline(&self, error: &Error) -> bool {
+        // An authoritative denial is a decision, not an availability failure,
+        // whatever its status (501 `floating_not_implemented` is a 5xx).
+        if is_authoritative_denial_error(error) {
+            return false;
+        }
         let retryable_server_or_transport =
             error.is_network_error() || matches!(error, Error::Api { status: 429, .. });
         match self.inner.config.offline_fallback_mode {
@@ -3186,6 +3421,30 @@ impl LicenseSeat {
         expected_state_operation: u64,
     ) -> Result<ValidationResult> {
         let mut last_invalid: Option<ValidationResult> = None;
+
+        // An authoritative denial installed in this process stands even when it
+        // could not be persisted (disk full, read-only cache): never fall back
+        // past it to an older signed grant.
+        let in_process_denial = {
+            let guard = self
+                .inner
+                .runtime_license_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .as_ref()
+                .filter(|state| {
+                    matches!(state.source, TrustedLicenseSource::FailClosedDenial)
+                        && state.license.identity() == *expected_identity
+                })
+                .and_then(|state| state.license.validation.clone())
+                .filter(|validation| {
+                    !validation.valid && is_authoritative_denial_code(validation.code.as_deref())
+                })
+        };
+        if let Some(denial) = in_process_denial {
+            return Ok(denial);
+        }
 
         // A previously committed online or local denial is stronger than any
         // older signed offline grant. This also prevents an undeletable or
@@ -3374,12 +3633,27 @@ impl LicenseSeat {
             }
         }
 
+        // Artifact verification reads the wall clock; the process may already
+        // have observed a later time (rollback after a longer run). Judge the
+        // grant at the process-effective time.
+        let effective_now = self.process_effective_now();
+        let mut authorization_expires_at = authorization_expires_at;
+        if result.valid
+            && authorization_expires_at
+                .is_some_and(|deadline| effective_now.timestamp() >= deadline)
+        {
+            *result = offline_invalid_result(
+                Some("offline_artifact_expired".into()),
+                Some("Signed offline authorization has expired".into()),
+            );
+            authorization_expires_at = None;
+        }
         if result.valid {
             if !license_response_matches_active_grant(
                 &result.license,
                 &expected_identity.license_key,
                 self.require_product_slug()?,
-                &Utc::now(),
+                &effective_now,
             ) {
                 *result = offline_invalid_result(
                     Some("offline_identity_mismatch".into()),
@@ -3505,7 +3779,7 @@ impl LicenseSeat {
     }
 
     fn runtime_license_state(&self) -> Option<RuntimeLicenseState> {
-        let (state, transition_events) = {
+        let state = {
             let mut guard = self
                 .inner
                 .runtime_license_state
@@ -3513,6 +3787,7 @@ impl LicenseSeat {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let state = guard.as_mut()?;
             let now = state.observe_effective_now();
+            self.raise_runtime_clock_floor(now);
             let mut transition_events = Vec::new();
             let artifact_expired = state
                 .authorization_expires_at
@@ -3583,12 +3858,9 @@ impl LicenseSeat {
                     state.license.trusted_license = None;
                     state.authorization_expires_at = None;
                     state.next_entitlement_transition_at = None;
-                } else if state
-                    .next_entitlement_transition_at
-                    .is_some_and(|deadline| now.timestamp() >= deadline)
-                {
+                } else if entitlement_transition_due(state.next_entitlement_transition_at, &now) {
                     state.next_entitlement_transition_at =
-                        next_entitlement_transition(&state.license, now.timestamp());
+                        next_entitlement_transition(&state.license, &now);
                     if let Some(validation) = state
                         .license
                         .validation
@@ -3602,12 +3874,56 @@ impl LicenseSeat {
                     }
                 }
             }
-            (state.clone(), transition_events)
+            // Publish while still holding the state lock. The transition was
+            // claimed under this lock; releasing it first let a later claim
+            // (e.g. "nothing left") reach subscribers before an earlier one
+            // ("B still active"), leaving them on stale state for good.
+            // `broadcast::Sender::send` never blocks or calls back into the
+            // SDK, so this cannot deadlock.
+            for event in transition_events {
+                self.emit(event);
+            }
+            state.clone()
         };
-        for event in transition_events {
-            self.emit(event);
-        }
         Some(state)
+    }
+
+    /// Wall time, floored by the process-wide anti-rollback clock.
+    fn process_effective_now(&self) -> chrono::DateTime<Utc> {
+        let floor = *self
+            .inner
+            .runtime_clock_floor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wall_now = Utc::now();
+        match floor {
+            Some((observed, at)) => {
+                effective_runtime_time(wall_now, observed, at.elapsed(), observed)
+            }
+            None => wall_now,
+        }
+    }
+
+    fn raise_runtime_clock_floor(&self, observed: chrono::DateTime<Utc>) {
+        let mut floor = self
+            .inner
+            .runtime_clock_floor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = floor.map(|(previous, at)| {
+            effective_runtime_time(previous, previous, at.elapsed(), previous)
+        });
+        if current.is_none_or(|current| observed >= current) {
+            *floor = Some((observed, Instant::now()));
+        }
+    }
+
+    fn reset_runtime_clock_floor(&self, observed: chrono::DateTime<Utc>) {
+        *self
+            .inner
+            .runtime_clock_floor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((observed, Instant::now()));
     }
 
     fn runtime_license(&self) -> Option<License> {
@@ -3629,9 +3945,21 @@ impl LicenseSeat {
             .recovery_license
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let observed_wall_time = Utc::now().timestamp();
+        // An authenticated online answer re-anchors process time to the wall
+        // clock (as it re-anchors the persisted watermark); every other
+        // source inherits the process floor, so an offline re-verification
+        // under a rolled-back clock cannot restart authorization time.
+        let observed_wall_time = if source == TrustedLicenseSource::OnlineResponse {
+            let now = Utc::now();
+            self.reset_runtime_clock_floor(now);
+            now
+        } else {
+            let now = self.process_effective_now();
+            self.raise_runtime_clock_floor(now);
+            now
+        };
         let next_entitlement_transition_at =
-            next_entitlement_transition(&license, observed_wall_time);
+            next_entitlement_transition(&license, &observed_wall_time);
         *self
             .inner
             .runtime_license_state
@@ -3642,7 +3970,7 @@ impl LicenseSeat {
             authorization_expires_at,
             observed_wall_time,
             observed_monotonic: Instant::now(),
-            last_effective_timestamp: observed_wall_time,
+            last_effective: observed_wall_time,
             next_entitlement_transition_at,
         });
     }
@@ -3670,7 +3998,7 @@ impl LicenseSeat {
         &self,
     ) -> Option<(ValidationResult, TrustedLicenseSource)> {
         let state = self.runtime_license_state()?;
-        let now = state.effective_now();
+        let now = state.observed_now();
         state
             .license
             .validation
@@ -4182,16 +4510,30 @@ fn license_status_for_observation(
     }
 }
 
-fn next_entitlement_transition(license: &License, after: i64) -> Option<i64> {
+/// Earliest active-entitlement expiry strictly after `after`, at full
+/// precision. An entitlement is active while `expires_at > now`
+/// ([`validation_for_observation`], [`LicenseSeat::check_entitlement`]), so the
+/// transition is due exactly when `now >= expires_at`.
+fn next_entitlement_transition(
+    license: &License,
+    after: &chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
     license
         .validation
         .as_ref()
         .filter(|validation| validation.valid)
         .into_iter()
         .flat_map(|validation| validation.license.active_entitlements.iter())
-        .filter_map(|entitlement| entitlement.expires_at.map(|expiry| expiry.timestamp()))
-        .filter(|expiry| *expiry > after)
+        .filter_map(|entitlement| entitlement.expires_at)
+        .filter(|expiry| expiry > after)
         .min()
+}
+
+fn entitlement_transition_due(
+    deadline: Option<chrono::DateTime<Utc>>,
+    now: &chrono::DateTime<Utc>,
+) -> bool {
+    deadline.is_some_and(|deadline| *now >= deadline)
 }
 
 fn validation_for_observation(
@@ -4205,16 +4547,23 @@ fn validation_for_observation(
     validation
 }
 
-fn effective_runtime_timestamp(
-    wall_now: i64,
-    observed_wall_time: i64,
-    elapsed: i64,
-    last_effective_timestamp: i64,
-) -> i64 {
-    wall_now
-        .max(observed_wall_time.saturating_add(elapsed.max(0)))
-        .max(last_effective_timestamp)
-        .min(chrono::DateTime::<Utc>::MAX_UTC.timestamp())
+/// Authorization time for one observation: the wall clock, floored by the
+/// monotonic time elapsed since the state was installed and by the greatest
+/// time already observed, all at full precision. Truncating the floors to
+/// whole seconds let a wall-clock rollback move effective time back to the
+/// start of the current second, reviving an entitlement whose sub-second
+/// expiry had already been observed and announced (licenseseat-rust#9 review).
+fn effective_runtime_time(
+    wall_now: chrono::DateTime<Utc>,
+    observed_wall_time: chrono::DateTime<Utc>,
+    elapsed: Duration,
+    last_effective: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    let monotonic_floor = chrono::Duration::from_std(elapsed)
+        .ok()
+        .and_then(|elapsed| observed_wall_time.checked_add_signed(elapsed))
+        .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
+    wall_now.max(monotonic_floor).max(last_effective)
 }
 
 /// Options for license activation.
@@ -4622,6 +4971,11 @@ fn validate_api_endpoint(url: &url::Url, verify_ssl: bool) -> Result<()> {
 }
 
 fn is_retryable_request_error(error: &Error) -> bool {
+    // An authoritative denial is a decision, not a transient failure; retrying
+    // could replace it with a codeless 5xx that falls back to the offline grant.
+    if is_authoritative_denial_error(error) {
+        return false;
+    }
     matches!(
         error,
         Error::Network(_)
@@ -5261,6 +5615,72 @@ fn is_revocation_code(code: Option<&str>) -> bool {
     })
 }
 
+/// Entitlement and license-mode denials (cross-SDK contract, see
+/// licenseseat-swift#26). The server's answer is the current decision in every
+/// fallback mode: it is recorded and never answered by an offline grant, but
+/// it does not void the grant the way revocation does.
+pub(crate) fn is_authoritative_denial_code(code: Option<&str>) -> bool {
+    code.is_some_and(|code| {
+        matches!(
+            code.to_ascii_lowercase().as_str(),
+            "version_not_entitled"
+                | "not_entitled"
+                | "product_mismatch"
+                | "floating_not_implemented"
+                | "named_user_not_implemented"
+        )
+    })
+}
+
+/// A thrown authoritative denial, regardless of HTTP status: the code, not the
+/// status class, decides (501 `floating_not_implemented` must not read as an
+/// outage).
+fn is_authoritative_denial_error(error: &Error) -> bool {
+    matches!(error, Error::Api { code, .. } if is_authoritative_denial_code(code.as_deref()))
+}
+
+/// The `valid:false` decision recorded for a thrown denial, so that a later
+/// outage or relaunch finds it before any signed offline grant.
+fn thrown_denial_validation(license: &License, error: &Error) -> ValidationResult {
+    let mut denied = license
+        .validation
+        .as_ref()
+        .map(|validation| validation.license.clone())
+        .or_else(|| license.trusted_license.clone())
+        .unwrap_or_else(|| LicenseResponse {
+            object: "license".into(),
+            key: license.license_key.clone(),
+            status: "active".into(),
+            starts_at: None,
+            expires_at: None,
+            mode: String::new(),
+            plan_key: String::new(),
+            seat_limit: None,
+            active_seats: 0,
+            active_entitlements: Vec::new(),
+            metadata: None,
+            product: Product {
+                slug: String::new(),
+                name: String::new(),
+            },
+        });
+    denied.active_entitlements.clear();
+    let (code, message) = match error {
+        Error::Api { code, message, .. } => (code.clone(), Some(message.clone())),
+        other => (None, Some(other.to_string())),
+    };
+    ValidationResult {
+        object: "validation_result".into(),
+        valid: false,
+        code: code.map(|code| code.to_ascii_lowercase()),
+        message,
+        warnings: None,
+        license: denied,
+        activation: None,
+        offline: false,
+    }
+}
+
 /// Return true only for API outcomes that authoritatively prove that the
 /// currently cached activation can no longer be used. Generic 404/422 errors
 /// are intentionally excluded: an intermediary, route mismatch, malformed
@@ -5292,7 +5712,6 @@ fn is_authoritative_invalidation_error(error: &Error) -> bool {
                 | "license_revoked"
                 | "license_suspended"
                 | "not_active"
-                | "product_mismatch"
                 | "revoked"
                 | "suspended"
         )
@@ -5307,17 +5726,390 @@ fn parse_rfc3339(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 #[cfg(test)]
+mod entitlement_transition_tests {
+    use super::{
+        entitlement_transition_due, next_entitlement_transition, validation_for_observation,
+    };
+    use crate::models::License;
+    use chrono::{DateTime, TimeZone, Utc};
+
+    fn license_with_entitlement_expiring_at(expiry: DateTime<Utc>) -> License {
+        serde_json::from_value(serde_json::json!({
+            "license_key": "KEY",
+            "device_id": "device",
+            "activation_id": "act_1",
+            "activated_at": "2026-01-01T00:00:00Z",
+            "last_validated": "2026-01-01T00:00:00Z",
+            "validation": {
+                "object": "validation_result",
+                "valid": true,
+                "license": {
+                    "object": "license",
+                    "key": "KEY",
+                    "status": "active",
+                    "mode": "hardware_locked",
+                    "plan_key": "pro",
+                    "active_seats": 1,
+                    "active_entitlements": [
+                        { "key": "short-lived", "expires_at": expiry.to_rfc3339() }
+                    ],
+                    "product": { "slug": "test-product", "name": "Test" }
+                },
+                "offline": false
+            }
+        }))
+        .expect("test license fixture")
+    }
+
+    fn still_listed(license: &License, now: &DateTime<Utc>) -> bool {
+        !validation_for_observation(license.validation.clone().unwrap(), now)
+            .license
+            .active_entitlements
+            .is_empty()
+    }
+
+    /// licenseseat-rust#9: the deadline used to be truncated to whole seconds,
+    /// so an observation inside `[floor(expiry), expiry)` fired the state
+    /// change while the entitlement was still listed and cleared the deadline,
+    /// leaving subscribers without any event at the real expiry.
+    #[test]
+    fn sub_second_expiry_fires_exactly_once_when_the_entitlement_lapses() {
+        let whole_second = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        let expiry = whole_second + chrono::Duration::milliseconds(700);
+        let license = license_with_entitlement_expiring_at(expiry);
+        let activated_at = whole_second - chrono::Duration::seconds(2);
+
+        let deadline = next_entitlement_transition(&license, &activated_at);
+        assert_eq!(
+            deadline,
+            Some(expiry),
+            "deadline keeps sub-second precision"
+        );
+
+        let inside_the_last_second = whole_second + chrono::Duration::milliseconds(300);
+        assert!(still_listed(&license, &inside_the_last_second));
+        assert!(
+            !entitlement_transition_due(deadline, &inside_the_last_second),
+            "no state change while the entitlement is still active"
+        );
+
+        for at_or_after in [expiry, expiry + chrono::Duration::milliseconds(1)] {
+            assert!(!still_listed(&license, &at_or_after));
+            assert!(entitlement_transition_due(deadline, &at_or_after));
+            assert_eq!(
+                next_entitlement_transition(&license, &at_or_after),
+                None,
+                "a lapsed entitlement is not rescheduled"
+            );
+        }
+    }
+
+    #[test]
+    fn transition_is_due_iff_the_observation_prunes_an_entitlement() {
+        let base = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        for expiry_ms in [0_i64, 1, 499, 500, 999] {
+            let expiry = base + chrono::Duration::milliseconds(expiry_ms);
+            let license = license_with_entitlement_expiring_at(expiry);
+            let deadline =
+                next_entitlement_transition(&license, &(base - chrono::Duration::seconds(1)));
+            for now_ms in -1_000_i64..=1_000 {
+                let now = base + chrono::Duration::milliseconds(now_ms);
+                assert_eq!(
+                    entitlement_transition_due(deadline, &now),
+                    !still_listed(&license, &now),
+                    "expiry +{expiry_ms}ms observed at {now_ms}ms"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_state_tests {
+    use super::{LicenseSeat, TrustedLicenseSource};
+    use crate::config::Config;
+    use crate::events::{EventData, EventKind};
+    use crate::models::License;
+    use chrono::{DateTime, Utc};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn sdk() -> LicenseSeat {
+        let mut config = Config::new("test-api-key", "test-product");
+        config.api_base_url = "http://127.0.0.1:9".into();
+        config.storage_prefix = format!(
+            "runtime_state_tests_{}_{}_",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        );
+        config.auto_validate_interval = std::time::Duration::ZERO;
+        config.heartbeat_interval = std::time::Duration::ZERO;
+        config.network_recheck_interval = std::time::Duration::ZERO;
+        config.offline_token_refresh_interval = std::time::Duration::ZERO;
+        LicenseSeat::try_new(config).expect("test sdk")
+    }
+
+    pub(super) fn license_with_entitlements(expiries: &[DateTime<Utc>]) -> License {
+        let entitlements: Vec<_> = expiries
+            .iter()
+            .enumerate()
+            .map(|(index, expiry)| {
+                serde_json::json!({ "key": format!("feature-{index}"), "expires_at": expiry.to_rfc3339() })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "license_key": "KEY",
+            "device_id": "device",
+            "activation_id": "act_1",
+            "activated_at": "2026-01-01T00:00:00Z",
+            "last_validated": "2026-01-01T00:00:00Z",
+            "validation": {
+                "object": "validation_result",
+                "valid": true,
+                "license": {
+                    "object": "license",
+                    "key": "KEY",
+                    "status": "active",
+                    "mode": "hardware_locked",
+                    "plan_key": "pro",
+                    "active_seats": 1,
+                    "active_entitlements": entitlements,
+                    "product": { "slug": "test-product", "name": "Test" }
+                },
+                "offline": false
+            }
+        }))
+        .expect("test license fixture")
+    }
+
+    fn license_without_expiring_entitlements() -> License {
+        license_with_entitlements(&[])
+    }
+
+    /// Sol r2 finding 1: re-installing runtime state from a signed offline
+    /// artifact used to anchor a fresh clock at the wall clock, discarding the
+    /// time this process had already observed. A rolled-back wall clock (here:
+    /// the process has observed a time one hour ahead of the wall) could then
+    /// revive an artifact whose deadline had already passed in process time.
+    #[test]
+    fn offline_reinstall_inherits_the_process_clock_floor() {
+        let sdk = sdk();
+        let wall = Utc::now();
+        sdk.reset_runtime_clock_floor(wall + chrono::Duration::hours(1));
+        sdk.set_runtime_license_state_until(
+            license_without_expiring_entitlements(),
+            TrustedLicenseSource::SignedOfflineArtifact,
+            Some((wall + chrono::Duration::minutes(10)).timestamp()),
+        );
+        let validation = sdk
+            .runtime_license_state()
+            .and_then(|state| state.license.validation)
+            .expect("runtime validation");
+        assert!(
+            !validation.valid,
+            "rolled-back clock revived an expired artifact"
+        );
+        assert_eq!(validation.code.as_deref(), Some("offline_artifact_expired"));
+    }
+
+    /// An authenticated online answer re-anchors process time to the wall
+    /// clock, mirroring how it re-anchors the persisted watermark.
+    #[test]
+    fn online_answer_reanchors_the_process_clock() {
+        let sdk = sdk();
+        let wall = Utc::now();
+        sdk.reset_runtime_clock_floor(wall + chrono::Duration::hours(1));
+        sdk.set_runtime_license_state(
+            license_with_entitlements(&[wall + chrono::Duration::minutes(10)]),
+            TrustedLicenseSource::OnlineResponse,
+        );
+        assert!(sdk.has_entitlement("feature-0"));
+    }
+
+    /// The same at the offline-verification boundary: the result handed back
+    /// to the caller of an offline revalidation is judged at process time.
+    #[cfg(feature = "offline")]
+    #[test]
+    fn offline_revalidation_judges_the_artifact_at_process_time() {
+        let sdk = sdk();
+        let license = license_without_expiring_entitlements();
+        sdk.inner
+            .cache
+            .commit_activation(&license, Utc::now().timestamp())
+            .expect("persist activation");
+        let wall = Utc::now();
+        sdk.reset_runtime_clock_floor(wall + chrono::Duration::hours(1));
+        let mut result = license.validation.clone().expect("validation");
+        let operation = sdk
+            .inner
+            .current_license_state_operation
+            .load(Ordering::SeqCst);
+        sdk.finalize_offline_validation(
+            &license.identity(),
+            operation,
+            &mut result,
+            Some((wall + chrono::Duration::minutes(10)).timestamp()),
+        )
+        .expect("finalize");
+        assert!(
+            !result.valid,
+            "offline revalidation revived an expired artifact"
+        );
+        assert_eq!(result.code.as_deref(), Some("offline_artifact_expired"));
+        assert!(!sdk.status().is_active());
+    }
+
+    /// The runtime half of "a signed offline grant expires without a process
+    /// restart", without waiting on the wall clock: the installed state's
+    /// effective time is advanced past the artifact deadline (as elapsed
+    /// monotonic time would), and the next observation must revoke the grant
+    /// and announce it exactly once (#19 review: the integration test cannot
+    /// guarantee it exercises this transition on a stalled machine).
+    #[test]
+    fn signed_offline_grant_expires_in_process() {
+        let sdk = sdk();
+        let mut license = license_with_entitlements(&[]);
+        license.validation.as_mut().unwrap().offline = true;
+        let deadline = Utc::now() + chrono::Duration::minutes(10);
+        sdk.set_runtime_license_state_until(
+            license,
+            TrustedLicenseSource::SignedOfflineArtifact,
+            Some(deadline.timestamp()),
+        );
+        assert!(sdk.status().is_active());
+        let mut events = sdk.subscribe();
+
+        sdk.inner
+            .runtime_license_state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .last_effective = deadline + chrono::Duration::seconds(1);
+
+        assert!(!sdk.status().is_active());
+        let validation = sdk.current_authoritative_validation().expect("validation");
+        assert!(!validation.valid);
+        assert_eq!(validation.code.as_deref(), Some("offline_artifact_expired"));
+        sdk.status();
+        let kinds: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| event.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::OfflineValidationFailed,
+                EventKind::ValidationOfflineFailed
+            ]
+        );
+    }
+
+    /// Concurrent observers claim transitions under the state lock; the
+    /// announcements must reach subscribers in the same order. Each event
+    /// carries the entitlements still active, so across one license's
+    /// lifetime the announced count can only shrink.
+    #[test]
+    fn concurrent_observers_announce_transitions_in_claim_order() {
+        let sdk = sdk();
+        let mut reordered = Vec::new();
+        for iteration in 0..1_500 {
+            let base = Utc::now() + chrono::Duration::milliseconds(2);
+            let expiries: Vec<_> = (0..4)
+                .map(|step| base + chrono::Duration::microseconds(150 * step))
+                .collect();
+            let end = *expiries.last().unwrap() + chrono::Duration::milliseconds(1);
+            let mut events = sdk.subscribe();
+            sdk.set_runtime_license_state(
+                license_with_entitlements(&expiries),
+                TrustedLicenseSource::OnlineResponse,
+            );
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| {
+                        while Utc::now() < end {
+                            let _ = sdk.runtime_license_state();
+                        }
+                        let _ = sdk.runtime_license_state();
+                    });
+                }
+            });
+            let mut announced = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if event.kind == EventKind::LicenseStateChanged {
+                    let Some(EventData::Validation(validation)) = event.data else {
+                        panic!("state change without validation");
+                    };
+                    announced.push(validation.license.active_entitlements.len());
+                }
+            }
+            if announced.windows(2).any(|pair| pair[1] > pair[0]) {
+                reordered.push((iteration, announced));
+            }
+        }
+        assert!(
+            reordered.is_empty(),
+            "transitions announced out of order: {reordered:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod runtime_clock_tests {
-    use super::effective_runtime_timestamp;
+    use super::effective_runtime_time;
+    use chrono::{DateTime, TimeZone, Utc};
+    use std::time::Duration;
+
+    fn at(seconds: i64, millis: u32) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, millis * 1_000_000).unwrap()
+    }
 
     #[test]
     fn runtime_authorization_clock_never_moves_backwards() {
-        assert_eq!(effective_runtime_timestamp(900, 1_000, 20, 1_000), 1_020);
-        assert_eq!(effective_runtime_timestamp(1_100, 1_000, 20, 1_000), 1_100);
-        assert_eq!(effective_runtime_timestamp(900, 1_000, -20, 1_000), 1_000);
+        let secs = Duration::from_secs;
+        assert_eq!(
+            effective_runtime_time(at(900, 0), at(1_000, 0), secs(20), at(1_000, 0)),
+            at(1_020, 0)
+        );
+        assert_eq!(
+            effective_runtime_time(at(1_100, 0), at(1_000, 0), secs(20), at(1_000, 0)),
+            at(1_100, 0)
+        );
+        assert_eq!(
+            effective_runtime_time(at(900, 0), at(1_000, 0), Duration::ZERO, at(1_000, 0)),
+            at(1_000, 0)
+        );
 
         // A previously observed forward wall-clock jump remains authoritative
         // after the wall clock is moved backwards again.
-        assert_eq!(effective_runtime_timestamp(950, 1_000, 21, 1_100), 1_100);
+        assert_eq!(
+            effective_runtime_time(at(950, 0), at(1_000, 0), secs(21), at(1_100, 0)),
+            at(1_100, 0)
+        );
+    }
+
+    /// A rollback must not move effective time back to the start of the
+    /// current second: an entitlement expiring at x.700 and observed expired at
+    /// x.800 would otherwise read as active again until x+1.
+    #[test]
+    fn runtime_clock_floors_keep_sub_second_precision() {
+        let observed = at(1_002, 800);
+        assert_eq!(
+            effective_runtime_time(at(990, 0), at(1_000, 0), Duration::ZERO, observed),
+            observed
+        );
+        assert_eq!(
+            effective_runtime_time(
+                at(990, 0),
+                at(1_000, 100),
+                Duration::from_millis(2_750),
+                at(1_000, 100)
+            ),
+            at(1_002, 850)
+        );
+        assert_eq!(
+            effective_runtime_time(at(1_000, 0), at(1_000, 0), Duration::MAX, at(1_000, 0)),
+            DateTime::<Utc>::MAX_UTC
+        );
     }
 }

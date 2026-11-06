@@ -31,6 +31,103 @@
   reach a verdict" from every failure that inspected an artifact and
   rejected it.
 
+## [0.6.4] - 2026-11-06
+
+### Fixed
+
+- **Authoritative denials never fall back to the offline grant.** A
+  validation answered with `version_not_entitled`, `not_entitled`,
+  `product_mismatch`, `floating_not_implemented` or
+  `named_user_not_implemented` (codes compared case-insensitively), whether
+  thrown or returned as `200 valid:false`, is now the current decision in
+  both `OfflineFallbackMode`s:
+  - 501 `floating_not_implemented` / `named_user_not_implemented` were
+    classified as network errors (5xx) and answered by the cached signed
+    grant, in both modes.
+  - A thrown 403 `not_entitled` / `version_not_entitled` changed nothing:
+    the SDK stayed entitled, and a later outage or relaunch kept the grant.
+  - The denial is now persisted as a `valid:false` validation and the
+    runtime state becomes a fail-closed denial, so a later outage or an
+    offline relaunch answers with the denial, not the grant.
+  - The signed grant is **kept** (it was purged for `valid:false` denials and
+    422 `product_mismatch`, which also removed the activation); the next
+    online `valid:true` restores entitlement. Revocation/suspension still
+    purge.
+  - 401/403/429/5xx without one of these codes keep their existing fallback.
+  - Authoritative denials are never retried (a retried 501 could otherwise be
+    replaced by a later codeless 503 that falls back to the grant).
+  - Denials returned by heartbeat, machine-file checkout, legacy offline-token
+    issuance and re-activation of the current activation are recorded the same
+    way; offline sync no longer requests a legacy token after a machine-file
+    denial.
+  - A denial that cannot be written to disk still holds for the running
+    process, and the signed grant is retired where possible.
+  - The cache refuses to overwrite a recorded denial with an offline grant
+    (checked inside the cache write lock, across SDK instances).
+  - Behaviour change: a 422 `product_mismatch` no longer deletes the
+    activation or emits `license:revoked`.
+  - Known gaps that need concurrent SDK instances, a temporarily immutable
+    cache directory, or a ~50 s clock rollback are tracked in #21.
+- Entitlement-expiry `license:state-changed` events are now emitted by the
+  first observation at or after the entitlement's real expiry. The SDK
+  detects entitlement transitions when its license state is observed
+  (`check_entitlement`, `has_entitlement`, `status`, snapshots, ...); the
+  transition deadline was truncated to whole seconds while observations
+  compare the full-precision `expires_at`, so an observation in the last
+  partial second before expiry announced a state change that still listed
+  the entitlement as active, cleared the deadline, and then announced nothing
+  when the entitlement really lapsed. Subscribers could keep showing an
+  expired entitlement until some unrelated state change. (#9)
+- One observation now uses one instant: the transition check and the answer
+  returned to the caller share the same `now`. Previously the caller
+  re-sampled the clock, so an observation straddling the expiry could return
+  "expired" while leaving the notification pending.
+- The in-process anti-rollback clock (monotonic floor and high-water mark)
+  keeps sub-second precision. Truncating it let a wall-clock rollback move
+  effective time back to the start of the current second, so an entitlement
+  already observed (and announced) as expired could read as active again for
+  up to a second, then lapse with no event.
+- The anti-rollback clock now holds across runtime-state replacements in
+  one process. Re-installing state from a signed offline artifact (for
+  example an offline revalidation during an outage) used to anchor a fresh
+  clock at the wall clock, so after a wall-clock rollback an artifact whose
+  deadline had already passed in process time verified again. Offline and
+  denial installs now inherit the process-wide floor, and offline
+  revalidation judges the artifact's deadline at that time; an
+  authenticated online answer still re-anchors to the wall clock, as it
+  re-anchors the persisted watermark.
+- State-change announcements reach subscribers in the order they were
+  claimed. Concurrent observers released the state lock before publishing,
+  so a later "nothing left" announcement could overtake an earlier one
+  that still listed an entitlement, leaving subscribers on stale state.
+- `restore_license` on an already-established state answers from one
+  observation; it returned the raw validation (still listing a lapsed
+  entitlement) beside a status computed at another instant.
+
+### Tests
+
+- `entitlement_expiry_notifies_subscribers_and_revokes_access_in_process` no
+  longer depends on scheduling: it subscribes before activating, stamps the
+  expiry when the mock server responds, waits on the wall clock instead of a
+  fixed sleep, and asserts emitted events synchronously. (#9)
+- Three more tests asserted inside fixed wall-clock budgets that durable
+  cache commits (`File::sync_all` is `F_FULLFSYNC` on macOS) overran under
+  parallel load: `revoked_auto_validation_does_not_send_a_followup_heartbeat`
+  now waits for `license:revoked`;
+  `test_support_tasks_do_not_duplicate_after_restart` checks request
+  spacing instead of counting inside 40 ms windows; and
+  `signed_offline_runtime_grant_expires_without_process_restart` stamps its
+  5 s machine-file window when the file is first served. (#12)
+- Review follow-ups for those tests (#12): the duplicate-loop test now
+  bounds the number of short request gaps after the restart instead of
+  skipping its check when activation is slow; the revocation test uses the
+  event stream closing after the SDK is dropped as a barrier for the whole
+  auto-validation cycle; the offline-expiry test accepts a successful
+  checkout whenever it returns and only accepts a refusal once the window
+  has provably closed; and the in-process expiry of a signed offline grant
+  is now also covered deterministically by
+  `runtime_state_tests::signed_offline_grant_expires_in_process`.
+
 ## [0.6.3] - 2026-08-19
 
 ### Added

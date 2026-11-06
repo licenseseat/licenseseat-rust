@@ -1266,11 +1266,194 @@ fn assert_coherent_snapshot(sdk: &LicenseSeat) {
     }
 }
 
+/// Wait until the wall clock (which the SDK reads for entitlement expiry)
+/// has reached `instant`. This is a condition wait, not a timing guess: it
+/// returns as soon as the condition holds, however loaded the machine is.
+async fn wait_for_wall_clock(instant: chrono::DateTime<Utc>) {
+    loop {
+        let remaining = instant - Utc::now();
+        if remaining <= chrono::Duration::zero() {
+            return;
+        }
+        tokio::time::sleep(remaining.to_std().unwrap_or(Duration::from_millis(1))).await;
+    }
+}
+
+fn drain_state_changes(
+    events: &mut tokio::sync::broadcast::Receiver<licenseseat::Event>,
+) -> Vec<licenseseat::Event> {
+    let mut changes = Vec::new();
+    loop {
+        match events.try_recv() {
+            Ok(event) if event.kind == licenseseat::EventKind::LicenseStateChanged => {
+                changes.push(event)
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return changes,
+            Err(error) => panic!("event stream broke: {error:?}"),
+        }
+    }
+}
+
+/// licenseseat-rust#9. Entitlement expiries carry sub-second precision; the
+/// state-change deadline used to be truncated to whole seconds, so a read in
+/// `[floor(expiry), expiry)` emitted the change early (entitlement still
+/// listed) and nothing was emitted at the real expiry. Under load that read
+/// was usually the test's own pre-subscribe `has_entitlement`, and the test
+/// timed out waiting for an event that had already gone to no subscriber.
+///
+/// The test no longer depends on scheduling: it subscribes before
+/// activation, stamps the expiry when the server responds, waits on the wall
+/// clock rather than a fixed sleep, and asserts the emitted events
+/// synchronously (emission happens inside the observing call).
 #[tokio::test]
 async fn entitlement_expiry_notifies_subscribers_and_revokes_access_in_process() {
+    struct ExpiringEntitlementActivation {
+        license_key: &'static str,
+        expiry: std::sync::Arc<std::sync::Mutex<Option<chrono::DateTime<Utc>>>>,
+    }
+
+    impl wiremock::Respond for ExpiringEntitlementActivation {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            // A deliberate sub-second component puts the old truncated
+            // deadline a full 500ms ahead of the real expiry.
+            let next_second = Utc::now().timestamp() + 1;
+            let expiry = chrono::DateTime::from_timestamp(next_second + 2, 500_000_000).unwrap();
+            *self.expiry.lock().unwrap() = Some(expiry);
+            let mut license = license_json(
+                self.license_key,
+                "active",
+                "pro",
+                "hardware_locked",
+                &[],
+                "Test App",
+            );
+            license["active_entitlements"] = json!([{
+                "key": "short-lived-feature",
+                "expires_at": expiry.to_rfc3339(),
+                "metadata": null
+            }]);
+            ResponseTemplate::new(201).set_body_json(activation_response_with_license(
+                self.license_key,
+                "device-123",
+                license,
+            ))
+        }
+    }
+
     let server = MockServer::start().await;
     let license_key = "EXPIRING-ENTITLEMENT-LICENSE";
-    let entitlement_expiry = Utc::now() + chrono::Duration::seconds(2);
+    let stamped_expiry = std::sync::Arc::new(std::sync::Mutex::new(None));
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(ExpiringEntitlementActivation {
+            license_key,
+            expiry: stamped_expiry.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    // No background observers: only this test's own calls observe state.
+    config.network_recheck_interval = Duration::ZERO;
+    config.offline_token_refresh_interval = Duration::ZERO;
+    let sdk = LicenseSeat::try_new(config).unwrap();
+    let mut events = sdk.subscribe();
+    let activated = sdk.activate(license_key).await.unwrap();
+    // The SDK installs its runtime state (and the entitlement deadline)
+    // before `activate` returns, so if we are still before the expiry here,
+    // the entitlement was live when installed and its expiry must be
+    // announced exactly once. Only if the machine stalled past the expiry
+    // during activation is "already expired on arrival, never announced"
+    // also correct.
+    let activation_returned_at = Utc::now();
+    let expiry = stamped_expiry
+        .lock()
+        .unwrap()
+        .expect("activation responded");
+    let installed_before_expiry_is_certain = activation_returned_at < expiry;
+    let activated_entitlements = &activated
+        .validation
+        .as_ref()
+        .expect("activation validation")
+        .license
+        .active_entitlements;
+    assert_eq!(activated_entitlements.len(), 1);
+    assert_eq!(activated_entitlements[0].expires_at, Some(expiry));
+
+    // Observe inside the last (partial) second before expiry. Whenever this
+    // observation lands before the real expiry, the entitlement must still be
+    // active and no state change may have been announced.
+    let truncated_deadline = chrono::DateTime::from_timestamp(expiry.timestamp(), 0).unwrap();
+    wait_for_wall_clock(truncated_deadline).await;
+    let observed = sdk.check_entitlement("short-lived-feature");
+    let early_changes = drain_state_changes(&mut events);
+    // Sampled after the drain: if even the drain finished before the expiry,
+    // no observer (ours or a background task) can legitimately have announced
+    // it yet, so any drained state change is the early-announcement bug.
+    let drained_before_expiry = Utc::now() < expiry;
+    if drained_before_expiry {
+        assert!(observed.active, "entitlement is active until its expiry");
+        assert!(
+            early_changes.is_empty(),
+            "no state change before the entitlement lapses: {early_changes:?}"
+        );
+    }
+
+    wait_for_wall_clock(expiry).await;
+    let entitlement = sdk.check_entitlement("short-lived-feature");
+    assert!(!entitlement.active);
+    assert_eq!(entitlement.reason, Some(EntitlementReason::Expired));
+    assert!(sdk.active_entitlements().is_empty());
+    assert!(matches!(sdk.status(), LicenseStatus::Active { .. }));
+
+    let changes: Vec<_> = early_changes
+        .into_iter()
+        .chain(drain_state_changes(&mut events))
+        .collect();
+    if installed_before_expiry_is_certain {
+        assert_eq!(
+            changes.len(),
+            1,
+            "exactly one state change for one expiry: {changes:?}"
+        );
+    } else {
+        assert!(changes.len() <= 1, "at most one state change: {changes:?}");
+    }
+    for change in changes {
+        let licenseseat::EventData::Validation(event_validation) =
+            change.data.expect("state change validation payload")
+        else {
+            panic!("state change should carry the current validation");
+        };
+        assert!(
+            event_validation.license.active_entitlements.is_empty(),
+            "the state change must announce the lapsed entitlement as gone"
+        );
+    }
+    assert!(
+        sdk.current_authoritative_validation()
+            .expect("authoritative validation")
+            .license
+            .active_entitlements
+            .is_empty(),
+        "every public authoritative snapshot must prune expired entitlements"
+    );
+
+    // Further observations must not re-announce the same expiry.
+    sdk.check_entitlement("short-lived-feature");
+    sdk.status();
+    assert!(drain_state_changes(&mut events).is_empty());
+}
+
+/// `restore_license` on an already-established state answers from one
+/// observation: after an entitlement lapses, the returned validation must not
+/// still list it beside a status that excludes it (#16 review, round 2).
+#[tokio::test]
+async fn restore_on_an_established_state_answers_from_one_observation() {
+    let server = MockServer::start().await;
+    let license_key = "RESTORE-OBSERVATION-LICENSE";
+    let expiry = Utc::now() + chrono::Duration::milliseconds(1_500);
     let mut license = license_json(
         license_key,
         "active",
@@ -1281,10 +1464,9 @@ async fn entitlement_expiry_notifies_subscribers_and_revokes_access_in_process()
     );
     license["active_entitlements"] = json!([{
         "key": "short-lived-feature",
-        "expires_at": entitlement_expiry.to_rfc3339(),
+        "expires_at": expiry.to_rfc3339(),
         "metadata": null
     }]);
-
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
         .respond_with(
@@ -1297,53 +1479,25 @@ async fn entitlement_expiry_notifies_subscribers_and_revokes_access_in_process()
         .mount(&server)
         .await;
 
-    let sdk = LicenseSeat::try_new(test_config(&server.uri())).unwrap();
+    let mut config = test_config(&server.uri());
+    config.network_recheck_interval = Duration::ZERO;
+    config.offline_token_refresh_interval = Duration::ZERO;
+    let sdk = LicenseSeat::try_new(config).unwrap();
     sdk.activate(license_key).await.unwrap();
-    assert!(sdk.has_entitlement("short-lived-feature"));
-    let mut events = sdk.subscribe();
+    wait_for_wall_clock(expiry).await;
 
-    let wait_seconds = entitlement_expiry
-        .timestamp()
-        .saturating_sub(Utc::now().timestamp())
-        .saturating_add(1)
-        .max(1) as u64;
-    tokio::time::sleep(Duration::from_secs(wait_seconds)).await;
-
-    let entitlement = sdk.check_entitlement("short-lived-feature");
-    assert!(!entitlement.active);
-    assert_eq!(entitlement.reason, Some(EntitlementReason::Expired));
-    assert!(sdk.active_entitlements().is_empty());
-    assert!(matches!(sdk.status(), LicenseStatus::Active { .. }));
-
-    let transition = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let event = events.recv().await.unwrap();
-            if event.kind == licenseseat::EventKind::LicenseStateChanged {
-                break event;
-            }
-        }
-    })
-    .await
-    .expect("entitlement expiry state-change event");
-    let licenseseat::EventData::Validation(event_validation) =
-        transition.data.expect("state change validation payload")
-    else {
-        panic!("state change should carry the current validation");
+    let restore = sdk.restore_license().await;
+    assert!(restore.restored, "the license itself is still active");
+    let LicenseStatus::Active { details } = &restore.status else {
+        panic!("unexpected status {:?}", restore.status);
     };
-    assert!(event_validation.license.active_entitlements.is_empty());
+    assert!(details.entitlements.is_empty());
+    let validation = restore.validation.expect("established validation");
+    assert!(validation.valid);
     assert!(
-        sdk.current_authoritative_validation()
-            .expect("authoritative validation")
-            .license
-            .active_entitlements
-            .is_empty(),
-        "every public authoritative snapshot must prune expired entitlements"
+        validation.license.active_entitlements.is_empty(),
+        "restore returned a validation that still lists a lapsed entitlement"
     );
-    sdk.check_entitlement("short-lived-feature");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    while let Ok(event) = events.try_recv() {
-        assert_ne!(event.kind, licenseseat::EventKind::LicenseStateChanged);
-    }
 }
 
 // ============================================================================
@@ -1483,6 +1637,41 @@ async fn test_offline_restore_does_not_reuse_unsigned_heartbeat_metadata() {
     assert!(!snapshot_path.exists());
 }
 
+/// Serves one machine file whose short validity window starts when the first
+/// machine-file request arrives, not when the test started. Under parallel
+/// load activation alone (durable cache commits use F_FULLFSYNC on macOS) can
+/// take seconds, which used to consume a window stamped up front
+/// (licenseseat-rust#12).
+#[cfg(feature = "offline")]
+struct MachineFileStampedOnFirstRequest {
+    license_key: &'static str,
+    fingerprint: &'static str,
+    embedded_license: serde_json::Value,
+    ttl: i64,
+    issued: std::sync::Arc<std::sync::Mutex<Option<(serde_json::Value, i64)>>>,
+}
+
+#[cfg(feature = "offline")]
+impl wiremock::Respond for MachineFileStampedOnFirstRequest {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        let mut issued = self.issued.lock().unwrap();
+        let (response, _) = issued.get_or_insert_with(|| {
+            let issued_at = Utc::now() - chrono::Duration::seconds(1);
+            let (response, _) = build_machine_file_fixture_with_timing(
+                self.license_key,
+                self.fingerprint,
+                Some(self.embedded_license.clone()),
+                issued_at,
+                self.ttl,
+                0,
+                None,
+            );
+            (response, issued_at.timestamp() + self.ttl)
+        });
+        ResponseTemplate::new(201).set_body_json(response.clone())
+    }
+}
+
 #[cfg(feature = "offline")]
 #[tokio::test]
 async fn signed_offline_runtime_grant_expires_without_process_restart() {
@@ -1497,18 +1686,17 @@ async fn signed_offline_runtime_grant_expires_without_process_restart() {
         &["pro-features"],
         "Test Product",
     );
-    let issued_at = Utc::now() - chrono::Duration::seconds(1);
-    let ttl = 6;
-    let authorization_deadline = issued_at.timestamp() + ttl;
-    let (machine_file_response, public_key_b64) = build_machine_file_fixture_with_timing(
+    // Only for the (fixed) public key; the served file is stamped later.
+    let (_, public_key_b64) = build_machine_file_fixture_with_timing(
         license_key,
         fingerprint,
-        Some(embedded_license.clone()),
-        issued_at,
-        ttl,
+        None,
+        Utc::now(),
+        6,
         0,
         None,
     );
+    let issued = std::sync::Arc::new(std::sync::Mutex::new(None));
 
     Mock::given(method("POST"))
         .and(path_regex(r"/products/.*/licenses/activate"))
@@ -1516,14 +1704,20 @@ async fn signed_offline_runtime_grant_expires_without_process_restart() {
             ResponseTemplate::new(201).set_body_json(activation_response_with_license(
                 license_key,
                 fingerprint,
-                embedded_license,
+                embedded_license.clone(),
             )),
         )
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/products/test-product/licenses/machine-file"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
+        .respond_with(MachineFileStampedOnFirstRequest {
+            license_key,
+            fingerprint,
+            embedded_license,
+            ttl: 6,
+            issued: issued.clone(),
+        })
         .mount(&server)
         .await;
 
@@ -1534,10 +1728,29 @@ async fn signed_offline_runtime_grant_expires_without_process_restart() {
 
     let online_sdk = LicenseSeat::try_new(online_config.clone()).unwrap();
     online_sdk.activate(license_key).await.unwrap();
-    online_sdk
+    let checkout = online_sdk
         .checkout_machine_file(license_key, Some(fingerprint), Some(30))
-        .await
-        .unwrap();
+        .await;
+    let authorization_deadline = issued
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("machine file served")
+        .1;
+    if let Err(error) = checkout {
+        // Checkout verifies the file before persisting it, so its return time
+        // says nothing about when verification ran; a successful checkout is
+        // accepted whenever it returns. A refusal is only correct once the
+        // window has closed, which this check proves after the fact. A stall
+        // that long leaves nothing below to exercise; the in-process
+        // transition itself is covered deterministically by
+        // `client::runtime_state_tests::signed_offline_grant_expires_in_process`.
+        assert!(
+            Utc::now().timestamp() >= authorization_deadline,
+            "checkout refused a machine file inside its validity window: {error}"
+        );
+        return;
+    }
     drop(online_sdk);
 
     let mut offline_config = online_config;
@@ -1545,21 +1758,35 @@ async fn signed_offline_runtime_grant_expires_without_process_restart() {
     offline_config.max_retries = 0;
     offline_config.retry_delay = Duration::ZERO;
     let offline_sdk = LicenseSeat::try_new(offline_config).unwrap();
-    let restored = offline_sdk.restore_license().await;
-    assert!(restored.restored);
-    assert!(matches!(
-        restored.status,
-        LicenseStatus::OfflineValid { .. }
-    ));
-    assert!(offline_sdk.has_entitlement("pro-features"));
     let mut expiry_events = offline_sdk.subscribe();
+    let restored = offline_sdk.restore_license().await;
+    let entitled_after_restore = offline_sdk.has_entitlement("pro-features");
+    // Each comparison below is only claimed for instants the test can prove
+    // were before the (whole-second) authorization deadline. If the machine
+    // stalled past it, only the expired side is asserted; the in-process
+    // transition is covered deterministically by
+    // `client::runtime_state_tests::signed_offline_grant_expires_in_process`.
+    let observed_before_deadline = Utc::now().timestamp() < authorization_deadline;
+    if observed_before_deadline {
+        assert!(restored.restored);
+        assert!(matches!(
+            restored.status,
+            LicenseStatus::OfflineValid { .. }
+        ));
+        assert!(entitled_after_restore);
+    }
 
-    let seconds_until_expired = authorization_deadline
-        .saturating_sub(Utc::now().timestamp())
-        .saturating_add(1)
-        .max(1) as u64;
-    tokio::time::sleep(Duration::from_secs(seconds_until_expired)).await;
+    wait_for_wall_clock(
+        chrono::DateTime::from_timestamp(authorization_deadline, 0).expect("deadline"),
+    )
+    .await;
 
+    assert!(!offline_sdk.has_entitlement("pro-features"));
+    assert!(offline_sdk.active_entitlements().is_empty());
+    assert!(!offline_sdk.get_status().valid);
+    if !observed_before_deadline {
+        return;
+    }
     assert!(offline_sdk.is_license_state_trusted());
     assert!(matches!(
         offline_sdk.status(),
@@ -1570,24 +1797,30 @@ async fn signed_offline_runtime_grant_expires_without_process_restart() {
         ClientStatus::OfflineInvalid
     );
     let validation = offline_sdk.get_status();
-    assert!(!validation.valid);
     assert!(validation.offline);
     assert_eq!(validation.code.as_deref(), Some("offline_artifact_expired"));
-    assert!(!offline_sdk.has_entitlement("pro-features"));
-    assert!(offline_sdk.active_entitlements().is_empty());
     assert_eq!(
         offline_sdk.current_trusted_license_source(),
         Some(licenseseat::TrustedLicenseSource::SignedOfflineArtifact)
     );
+    let failures: Vec<_> = std::iter::from_fn(|| expiry_events.try_recv().ok())
+        .map(|event| event.kind)
+        .filter(|kind| {
+            matches!(
+                kind,
+                licenseseat::EventKind::OfflineValidationFailed
+                    | licenseseat::EventKind::ValidationOfflineFailed
+            )
+        })
+        .collect();
     assert_eq!(
-        expiry_events.recv().await.unwrap().kind,
-        licenseseat::EventKind::OfflineValidationFailed
+        failures,
+        vec![
+            licenseseat::EventKind::OfflineValidationFailed,
+            licenseseat::EventKind::ValidationOfflineFailed,
+        ],
+        "one terminal expiry announcement"
     );
-    assert_eq!(
-        expiry_events.recv().await.unwrap().kind,
-        licenseseat::EventKind::ValidationOfflineFailed
-    );
-    assert!(expiry_events.try_recv().is_err());
 }
 
 #[cfg(feature = "offline")]
@@ -3083,6 +3316,473 @@ async fn test_duplicate_keys_in_nested_api_metadata_are_rejected() {
     ));
     assert!(sdk.current_license().is_none());
 }
+
+// ============================================================================
+// Authoritative denials never fall back to the offline grant
+// ============================================================================
+
+/// The cross-SDK contract (licenseseat-swift#26): a denial with one of these
+/// codes, thrown or returned as `200 valid:false`, is the current decision.
+/// It must never be answered by the cached offline grant, in either fallback
+/// mode, now or after a later outage or relaunch. The grant itself is kept
+/// (a later online `valid:true` restores it); only revocation purges.
+#[cfg(feature = "offline")]
+const AUTHORITATIVE_DENIALS: [(u16, &str); 5] = [
+    (403, "version_not_entitled"),
+    (403, "not_entitled"),
+    (422, "product_mismatch"),
+    (501, "floating_not_implemented"),
+    (501, "named_user_not_implemented"),
+];
+
+/// Activate and check out a long-lived signed machine file, so the offline
+/// grant is present and valid; returns the online SDK and its config.
+#[cfg(feature = "offline")]
+async fn sdk_with_valid_offline_grant(
+    server: &MockServer,
+    mode: OfflineFallbackMode,
+) -> (LicenseSeat, Config) {
+    sdk_with_valid_offline_grant_configured(server, mode, |_| {}).await
+}
+
+#[cfg(feature = "offline")]
+async fn sdk_with_valid_offline_grant_configured(
+    server: &MockServer,
+    mode: OfflineFallbackMode,
+    customize: impl FnOnce(&mut Config),
+) -> (LicenseSeat, Config) {
+    let license_key = "DENIAL-LICENSE";
+    let fingerprint = "denial-installation";
+    let embedded_license = license_json(
+        license_key,
+        "active",
+        "pro",
+        "hardware_locked",
+        &["pro-features"],
+        "Test Product",
+    );
+    let (machine_file_response, public_key_b64) = build_machine_file_fixture_with_timing(
+        license_key,
+        fingerprint,
+        Some(embedded_license.clone()),
+        Utc::now() - chrono::Duration::minutes(1),
+        86_400,
+        0,
+        None,
+    );
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response_with_license(
+                license_key,
+                fingerprint,
+                embedded_license,
+            )),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/licenses/machine-file"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(machine_file_response))
+        .mount(server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    config.device_identifier = Some(fingerprint.into());
+    config.signing_public_key = Some(public_key_b64);
+    config.signing_key_id = Some("key-2026".into());
+    config.offline_fallback_mode = mode;
+    config.max_retries = 0;
+    config.retry_delay = Duration::ZERO;
+    customize(&mut config);
+
+    let sdk = LicenseSeat::try_new(config.clone()).unwrap();
+    sdk.activate(license_key).await.unwrap();
+    sdk.checkout_machine_file(license_key, Some(fingerprint), Some(30))
+        .await
+        .unwrap();
+    assert!(sdk.has_entitlement("pro-features"));
+    (sdk, config)
+}
+
+/// After a denial: the SDK is not entitled, the grant is still on disk, a
+/// later outage (5xx without a denial code, which normally falls back in
+/// both modes) answers with the denial, and a relaunch while offline does not
+/// restore the license.
+#[cfg(feature = "offline")]
+async fn assert_denial_is_the_current_decision(
+    server: &MockServer,
+    sdk: &LicenseSeat,
+    config: &Config,
+    label: &str,
+) {
+    assert!(
+        !sdk.has_entitlement("pro-features"),
+        "{label}: entitled after denial"
+    );
+    assert!(!sdk.status().is_active(), "{label}: active after denial");
+    assert!(
+        cache_path_for(&config.storage_prefix, "machine_file").exists(),
+        "{label}: an authoritative denial must not purge the offline grant"
+    );
+
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(server)
+        .await;
+    if let Ok(validation) = sdk.validate().await {
+        assert!(
+            !validation.valid,
+            "{label}: outage revived the offline grant"
+        );
+    }
+    assert!(
+        !sdk.has_entitlement("pro-features"),
+        "{label}: entitled after outage"
+    );
+
+    let mut offline_config = config.clone();
+    offline_config.api_base_url = "http://127.0.0.1:9".into();
+    let relaunched = LicenseSeat::try_new(offline_config).unwrap();
+    let restore = relaunched.restore_license().await;
+    assert!(
+        !restore.restored,
+        "{label}: relaunch revived the offline grant"
+    );
+    assert!(
+        !relaunched.has_entitlement("pro-features"),
+        "{label}: entitled after relaunch"
+    );
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn thrown_authoritative_denials_never_fall_back_to_the_offline_grant() {
+    for mode in [
+        OfflineFallbackMode::NetworkOnly,
+        OfflineFallbackMode::Always,
+    ] {
+        for (status, code) in AUTHORITATIVE_DENIALS {
+            // Mixed case: the contract compares codes case-insensitively.
+            let wire_code = if status == 501 {
+                code.to_ascii_uppercase()
+            } else {
+                code.to_string()
+            };
+            let label = format!("{mode:?} {status} {wire_code}");
+            let server = MockServer::start().await;
+            let (sdk, config) = sdk_with_valid_offline_grant(&server, mode).await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/products/.*/licenses/validate"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(api_error_response(&wire_code, "denied")),
+                )
+                .mount(&server)
+                .await;
+
+            match sdk.validate().await {
+                Err(error) => assert_eq!(
+                    error.code().map(str::to_ascii_lowercase).as_deref(),
+                    Some(code),
+                    "{label}"
+                ),
+                Ok(validation) => panic!("{label}: fell back to {validation:?}"),
+            }
+            assert_denial_is_the_current_decision(&server, &sdk, &config, &label).await;
+        }
+    }
+}
+
+/// Codex #20 finding 1: a retried request must not replace an authoritative
+/// denial with a later codeless 5xx that would fall back to the grant.
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn retries_never_discard_an_authoritative_denial() {
+    let server = MockServer::start().await;
+    let (sdk, config) =
+        sdk_with_valid_offline_grant_configured(&server, OfflineFallbackMode::Always, |config| {
+            config.max_retries = 2;
+            config.retry_delay = Duration::from_millis(1);
+        })
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(
+            ResponseTemplate::new(501)
+                .set_body_json(api_error_response("floating_not_implemented", "denied")),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    match sdk.validate().await {
+        Err(error) => assert_eq!(error.code(), Some("floating_not_implemented")),
+        Ok(validation) => panic!("retry masked the denial: {validation:?}"),
+    }
+    assert_denial_is_the_current_decision(&server, &sdk, &config, "retried 501").await;
+}
+
+/// Codex #20 finding 2: a denial from machine-file checkout, legacy offline
+/// token issuance or re-activation of the current activation is recorded too.
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn lifecycle_authoritative_denials_are_recorded() {
+    for (endpoint, status, code) in [
+        ("machine-file", 403_u16, "not_entitled"),
+        ("offline-token", 403, "version_not_entitled"),
+        ("activate", 403, "not_entitled"),
+        ("machine-file", 501, "NAMED_USER_NOT_IMPLEMENTED"),
+    ] {
+        let label = format!("{endpoint} {status} {code}");
+        let server = MockServer::start().await;
+        let (sdk, config) = sdk_with_valid_offline_grant_configured(
+            &server,
+            OfflineFallbackMode::Always,
+            |config| config.enable_legacy_offline_tokens = true,
+        )
+        .await;
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path_regex(format!(r"/products/.*/licenses/{endpoint}$")))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(api_error_response(code, "denied")),
+            )
+            .mount(&server)
+            .await;
+        let license = sdk.current_license().expect("current license");
+        let outcome = match endpoint {
+            "machine-file" => sdk
+                .checkout_machine_file(&license.license_key, Some(&license.device_id), Some(30))
+                .await
+                .map(|_| ()),
+            "offline-token" => sdk
+                .generate_offline_token(&license.license_key, Some(&license.device_id), Some(30))
+                .await
+                .map(|_| ()),
+            _ => sdk.activate(&license.license_key).await.map(|_| ()),
+        };
+        assert!(outcome.is_err(), "{label}: request succeeded");
+        assert_denial_is_the_current_decision(&server, &sdk, &config, &label).await;
+    }
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn offline_sync_stops_after_a_machine_file_denial() {
+    let server = MockServer::start().await;
+    let (sdk, _config) =
+        sdk_with_valid_offline_grant_configured(&server, OfflineFallbackMode::Always, |config| {
+            config.enable_legacy_offline_tokens = true
+        })
+        .await;
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/machine-file$"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_json(api_error_response("not_entitled", "denied")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/offline-token$"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    assert!(sdk.sync_offline_assets().await.is_err());
+    server.verify().await;
+}
+
+/// Codex #20 finding 3: if the denial cannot be written, it still holds for
+/// this process and later outages here cannot fall back past it.
+// The SDK re-asserts 0o700 on its cache directory, so a plain chmod cannot
+// make writes fail; the macOS user-immutable flag can.
+#[cfg(all(feature = "offline", target_os = "macos"))]
+#[tokio::test]
+async fn unpersistable_denial_still_holds_in_process() {
+    let set_immutable = |path: &std::path::Path, on: bool| {
+        let status = std::process::Command::new("chflags")
+            .arg(if on { "uchg" } else { "nouchg" })
+            .arg(path)
+            .status()
+            .expect("chflags");
+        assert!(status.success());
+    };
+    for valid_false in [false, true] {
+        let label = if valid_false {
+            "200 valid:false"
+        } else {
+            "403"
+        };
+        let server = MockServer::start().await;
+        // A private cache directory, so making it read-only affects no other test.
+        let storage = tempfile::tempdir().unwrap();
+        let storage_path = storage.path().to_path_buf();
+        let (sdk, _config) = sdk_with_valid_offline_grant_configured(
+            &server,
+            OfflineFallbackMode::Always,
+            |config| config.storage_path = Some(storage_path.clone()),
+        )
+        .await;
+        let response = if valid_false {
+            let mut denied = license_json(
+                "DENIAL-LICENSE",
+                "active",
+                "pro",
+                "hardware_locked",
+                &[],
+                "Test Product",
+            );
+            denied["active_seats"] = json!(1);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "object": "validation_result",
+                "valid": false,
+                "code": "not_entitled",
+                "message": "denied",
+                "license": denied,
+            }))
+        } else {
+            ResponseTemplate::new(403).set_body_json(api_error_response("not_entitled", "denied"))
+        };
+        Mock::given(method("POST"))
+            .and(path_regex(r"/products/.*/licenses/validate"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        set_immutable(&storage_path, true);
+        let denied = sdk.validate().await;
+        let entitled_after_denial = sdk.has_entitlement("pro-features");
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/products/.*/licenses/validate"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let during_outage = sdk.validate().await;
+        let entitled_during_outage = sdk.has_entitlement("pro-features");
+        set_immutable(&storage_path, false);
+
+        assert!(
+            matches!(denied, Err(licenseseat::Error::Cache(_))),
+            "{label}: the denial write was expected to fail, got {denied:?}"
+        );
+        assert!(
+            !entitled_after_denial,
+            "{label}: entitled after an unpersisted denial"
+        );
+        if let Ok(validation) = during_outage {
+            assert!(!validation.valid, "{label}: outage revived the grant");
+        }
+        assert!(
+            !entitled_during_outage,
+            "{label}: entitled during the outage"
+        );
+    }
+}
+
+/// A denial delivered by a heartbeat is the same server decision as one from
+/// validate: it must be recorded so no later outage or relaunch revives the grant.
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn heartbeat_authoritative_denials_are_recorded_like_validation_denials() {
+    for (status, code) in AUTHORITATIVE_DENIALS {
+        let label = format!("heartbeat {status} {code}");
+        let server = MockServer::start().await;
+        let (sdk, config) =
+            sdk_with_valid_offline_grant(&server, OfflineFallbackMode::Always).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/products/.*/licenses/heartbeat"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(api_error_response(code, "denied")),
+            )
+            .mount(&server)
+            .await;
+
+        match sdk.heartbeat().await {
+            Err(error) => assert_eq!(
+                error.code().map(str::to_ascii_lowercase).as_deref(),
+                Some(code),
+                "{label}"
+            ),
+            Ok(response) => panic!("{label}: heartbeat succeeded with {response:?}"),
+        }
+        assert_denial_is_the_current_decision(&server, &sdk, &config, &label).await;
+    }
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn valid_false_authoritative_denials_keep_the_grant_but_never_revive_it() {
+    for (_, code) in AUTHORITATIVE_DENIALS {
+        let label = format!("200 valid:false {code}");
+        let server = MockServer::start().await;
+        let (sdk, config) =
+            sdk_with_valid_offline_grant(&server, OfflineFallbackMode::Always).await;
+        let mut denied = license_json(
+            "DENIAL-LICENSE",
+            "active",
+            "pro",
+            "hardware_locked",
+            &[],
+            "Test Product",
+        );
+        denied["active_seats"] = json!(1);
+        Mock::given(method("POST"))
+            .and(path_regex(r"/products/.*/licenses/validate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "validation_result",
+                "valid": false,
+                "code": code,
+                "message": "denied",
+                "warnings": null,
+                "license": denied,
+                "activation": null
+            })))
+            .mount(&server)
+            .await;
+
+        let validation = sdk.validate().await.expect(&label);
+        assert!(!validation.valid, "{label}");
+        assert_denial_is_the_current_decision(&server, &sdk, &config, &label).await;
+    }
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn codeless_server_failures_still_fall_back_to_the_offline_grant() {
+    for (status, mode) in [
+        (503, OfflineFallbackMode::NetworkOnly),
+        (501, OfflineFallbackMode::NetworkOnly),
+        (429, OfflineFallbackMode::Always),
+    ] {
+        let label = format!("{mode:?} {status}");
+        let server = MockServer::start().await;
+        let (sdk, _config) = sdk_with_valid_offline_grant(&server, mode).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/products/.*/licenses/validate"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        let validation = sdk.validate().await.expect(&label);
+        assert!(
+            validation.valid && validation.offline,
+            "{label}: {validation:?}"
+        );
+        assert!(sdk.has_entitlement("pro-features"), "{label}");
+    }
+}
+
 
 /// A network blip before the first machine-file sync landed used to revoke a
 /// perfectly valid license.
