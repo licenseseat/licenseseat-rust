@@ -3109,6 +3109,15 @@ async fn sdk_with_valid_offline_grant(
     server: &MockServer,
     mode: OfflineFallbackMode,
 ) -> (LicenseSeat, Config) {
+    sdk_with_valid_offline_grant_configured(server, mode, |_| {}).await
+}
+
+#[cfg(feature = "offline")]
+async fn sdk_with_valid_offline_grant_configured(
+    server: &MockServer,
+    mode: OfflineFallbackMode,
+    customize: impl FnOnce(&mut Config),
+) -> (LicenseSeat, Config) {
     let license_key = "DENIAL-LICENSE";
     let fingerprint = "denial-installation";
     let embedded_license = license_json(
@@ -3152,6 +3161,7 @@ async fn sdk_with_valid_offline_grant(
     config.offline_fallback_mode = mode;
     config.max_retries = 0;
     config.retry_delay = Duration::ZERO;
+    customize(&mut config);
 
     let sdk = LicenseSeat::try_new(config.clone()).unwrap();
     sdk.activate(license_key).await.unwrap();
@@ -3250,6 +3260,201 @@ async fn thrown_authoritative_denials_never_fall_back_to_the_offline_grant() {
             }
             assert_denial_is_the_current_decision(&server, &sdk, &config, &label).await;
         }
+    }
+}
+
+/// Codex #20 finding 1: a retried request must not replace an authoritative
+/// denial with a later codeless 5xx that would fall back to the grant.
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn retries_never_discard_an_authoritative_denial() {
+    let server = MockServer::start().await;
+    let (sdk, config) =
+        sdk_with_valid_offline_grant_configured(&server, OfflineFallbackMode::Always, |config| {
+            config.max_retries = 2;
+            config.retry_delay = Duration::from_millis(1);
+        })
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(
+            ResponseTemplate::new(501)
+                .set_body_json(api_error_response("floating_not_implemented", "denied")),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/validate"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    match sdk.validate().await {
+        Err(error) => assert_eq!(error.code(), Some("floating_not_implemented")),
+        Ok(validation) => panic!("retry masked the denial: {validation:?}"),
+    }
+    assert_denial_is_the_current_decision(&server, &sdk, &config, "retried 501").await;
+}
+
+/// Codex #20 finding 2: a denial from machine-file checkout, legacy offline
+/// token issuance or re-activation of the current activation is recorded too.
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn lifecycle_authoritative_denials_are_recorded() {
+    for (endpoint, status, code) in [
+        ("machine-file", 403_u16, "not_entitled"),
+        ("offline-token", 403, "version_not_entitled"),
+        ("activate", 403, "not_entitled"),
+        ("machine-file", 501, "NAMED_USER_NOT_IMPLEMENTED"),
+    ] {
+        let label = format!("{endpoint} {status} {code}");
+        let server = MockServer::start().await;
+        let (sdk, config) = sdk_with_valid_offline_grant_configured(
+            &server,
+            OfflineFallbackMode::Always,
+            |config| config.enable_legacy_offline_tokens = true,
+        )
+        .await;
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path_regex(format!(r"/products/.*/licenses/{endpoint}$")))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(api_error_response(code, "denied")),
+            )
+            .mount(&server)
+            .await;
+        let license = sdk.current_license().expect("current license");
+        let outcome = match endpoint {
+            "machine-file" => sdk
+                .checkout_machine_file(&license.license_key, Some(&license.device_id), Some(30))
+                .await
+                .map(|_| ()),
+            "offline-token" => sdk
+                .generate_offline_token(&license.license_key, Some(&license.device_id), Some(30))
+                .await
+                .map(|_| ()),
+            _ => sdk.activate(&license.license_key).await.map(|_| ()),
+        };
+        assert!(outcome.is_err(), "{label}: request succeeded");
+        assert_denial_is_the_current_decision(&server, &sdk, &config, &label).await;
+    }
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn offline_sync_stops_after_a_machine_file_denial() {
+    let server = MockServer::start().await;
+    let (sdk, _config) =
+        sdk_with_valid_offline_grant_configured(&server, OfflineFallbackMode::Always, |config| {
+            config.enable_legacy_offline_tokens = true
+        })
+        .await;
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/machine-file$"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_json(api_error_response("not_entitled", "denied")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/offline-token$"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    assert!(sdk.sync_offline_assets().await.is_err());
+    server.verify().await;
+}
+
+/// Codex #20 finding 3: if the denial cannot be written, it still holds for
+/// this process and later outages here cannot fall back past it.
+// The SDK re-asserts 0o700 on its cache directory, so a plain chmod cannot
+// make writes fail; the macOS user-immutable flag can.
+#[cfg(all(feature = "offline", target_os = "macos"))]
+#[tokio::test]
+async fn unpersistable_denial_still_holds_in_process() {
+    let set_immutable = |path: &std::path::Path, on: bool| {
+        let status = std::process::Command::new("chflags")
+            .arg(if on { "uchg" } else { "nouchg" })
+            .arg(path)
+            .status()
+            .expect("chflags");
+        assert!(status.success());
+    };
+    for valid_false in [false, true] {
+        let label = if valid_false {
+            "200 valid:false"
+        } else {
+            "403"
+        };
+        let server = MockServer::start().await;
+        // A private cache directory, so making it read-only affects no other test.
+        let storage = tempfile::tempdir().unwrap();
+        let storage_path = storage.path().to_path_buf();
+        let (sdk, _config) = sdk_with_valid_offline_grant_configured(
+            &server,
+            OfflineFallbackMode::Always,
+            |config| config.storage_path = Some(storage_path.clone()),
+        )
+        .await;
+        let response = if valid_false {
+            let mut denied = license_json(
+                "DENIAL-LICENSE",
+                "active",
+                "pro",
+                "hardware_locked",
+                &[],
+                "Test Product",
+            );
+            denied["active_seats"] = json!(1);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "object": "validation_result",
+                "valid": false,
+                "code": "not_entitled",
+                "message": "denied",
+                "license": denied,
+            }))
+        } else {
+            ResponseTemplate::new(403).set_body_json(api_error_response("not_entitled", "denied"))
+        };
+        Mock::given(method("POST"))
+            .and(path_regex(r"/products/.*/licenses/validate"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        set_immutable(&storage_path, true);
+        let denied = sdk.validate().await;
+        let entitled_after_denial = sdk.has_entitlement("pro-features");
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/products/.*/licenses/validate"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let during_outage = sdk.validate().await;
+        let entitled_during_outage = sdk.has_entitlement("pro-features");
+        set_immutable(&storage_path, false);
+
+        assert!(
+            matches!(denied, Err(licenseseat::Error::Cache(_))),
+            "{label}: the denial write was expected to fail, got {denied:?}"
+        );
+        assert!(
+            !entitled_after_denial,
+            "{label}: entitled after an unpersisted denial"
+        );
+        if let Ok(validation) = during_outage {
+            assert!(!validation.valid, "{label}: outage revived the grant");
+        }
+        assert!(
+            !entitled_during_outage,
+            "{label}: entitled during the outage"
+        );
     }
 }
 
