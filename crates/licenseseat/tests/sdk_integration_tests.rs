@@ -3253,6 +3253,36 @@ async fn thrown_authoritative_denials_never_fall_back_to_the_offline_grant() {
     }
 }
 
+/// A denial delivered by a heartbeat is the same server decision as one from
+/// validate: it must be recorded so no later outage or relaunch revives the grant.
+#[cfg(feature = "offline")]
+#[tokio::test]
+async fn heartbeat_authoritative_denials_are_recorded_like_validation_denials() {
+    for (status, code) in AUTHORITATIVE_DENIALS {
+        let label = format!("heartbeat {status} {code}");
+        let server = MockServer::start().await;
+        let (sdk, config) =
+            sdk_with_valid_offline_grant(&server, OfflineFallbackMode::Always).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/products/.*/licenses/heartbeat"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(api_error_response(code, "denied")),
+            )
+            .mount(&server)
+            .await;
+
+        match sdk.heartbeat().await {
+            Err(error) => assert_eq!(
+                error.code().map(str::to_ascii_lowercase).as_deref(),
+                Some(code),
+                "{label}"
+            ),
+            Ok(response) => panic!("{label}: heartbeat succeeded with {response:?}"),
+        }
+        assert_denial_is_the_current_decision(&server, &sdk, &config, &label).await;
+    }
+}
+
 #[cfg(feature = "offline")]
 #[tokio::test]
 async fn valid_false_authoritative_denials_keep_the_grant_but_never_revive_it() {

@@ -42,6 +42,10 @@ struct ParsedMachineFileEnvelope {
 }
 
 /// Verify an offline token's signature.
+///
+/// This checks the artifact (signature, claims, binding, validity window). It
+/// does not consult recorded server denials (e.g. `not_entitled`); use
+/// `LicenseSeat::validate()` / the license state for licensing decisions.
 pub fn verify_token(
     token: &OfflineTokenResponse,
     signing_key: &SigningKeyResponse,
@@ -238,6 +242,10 @@ pub(crate) fn offline_token_authorization_deadline(
 }
 
 /// Verify and decrypt a machine file.
+///
+/// This checks the artifact (signature, claims, binding, validity window). It
+/// does not consult recorded server denials (e.g. `not_entitled`); use
+/// `LicenseSeat::validate()` / the license state for licensing decisions.
 pub fn verify_machine_file(
     machine_file: &MachineFile,
     license_key: &str,

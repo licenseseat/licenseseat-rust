@@ -778,41 +778,15 @@ impl LicenseSeat {
                 self.emit(Event::with_error(EventKind::ValidationError, e.to_string()));
 
                 if is_authoritative_denial_error(&e) {
-                    if let Some(identity) = cached_identity.as_ref() {
-                        let _state_guard = self.lock_state_for_commit();
-                        self.ensure_current_target_operation(
-                            &self.inner.current_validation_operation,
-                            operation,
-                            stateful,
-                            "validation",
-                        )?;
-                        let mut denied_license = cached_license
-                            .clone()
-                            .expect("cached identity requires a cached license");
-                        let denial = thrown_denial_validation(&denied_license, &e);
-                        let observed_at = Utc::now();
-                        if !self
-                            .inner
-                            .cache
-                            .update_validation(identity, &denial, observed_at)?
-                        {
-                            return Err(Error::OperationSuperseded {
-                                operation: "validation",
-                            });
-                        }
-                        self.inner
-                            .current_offline_sync_operation
-                            .store(0, Ordering::SeqCst);
-                        self.stop_background_tasks();
-                        denied_license.validation = Some(denial.clone());
-                        denied_license.last_validated = observed_at;
-                        denied_license.trusted_license = None;
-                        self.set_runtime_license_state(
-                            denied_license,
-                            TrustedLicenseSource::FailClosedDenial,
-                        );
-                        self.emit(Event::with_validation(EventKind::ValidationFailed, denial));
-                    }
+                    self.record_thrown_authoritative_denial(
+                        &self.inner.current_validation_operation,
+                        operation,
+                        stateful,
+                        "validation",
+                        cached_identity.as_ref(),
+                        cached_license.as_ref(),
+                        &e,
+                    )?;
                     return Err(e);
                 }
 
@@ -1008,6 +982,52 @@ impl LicenseSeat {
         outcome
     }
 
+    /// Record a thrown authoritative denial (see `is_authoritative_denial_code`)
+    /// as the current decision: persisted as a `valid: false` validation, runtime
+    /// state `FailClosedDenial`, background tasks stopped. The offline grant is
+    /// kept; it is not a revocation. No-op without a cached identity.
+    #[allow(clippy::too_many_arguments)]
+    fn record_thrown_authoritative_denial(
+        &self,
+        slot: &AtomicU64,
+        operation: u64,
+        stateful: bool,
+        operation_name: &'static str,
+        cached_identity: Option<&LicenseIdentity>,
+        cached_license: Option<&License>,
+        error: &Error,
+    ) -> Result<()> {
+        let Some(identity) = cached_identity else {
+            return Ok(());
+        };
+        let _state_guard = self.lock_state_for_commit();
+        self.ensure_current_target_operation(slot, operation, stateful, operation_name)?;
+        let mut denied_license = cached_license
+            .cloned()
+            .expect("cached identity requires a cached license");
+        let denial = thrown_denial_validation(&denied_license, error);
+        let observed_at = Utc::now();
+        if !self
+            .inner
+            .cache
+            .update_validation(identity, &denial, observed_at)?
+        {
+            return Err(Error::OperationSuperseded {
+                operation: operation_name,
+            });
+        }
+        self.inner
+            .current_offline_sync_operation
+            .store(0, Ordering::SeqCst);
+        self.stop_background_tasks();
+        denied_license.validation = Some(denial.clone());
+        denied_license.last_validated = observed_at;
+        denied_license.trusted_license = None;
+        self.set_runtime_license_state(denied_license, TrustedLicenseSource::FailClosedDenial);
+        self.emit(Event::with_validation(EventKind::ValidationFailed, denial));
+        Ok(())
+    }
+
     /// Send a heartbeat for the current license.
     pub async fn heartbeat(&self) -> Result<HeartbeatResponse> {
         let license = self.current_license().ok_or(Error::NoActiveLicense)?;
@@ -1162,6 +1182,27 @@ impl LicenseSeat {
                     return Err(superseded);
                 }
                 self.set_last_heartbeat_error(Some(e.to_string()));
+                if is_authoritative_denial_error(&e) {
+                    // The same server decision as a validate denial: record it,
+                    // keep the grant, never restart support tasks for it.
+                    if let Err(record_error) = self.record_thrown_authoritative_denial(
+                        &self.inner.current_heartbeat_operation,
+                        operation,
+                        stateful,
+                        "heartbeat",
+                        cached_identity.as_ref(),
+                        cached_license.as_ref(),
+                        &e,
+                    ) {
+                        self.emit(Event::with_error(
+                            EventKind::HeartbeatError,
+                            record_error.to_string(),
+                        ));
+                        return Err(record_error);
+                    }
+                    self.emit(Event::with_error(EventKind::HeartbeatError, e.to_string()));
+                    return Err(e);
+                }
                 if is_authoritative_invalidation_error(&e) {
                     if let Some(identity) = cached_identity.as_ref() {
                         self.invalidate_license_operations();
@@ -2646,6 +2687,10 @@ impl LicenseSeat {
     }
 
     /// Verify a legacy offline token locally.
+    ///
+    /// This checks the artifact (signature, claims, binding, validity window). It
+    /// does not consult recorded server denials (e.g. `not_entitled`); use
+    /// `validate()` / the license state for licensing decisions.
     #[cfg(feature = "offline")]
     pub fn verify_offline_token(
         &self,
@@ -2808,6 +2853,10 @@ impl LicenseSeat {
     }
 
     /// Verify a machine file locally and emit the standard SDK verification events.
+    ///
+    /// This checks the artifact (signature, claims, binding, validity window). It
+    /// does not consult recorded server denials (e.g. `not_entitled`); use
+    /// `validate()` / the license state for licensing decisions.
     #[cfg(feature = "offline")]
     pub fn verify_machine_file(
         &self,
