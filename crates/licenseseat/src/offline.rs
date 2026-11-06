@@ -1335,6 +1335,69 @@ mod tests {
         assert!(authorization_deadline(i64::MAX, i64::MAX, 1, 0).is_err());
     }
 
+    /// Cross-SDK validity-window contract: the window is `[nbf, exp)`, so
+    /// `nbf == exp` authorizes no instant and must be rejected outright
+    /// (license_seat#16 is the gem-side fix for the same rule).
+    #[test]
+    fn offline_token_rejects_a_zero_width_validity_window() {
+        let mut token = token_with_entitlement_expiry(None);
+        token.token.nbf = token.token.exp - 1;
+        token.canonical = serde_json::to_string(&token.token).unwrap();
+        assert!(validate_token_envelope(&token).is_ok());
+
+        token.token.nbf = token.token.exp;
+        token.canonical = serde_json::to_string(&token.token).unwrap();
+        for result in [
+            validate_token_envelope(&token),
+            check_token_validity_at(&token, token.token.nbf, 0),
+            check_token_validity_at(&token, token.token.nbf - 1, 300),
+        ] {
+            assert!(matches!(
+                result,
+                Err(Error::OfflineVerificationFailed(code)) if code == "INVALID_TIME_WINDOW"
+            ));
+        }
+    }
+
+    #[test]
+    fn machine_file_rejects_a_zero_width_validity_window_even_with_grace() {
+        let mut payload = MachineFilePayload {
+            schema_version: 2,
+            issued: "2026-01-01T00:00:00Z".into(),
+            iat: 1_767_225_600,
+            expiry: "2026-01-02T00:00:00Z".into(),
+            exp: 1_767_312_000,
+            nbf: 1_767_311_999,
+            ttl: 86_400,
+            grace_period: 3_600,
+            license_key: "TEST-LICENSE".into(),
+            product_slug: "test-product".into(),
+            license_expires_at: None,
+            key_id: "key-1".into(),
+            sdk_version: None,
+            machine_id: "machine-1".into(),
+            fingerprint: "test-installation".into(),
+            fingerprint_components: Default::default(),
+            device_name: "Test Device".into(),
+            platform: "test".into(),
+            created_at: None,
+            metadata: Default::default(),
+            license: None,
+        };
+        assert!(machine_file_time_claims_are_valid(
+            &payload,
+            Some(payload.iat),
+            Some(payload.exp),
+        ));
+
+        payload.nbf = payload.exp;
+        assert!(!machine_file_time_claims_are_valid(
+            &payload,
+            Some(payload.iat),
+            Some(payload.exp),
+        ));
+    }
+
     #[test]
     fn machine_file_claim_window_rejects_non_positive_or_unrepresentable_time() {
         let mut payload = MachineFilePayload {
