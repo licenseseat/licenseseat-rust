@@ -549,6 +549,19 @@ impl LicenseCache {
             if license.identity() != *expected {
                 return Ok(false);
             }
+            // A recorded authoritative denial outranks any offline verdict; only
+            // an online response may replace it. Checked under the I/O lock so a
+            // concurrent instance cannot overwrite a denial committed after its
+            // own pre-check.
+            if result.offline
+                && result.valid
+                && license.validation.as_ref().is_some_and(|validation| {
+                    !validation.valid
+                        && crate::client::is_authoritative_denial_code(validation.code.as_deref())
+                })
+            {
+                return Ok(false);
+            }
             if result.valid && license.license_key == result.license.key {
                 license.trusted_license = Some(result.license.clone());
             } else if !result.valid {
@@ -1170,7 +1183,7 @@ fn sync_parent_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{License, LicenseResponse};
+    use crate::models::{License, LicenseResponse, ValidationResult};
     use chrono::{TimeZone, Utc};
 
     fn sample_license(key: &str, fingerprint: &str, activation_id: &str) -> License {
@@ -1209,6 +1222,63 @@ mod tests {
             .expect("trusted license fixture"),
         );
         license
+    }
+
+    /// Codex #20 finding 4: another instance that passed its own denial check
+    /// before this denial was committed must not overwrite it with an offline
+    /// grant. The precedence is enforced inside the cache transaction.
+    #[test]
+    fn offline_grant_cannot_overwrite_a_committed_authoritative_denial() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let cache = LicenseCache::new("denial_precedence_", Some(directory.path().into()));
+        let license = sample_trusted_license("KEY", "fingerprint", "activation");
+        cache.set_license(&license).expect("cache write");
+        let identity = license.identity();
+        let response = license.trusted_license.clone().expect("trusted fixture");
+        let now = Utc::now();
+        let result = |valid: bool, code: Option<&str>, offline: bool| ValidationResult {
+            object: "validation_result".into(),
+            valid,
+            code: code.map(Into::into),
+            message: None,
+            warnings: None,
+            license: response.clone(),
+            activation: None,
+            offline,
+        };
+
+        assert!(
+            cache
+                .update_validation(&identity, &result(false, Some("NOT_ENTITLED"), false), now)
+                .expect("denial write")
+        );
+        assert!(
+            !cache
+                .update_validation(&identity, &result(true, None, true), now)
+                .expect("offline write")
+        );
+        let stored = cache
+            .get_license()
+            .expect("license")
+            .validation
+            .expect("validation");
+        assert!(!stored.valid);
+        assert_eq!(stored.code.as_deref(), Some("NOT_ENTITLED"));
+
+        // An offline *denial* and an online success still apply.
+        assert!(
+            cache
+                .update_validation(&identity, &result(true, None, false), now)
+                .expect("online write")
+        );
+        assert!(
+            cache
+                .get_license()
+                .expect("license")
+                .validation
+                .expect("v")
+                .valid
+        );
     }
 
     #[test]

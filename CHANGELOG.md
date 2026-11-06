@@ -6,6 +6,25 @@
 
 ### Fixed
 
+- **Authoritative denials never fall back to the offline grant.** A
+  validation answered with `version_not_entitled`, `not_entitled`,
+  `product_mismatch`, `floating_not_implemented` or
+  `named_user_not_implemented` (codes compared case-insensitively), whether
+  thrown or returned as `200 valid:false`, is now the current decision in
+  both `OfflineFallbackMode`s:
+  - 501 `floating_not_implemented` / `named_user_not_implemented` were
+    classified as network errors (5xx) and answered by the cached signed
+    grant, in both modes.
+  - A thrown 403 `not_entitled` / `version_not_entitled` changed nothing:
+    the SDK stayed entitled, and a later outage or relaunch kept the grant.
+  - The denial is now persisted as a `valid:false` validation and the
+    runtime state becomes a fail-closed denial, so a later outage or an
+    offline relaunch answers with the denial, not the grant.
+  - The signed grant is **kept** (it was purged for `valid:false` denials and
+    422 `product_mismatch`, which also removed the activation); the next
+    online `valid:true` restores entitlement. Revocation/suspension still
+    purge.
+  - 401/403/429/5xx without one of these codes keep their existing fallback.
 - Entitlement-expiry `license:state-changed` events are now emitted by the
   first observation at or after the entitlement's real expiry. The SDK
   detects entitlement transitions when its license state is observed

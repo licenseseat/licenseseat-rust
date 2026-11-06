@@ -459,6 +459,12 @@ impl LicenseSeat {
         self.validate_request_fingerprint(&device_id)?;
         validate_optional_text_input(options.device_name.as_deref(), 255, "device_name")?;
         validate_metadata_input(options.metadata.as_ref(), "metadata")?;
+        // The activation this request would renew, if any: a denial for it is
+        // recorded like a validate denial.
+        let current_identity = self
+            .current_license()
+            .filter(|license| license.license_key == license_key && license.device_id == device_id)
+            .map(|license| license.identity());
         debug!("Starting activation request");
 
         self.emit(Event::new(EventKind::ActivationStart));
@@ -552,10 +558,24 @@ impl LicenseSeat {
 
                 debug!("License activated successfully");
             }
-            Err(error) => self.emit(Event::with_error(
-                EventKind::ActivationError,
-                error.to_string(),
-            )),
+            Err(error) => {
+                // Re-activating the current activation and being told "not
+                // entitled" is the same decision as a validate denial.
+                if let Some(identity) = current_identity.as_ref() {
+                    if let Err(record_error) =
+                        self.record_lifecycle_authoritative_denial(identity, error)
+                    {
+                        self.emit(Event::with_error(
+                            EventKind::SdkError,
+                            record_error.to_string(),
+                        ));
+                    }
+                }
+                self.emit(Event::with_error(
+                    EventKind::ActivationError,
+                    error.to_string(),
+                ))
+            }
         }
         let _ = self.inner.current_activation_operation.compare_exchange(
             operation,
@@ -640,11 +660,33 @@ impl LicenseSeat {
                 )?;
                 let observed_at = Utc::now();
                 if let Some(identity) = cached_identity.as_ref() {
-                    if !self
-                        .inner
-                        .cache
-                        .update_validation(identity, &result, observed_at)?
-                    {
+                    let persisted =
+                        self.inner
+                            .cache
+                            .update_validation(identity, &result, observed_at);
+                    if let Err(error) = persisted {
+                        if !result.valid {
+                            // The server's denial stands even if it cannot be
+                            // written: install it here and retire the grant.
+                            self.inner
+                                .current_offline_sync_operation
+                                .store(0, Ordering::SeqCst);
+                            self.stop_background_tasks();
+                            self.retire_offline_grant_after_unpersisted_denial();
+                            let mut denied_license = cached_license
+                                .clone()
+                                .expect("cached identity requires a cached license");
+                            denied_license.validation = Some(result.clone());
+                            denied_license.last_validated = observed_at;
+                            denied_license.trusted_license = None;
+                            self.set_runtime_license_state(
+                                denied_license,
+                                TrustedLicenseSource::FailClosedDenial,
+                            );
+                        }
+                        return Err(error);
+                    }
+                    if !persisted? {
                         return Err(Error::OperationSuperseded {
                             operation: "validation",
                         });
@@ -664,8 +706,17 @@ impl LicenseSeat {
                         // Persist the authoritative denial before deleting any
                         // older signed grant. If deletion fails, the denial
                         // remains the fail-closed state observed on restart.
-                        if let Err(error) = self.inner.cache.clear_offline_assets() {
-                            self.emit(Event::with_error(EventKind::SdkError, error.to_string()));
+                        // An entitlement/mode denial is the current decision,
+                        // not proof the grant is void: it is recorded (and
+                        // blocks every offline fallback) but the grant is kept
+                        // for the next online `valid:true`.
+                        if !is_authoritative_denial_code(result.code.as_deref()) {
+                            if let Err(error) = self.inner.cache.clear_offline_assets() {
+                                self.emit(Event::with_error(
+                                    EventKind::SdkError,
+                                    error.to_string(),
+                                ));
+                            }
                         }
                         self.stop_background_tasks();
                     }
@@ -775,6 +826,19 @@ impl LicenseSeat {
                     ));
                 }
                 self.emit(Event::with_error(EventKind::ValidationError, e.to_string()));
+
+                if is_authoritative_denial_error(&e) {
+                    self.record_thrown_authoritative_denial(
+                        &self.inner.current_validation_operation,
+                        operation,
+                        stateful,
+                        "validation",
+                        cached_identity.as_ref(),
+                        cached_license.as_ref(),
+                        &e,
+                    )?;
+                    return Err(e);
+                }
 
                 if is_authoritative_invalidation_error(&e) {
                     let _state_guard = self.lock_state_for_commit();
@@ -968,6 +1032,103 @@ impl LicenseSeat {
         outcome
     }
 
+    /// Record a thrown authoritative denial (see `is_authoritative_denial_code`)
+    /// as the current decision: persisted as a `valid: false` validation, runtime
+    /// state `FailClosedDenial`, background tasks stopped. The offline grant is
+    /// kept; it is not a revocation. No-op without a cached identity.
+    #[allow(clippy::too_many_arguments)]
+    fn record_thrown_authoritative_denial(
+        &self,
+        slot: &AtomicU64,
+        operation: u64,
+        stateful: bool,
+        operation_name: &'static str,
+        cached_identity: Option<&LicenseIdentity>,
+        cached_license: Option<&License>,
+        error: &Error,
+    ) -> Result<()> {
+        let Some(identity) = cached_identity else {
+            return Ok(());
+        };
+        let _state_guard = self.lock_state_for_commit();
+        self.ensure_current_target_operation(slot, operation, stateful, operation_name)?;
+        let license = cached_license
+            .cloned()
+            .expect("cached identity requires a cached license");
+        if !self.commit_thrown_authoritative_denial_locked(identity, license, error)? {
+            return Err(Error::OperationSuperseded {
+                operation: operation_name,
+            });
+        }
+        Ok(())
+    }
+
+    /// Record an authoritative denial returned by a lifecycle request that has
+    /// no operation slot of its own (activation, machine-file checkout, offline
+    /// token) when it concerns the exact current activation.
+    #[cfg_attr(not(feature = "offline"), allow(dead_code))]
+    fn record_lifecycle_authoritative_denial(
+        &self,
+        identity: &LicenseIdentity,
+        error: &Error,
+    ) -> Result<()> {
+        if !is_authoritative_denial_error(error) {
+            return Ok(());
+        }
+        let _state_guard = self.lock_state_for_commit();
+        let Some(license) = self
+            .current_license()
+            .filter(|license| license.identity() == *identity)
+        else {
+            return Ok(());
+        };
+        self.commit_thrown_authoritative_denial_locked(identity, license, error)
+            .map(|_| ())
+    }
+
+    /// Caller holds the state-commit lock. Returns `Ok(false)` when the cached
+    /// activation is no longer `identity`. If the decision cannot be persisted,
+    /// the denial is still installed for this process and the signed offline
+    /// grant is retired, so neither this process nor a relaunch can revive it.
+    fn commit_thrown_authoritative_denial_locked(
+        &self,
+        identity: &LicenseIdentity,
+        mut denied_license: License,
+        error: &Error,
+    ) -> Result<bool> {
+        let denial = thrown_denial_validation(&denied_license, error);
+        let observed_at = Utc::now();
+        let persisted = self
+            .inner
+            .cache
+            .update_validation(identity, &denial, observed_at);
+        if matches!(persisted, Ok(false)) {
+            return Ok(false);
+        }
+        self.inner
+            .current_offline_sync_operation
+            .store(0, Ordering::SeqCst);
+        self.stop_background_tasks();
+        if persisted.is_err() {
+            self.retire_offline_grant_after_unpersisted_denial();
+        }
+        denied_license.validation = Some(denial.clone());
+        denied_license.last_validated = observed_at;
+        denied_license.trusted_license = None;
+        self.set_runtime_license_state(denied_license, TrustedLicenseSource::FailClosedDenial);
+        self.emit(Event::with_validation(EventKind::ValidationFailed, denial));
+        persisted
+    }
+
+    /// A denial that could not be written must not leave a signed offline grant
+    /// that a later outage or relaunch would accept.
+    fn retire_offline_grant_after_unpersisted_denial(&self) {
+        #[cfg(feature = "offline")]
+        if let Err(error) = self.inner.cache.clear_offline_assets() {
+            self.emit(Event::with_error(EventKind::SdkError, error.to_string()));
+        }
+    }
+
     /// Send a heartbeat for the current license.
     pub async fn heartbeat(&self) -> Result<HeartbeatResponse> {
         let license = self.current_license().ok_or(Error::NoActiveLicense)?;
@@ -1122,6 +1283,27 @@ impl LicenseSeat {
                     return Err(superseded);
                 }
                 self.set_last_heartbeat_error(Some(e.to_string()));
+                if is_authoritative_denial_error(&e) {
+                    // The same server decision as a validate denial: record it,
+                    // keep the grant, never restart support tasks for it.
+                    if let Err(record_error) = self.record_thrown_authoritative_denial(
+                        &self.inner.current_heartbeat_operation,
+                        operation,
+                        stateful,
+                        "heartbeat",
+                        cached_identity.as_ref(),
+                        cached_license.as_ref(),
+                        &e,
+                    ) {
+                        self.emit(Event::with_error(
+                            EventKind::HeartbeatError,
+                            record_error.to_string(),
+                        ));
+                        return Err(record_error);
+                    }
+                    self.emit(Event::with_error(EventKind::HeartbeatError, e.to_string()));
+                    return Err(e);
+                }
                 if is_authoritative_invalidation_error(&e) {
                     if let Some(identity) = cached_identity.as_ref() {
                         self.invalidate_license_operations();
@@ -2431,10 +2613,22 @@ impl LicenseSeat {
                 self.emit(Event::new(EventKind::OfflineTokenFetched));
                 self.emit(Event::new(EventKind::OfflineTokenReady));
             }
-            Err(error) => self.emit(Event::with_error(
-                EventKind::OfflineTokenFetchError,
-                error.to_string(),
-            )),
+            Err(error) => {
+                if let Some(identity) = cached_identity.as_ref() {
+                    if let Err(record_error) =
+                        self.record_lifecycle_authoritative_denial(identity, error)
+                    {
+                        self.emit(Event::with_error(
+                            EventKind::SdkError,
+                            record_error.to_string(),
+                        ));
+                    }
+                }
+                self.emit(Event::with_error(
+                    EventKind::OfflineTokenFetchError,
+                    error.to_string(),
+                ))
+            }
         }
         outcome
     }
@@ -2585,10 +2779,22 @@ impl LicenseSeat {
                 self.emit(Event::new(EventKind::MachineFileFetched));
                 self.emit(Event::new(EventKind::MachineFileReady));
             }
-            Err(error) => self.emit(Event::with_error(
-                EventKind::MachineFileFetchError,
-                error.to_string(),
-            )),
+            Err(error) => {
+                if let Some(identity) = cached_identity.as_ref() {
+                    if let Err(record_error) =
+                        self.record_lifecycle_authoritative_denial(identity, error)
+                    {
+                        self.emit(Event::with_error(
+                            EventKind::SdkError,
+                            record_error.to_string(),
+                        ));
+                    }
+                }
+                self.emit(Event::with_error(
+                    EventKind::MachineFileFetchError,
+                    error.to_string(),
+                ))
+            }
         }
         outcome
     }
@@ -2612,6 +2818,10 @@ impl LicenseSeat {
     }
 
     /// Verify a legacy offline token locally.
+    ///
+    /// This checks the artifact (signature, claims, binding, validity window). It
+    /// does not consult recorded server denials (e.g. `not_entitled`); use
+    /// `validate()` / the license state for licensing decisions.
     #[cfg(feature = "offline")]
     pub fn verify_offline_token(
         &self,
@@ -2774,6 +2984,10 @@ impl LicenseSeat {
     }
 
     /// Verify a machine file locally and emit the standard SDK verification events.
+    ///
+    /// This checks the artifact (signature, claims, binding, validity window). It
+    /// does not consult recorded server denials (e.g. `not_entitled`); use
+    /// `validate()` / the license state for licensing decisions.
     #[cfg(feature = "offline")]
     pub fn verify_machine_file(
         &self,
@@ -2842,7 +3056,9 @@ impl LicenseSeat {
             Err(error) => error,
         };
 
-        if !self.inner.config.enable_legacy_offline_tokens {
+        if !self.inner.config.enable_legacy_offline_tokens
+            || is_authoritative_denial_error(&machine_file_error)
+        {
             return Err(machine_file_error);
         }
 
@@ -3064,6 +3280,11 @@ impl LicenseSeat {
     }
 
     fn should_fallback_offline(&self, error: &Error) -> bool {
+        // An authoritative denial is a decision, not an availability failure,
+        // whatever its status (501 `floating_not_implemented` is a 5xx).
+        if is_authoritative_denial_error(error) {
+            return false;
+        }
         let retryable_server_or_transport =
             error.is_network_error() || matches!(error, Error::Api { status: 429, .. });
         match self.inner.config.offline_fallback_mode {
@@ -3131,6 +3352,30 @@ impl LicenseSeat {
         expected_state_operation: u64,
     ) -> Result<ValidationResult> {
         let mut last_invalid: Option<ValidationResult> = None;
+
+        // An authoritative denial installed in this process stands even when it
+        // could not be persisted (disk full, read-only cache): never fall back
+        // past it to an older signed grant.
+        let in_process_denial = {
+            let guard = self
+                .inner
+                .runtime_license_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .as_ref()
+                .filter(|state| {
+                    matches!(state.source, TrustedLicenseSource::FailClosedDenial)
+                        && state.license.identity() == *expected_identity
+                })
+                .and_then(|state| state.license.validation.clone())
+                .filter(|validation| {
+                    !validation.valid && is_authoritative_denial_code(validation.code.as_deref())
+                })
+        };
+        if let Some(denial) = in_process_denial {
+            return Ok(denial);
+        }
 
         // A previously committed online or local denial is stronger than any
         // older signed offline grant. This also prevents an undeletable or
@@ -4650,6 +4895,11 @@ fn validate_api_endpoint(url: &url::Url, verify_ssl: bool) -> Result<()> {
 }
 
 fn is_retryable_request_error(error: &Error) -> bool {
+    // An authoritative denial is a decision, not a transient failure; retrying
+    // could replace it with a codeless 5xx that falls back to the offline grant.
+    if is_authoritative_denial_error(error) {
+        return false;
+    }
     matches!(
         error,
         Error::Network(_)
@@ -5289,6 +5539,72 @@ fn is_revocation_code(code: Option<&str>) -> bool {
     })
 }
 
+/// Entitlement and license-mode denials (cross-SDK contract, see
+/// licenseseat-swift#26). The server's answer is the current decision in every
+/// fallback mode: it is recorded and never answered by an offline grant, but
+/// it does not void the grant the way revocation does.
+pub(crate) fn is_authoritative_denial_code(code: Option<&str>) -> bool {
+    code.is_some_and(|code| {
+        matches!(
+            code.to_ascii_lowercase().as_str(),
+            "version_not_entitled"
+                | "not_entitled"
+                | "product_mismatch"
+                | "floating_not_implemented"
+                | "named_user_not_implemented"
+        )
+    })
+}
+
+/// A thrown authoritative denial, regardless of HTTP status: the code, not the
+/// status class, decides (501 `floating_not_implemented` must not read as an
+/// outage).
+fn is_authoritative_denial_error(error: &Error) -> bool {
+    matches!(error, Error::Api { code, .. } if is_authoritative_denial_code(code.as_deref()))
+}
+
+/// The `valid:false` decision recorded for a thrown denial, so that a later
+/// outage or relaunch finds it before any signed offline grant.
+fn thrown_denial_validation(license: &License, error: &Error) -> ValidationResult {
+    let mut denied = license
+        .validation
+        .as_ref()
+        .map(|validation| validation.license.clone())
+        .or_else(|| license.trusted_license.clone())
+        .unwrap_or_else(|| LicenseResponse {
+            object: "license".into(),
+            key: license.license_key.clone(),
+            status: "active".into(),
+            starts_at: None,
+            expires_at: None,
+            mode: String::new(),
+            plan_key: String::new(),
+            seat_limit: None,
+            active_seats: 0,
+            active_entitlements: Vec::new(),
+            metadata: None,
+            product: Product {
+                slug: String::new(),
+                name: String::new(),
+            },
+        });
+    denied.active_entitlements.clear();
+    let (code, message) = match error {
+        Error::Api { code, message, .. } => (code.clone(), Some(message.clone())),
+        other => (None, Some(other.to_string())),
+    };
+    ValidationResult {
+        object: "validation_result".into(),
+        valid: false,
+        code: code.map(|code| code.to_ascii_lowercase()),
+        message,
+        warnings: None,
+        license: denied,
+        activation: None,
+        offline: false,
+    }
+}
+
 /// Return true only for API outcomes that authoritatively prove that the
 /// currently cached activation can no longer be used. Generic 404/422 errors
 /// are intentionally excluded: an intermediary, route mismatch, malformed
@@ -5320,7 +5636,6 @@ fn is_authoritative_invalidation_error(error: &Error) -> bool {
                 | "license_revoked"
                 | "license_suspended"
                 | "not_active"
-                | "product_mismatch"
                 | "revoked"
                 | "suspended"
         )
