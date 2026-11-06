@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-## [0.6.4] - Unreleased (proposed)
+## [0.6.4] - 2026-11-06
 
 ### Fixed
 
@@ -25,6 +25,20 @@
     online `valid:true` restores entitlement. Revocation/suspension still
     purge.
   - 401/403/429/5xx without one of these codes keep their existing fallback.
+  - Authoritative denials are never retried (a retried 501 could otherwise be
+    replaced by a later codeless 503 that falls back to the grant).
+  - Denials returned by heartbeat, machine-file checkout, legacy offline-token
+    issuance and re-activation of the current activation are recorded the same
+    way; offline sync no longer requests a legacy token after a machine-file
+    denial.
+  - A denial that cannot be written to disk still holds for the running
+    process, and the signed grant is retired where possible.
+  - The cache refuses to overwrite a recorded denial with an offline grant
+    (checked inside the cache write lock, across SDK instances).
+  - Behaviour change: a 422 `product_mismatch` no longer deletes the
+    activation or emits `license:revoked`.
+  - Known gaps that need concurrent SDK instances, a temporarily immutable
+    cache directory, or a ~50 s clock rollback are tracked in #21.
 - Entitlement-expiry `license:state-changed` events are now emitted by the
   first observation at or after the entitlement's real expiry. The SDK
   detects entitlement transitions when its license state is observed
