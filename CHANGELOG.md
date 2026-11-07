@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- An offline validation that finds **no cached artifact at all** no longer
+  revokes an established grant. `perform_offline_validation` ends in a
+  "nothing to check against" fallback, and `finalize_offline_validation`
+  committed every invalid result with `trusted_license = None` and
+  `TrustedLicenseSource::FailClosedDenial` — including that one. This
+  contradicted `OfflineFallbackMode`'s documented contract, "only
+  specifically recognized authoritative license denials clear the last
+  trusted grant": an absent artifact is not a denial, it is the absence of a
+  verdict. A host whose network dipped before its first machine-file sync
+  landed would see a valid paid license read as revoked. It now surfaces as
+  `Error::NoOfflineArtifact` and leaves the established grant standing.
+- The post-activation offline-asset sync retries (5s / 30s / 2m / 10m)
+  instead of logging one failure and dropping it. Previously the only other
+  attempt was `offline_refresh_loop`, one whole
+  `offline_token_refresh_interval` later — 72 hours on hosts that raise it
+  — so an activation landing in a brief network gap left the install with no
+  artifact for days, which is precisely when the bug above would bite. The
+  retry runs off a `Weak` and has its own activation-specific cancellation,
+  so it can neither keep the SDK alive after the host drops it nor outlive the
+  activation it belongs to.
+- Activation-time artifact sync and its retries now run even when both periodic
+  support intervals are disabled; cancellation also interrupts retry backoff.
+
+### Added
+
+- `Error::NoOfflineArtifact`, distinguishing "offline validation could not
+  reach a verdict" from every failure that inspected an artifact and
+  rejected it.
+
 ## [0.6.4] - 2026-11-06
 
 ### Fixed

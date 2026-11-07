@@ -93,6 +93,16 @@ pub enum Error {
     #[error("clock tampering detected: system time appears to have been manipulated")]
     ClockTamperingDetected,
 
+    /// Offline validation could not reach a verdict because no signed artifact
+    /// is cached.
+    ///
+    /// Deliberately distinct from every other offline failure: those inspect an
+    /// artifact and reject it, while this one has nothing to inspect. It is an
+    /// absence of evidence, never a license denial, so it must not clear a
+    /// grant that an earlier authoritative decision established.
+    #[error("offline validation unavailable: no cached machine file or offline token")]
+    NoOfflineArtifact,
+
     /// Grace period exceeded for offline use.
     #[error("offline grace period exceeded: last online validation was {days} days ago")]
     GracePeriodExceeded {
@@ -189,6 +199,7 @@ impl Error {
             Self::OfflineTokenExpired => "offline artifact expired".into(),
             Self::OfflineVerificationFailed(_) => "offline verification failed".into(),
             Self::ClockTamperingDetected => "clock rollback detected".into(),
+            Self::NoOfflineArtifact => "no cached offline artifact".into(),
             Self::GracePeriodExceeded { .. } => "offline grace period exceeded".into(),
             Self::Cache(_) => "durable cache operation failed".into(),
             Self::Url(_) => "invalid URL".into(),

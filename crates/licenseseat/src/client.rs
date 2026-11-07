@@ -96,6 +96,8 @@ struct LicenseSeatInner {
     background_tasks_running: AtomicBool,
     support_tasks_generation: AtomicU64,
     support_tasks_cancel: Mutex<Option<watch::Sender<()>>>,
+    #[cfg(feature = "offline")]
+    activation_sync_cancel: Mutex<Option<watch::Sender<()>>>,
     auto_validation_running: AtomicBool,
     auto_validation_generation: AtomicU64,
     auto_validation_cancel: Mutex<Option<watch::Sender<()>>>,
@@ -384,6 +386,8 @@ impl LicenseSeat {
             background_tasks_running: AtomicBool::new(false),
             support_tasks_generation: AtomicU64::new(0),
             support_tasks_cancel: Mutex::new(None),
+            #[cfg(feature = "offline")]
+            activation_sync_cancel: Mutex::new(None),
             auto_validation_running: AtomicBool::new(false),
             auto_validation_generation: AtomicU64::new(0),
             auto_validation_cancel: Mutex::new(None),
@@ -482,6 +486,8 @@ impl LicenseSeat {
 
         let path = build_license_action_path(product_slug, "activate");
 
+        #[cfg(feature = "offline")]
+        let mut activation_sync = None;
         let outcome = match self.post::<ActivationResponse>(&path, Some(body)).await {
             Ok(activation) => (|| -> Result<(License, Vec<String>)> {
                 let _state_guard = self.lock_state_for_commit();
@@ -524,6 +530,16 @@ impl LicenseSeat {
                     license.clone(),
                     TrustedLicenseSource::OnlineResponse,
                 );
+                #[cfg(feature = "offline")]
+                {
+                    let (cancel_tx, cancel_rx) = watch::channel(());
+                    *self
+                        .inner
+                        .activation_sync_cancel
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancel_tx);
+                    activation_sync = Some((license.identity(), cancel_rx));
+                }
                 Ok((license, cache_warnings))
             })(),
             Err(error) => Err(error),
@@ -545,14 +561,12 @@ impl LicenseSeat {
 
                 #[cfg(feature = "offline")]
                 {
-                    let sdk = self.clone();
+                    let weak = Arc::downgrade(&self.inner);
+                    let (identity, cancel) = activation_sync
+                        .take()
+                        .expect("successful activation registers its offline sync");
                     tokio::spawn(async move {
-                        if let Err(error) = sdk.sync_offline_assets().await {
-                            warn!(
-                                "Failed to sync offline assets: {}",
-                                error.redacted_log_summary()
-                            );
-                        }
+                        Self::sync_offline_assets_after_activation(weak, identity, cancel).await;
                     });
                 }
 
@@ -2273,6 +2287,16 @@ impl LicenseSeat {
 
     /// Stop all background tasks.
     pub fn stop_background_tasks(&self) {
+        #[cfg(feature = "offline")]
+        if let Some(cancel) = self
+            .inner
+            .activation_sync_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = cancel.send(());
+        }
         self.stop_auto_validation();
         self.stop_heartbeat();
         self.stop_support_tasks();
@@ -2460,6 +2484,91 @@ impl LicenseSeat {
                             sdk.start_heartbeat(&license.license_key);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Fetch the offline artifact right after activation, retrying briefly.
+    ///
+    /// This was a single attempt whose failure was logged and dropped. The only
+    /// other chance was `offline_refresh_loop`, one whole
+    /// `offline_token_refresh_interval` later — 72 hours on hosts that raise it
+    /// from the default. So an activation that happened to land in a network
+    /// gap left the install with no cached artifact for days, and any
+    /// validation in that window had nothing to fall back on: exactly the
+    /// state that used to surface as a bogus denial.
+    ///
+    /// Short, bounded, and front-loaded, because a gap at activation is
+    /// normally over in seconds. Anything still failing after this belongs to
+    /// the refresh loop rather than to a task kept alive indefinitely.
+    #[cfg(feature = "offline")]
+    async fn sync_offline_assets_after_activation(
+        weak: Weak<LicenseSeatInner>,
+        identity: LicenseIdentity,
+        mut cancel: watch::Receiver<()>,
+    ) {
+        const RETRY_DELAYS: [Duration; 4] = [
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Duration::from_secs(120),
+            Duration::from_secs(600),
+        ];
+
+        let mut delays = RETRY_DELAYS.iter().copied();
+        let mut attempt = 1usize;
+
+        loop {
+            // Rebuilt per attempt from a Weak so a retry schedule can never be
+            // what keeps the SDK alive after the host drops it.
+            let outcome = {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let sdk = Self { inner };
+                if !sdk.inner.cache.matches_identity(&identity) {
+                    debug!("Offline asset sync stopping: activation superseded");
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancel.changed() => return,
+                    outcome = sdk.sync_offline_assets() => outcome,
+                }
+            };
+
+            match outcome {
+                Ok(()) => return,
+                // The activation this artifact would belong to is gone or has
+                // been replaced. Whatever replaced it runs its own sync.
+                Err(error @ (Error::NoActiveLicense | Error::OperationSuperseded { .. })) => {
+                    debug!(
+                        "Offline asset sync stopping: {}",
+                        error.redacted_log_summary()
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let Some(delay) = delays.next() else {
+                        warn!(
+                            "Failed to sync offline assets after {} attempts, leaving it to the refresh loop: {}",
+                            attempt,
+                            error.redacted_log_summary()
+                        );
+                        return;
+                    };
+                    warn!(
+                        "Offline asset sync attempt {} failed, retrying in {:?}: {}",
+                        attempt,
+                        delay,
+                        error.redacted_log_summary()
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = cancel.changed() => return,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    attempt += 1;
                 }
             }
         }
@@ -3501,12 +3610,19 @@ impl LicenseSeat {
             }
         }
 
-        let mut result = last_invalid.unwrap_or_else(|| {
-            offline_invalid_result(
-                Some("no_offline_artifact".into()),
-                Some("No cached machine file or offline token available".into()),
-            )
-        });
+        // Nothing to inspect at all. Every branch above examined an artifact
+        // and rejected it, which is a verdict; this is the absence of one.
+        //
+        // `OfflineFallbackMode`'s contract is explicit that "only specifically
+        // recognized authoritative license denials clear the last trusted
+        // grant", so committing this as a denial — which is what
+        // `finalize_offline_validation` does with any invalid result — would
+        // revoke a perfectly good license because the network happened to be
+        // down before the first machine-file sync succeeded. Report it as an
+        // error instead and leave the established grant exactly as it was.
+        let Some(mut result) = last_invalid else {
+            return Err(Error::NoOfflineArtifact);
+        };
         self.finalize_offline_validation(
             expected_identity,
             expected_state_operation,
@@ -5975,6 +6091,128 @@ mod runtime_state_tests {
             reordered.is_empty(),
             "transitions announced out of order: {reordered:?}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "offline"))]
+mod activation_sync_tests {
+    use super::runtime_state_tests::license_with_entitlements;
+    use super::{Config, EventKind, LicenseSeat};
+    use std::time::Duration;
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn deactivation_interrupts_activation_sync_backoff() {
+        let server = MockServer::start().await;
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = Config::new("test-api-key", "test-product");
+        config.api_base_url = server.uri();
+        config.storage_path = Some(storage.path().into());
+        config.device_identifier = Some("device-123".into());
+        config.auto_validate_interval = Duration::ZERO;
+        config.heartbeat_interval = Duration::ZERO;
+        config.network_recheck_interval = Duration::ZERO;
+        config.offline_token_refresh_interval = Duration::ZERO;
+        config.max_retries = 0;
+
+        let license = license_with_entitlements(&[]).validation.unwrap().license;
+        let mut replacement_license = license.clone();
+        replacement_license.key = "OTHER".into();
+        Mock::given(method("POST"))
+            .and(path("/products/test-product/licenses/activate"))
+            .and(body_partial_json(
+                serde_json::json!({ "license_key": "OTHER" }),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "object": "activation", "id": "act_2", "device_id": "device-123",
+                "license_key": "OTHER", "activated_at": chrono::Utc::now(),
+                "license": replacement_license
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/products/test-product/licenses/activate"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "object": "activation", "id": "act_1", "device_id": "device-123",
+                "license_key": "KEY", "activated_at": chrono::Utc::now(), "license": license
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/products/test-product/licenses/machine-file"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/products/test-product/licenses/deactivate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "deactivation", "activation_id": "act_1",
+                "deactivated_at": chrono::Utc::now()
+            })))
+            .mount(&server)
+            .await;
+
+        let sdk = LicenseSeat::try_new(config).unwrap();
+        let mut events = sdk.subscribe();
+        sdk.activate("KEY").await.unwrap();
+        let cancel = sdk
+            .inner
+            .activation_sync_cancel
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while events.recv().await.unwrap().kind != EventKind::MachineFileFetchError {}
+        })
+        .await
+        .expect("initial sync did not fail");
+        sdk.deactivate().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cancel.closed())
+            .await
+            .expect("cancelled retry remained asleep");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path().ends_with("/machine-file"))
+                .count(),
+            1
+        );
+
+        // The same cancellation path also applies to reset, explicit shutdown,
+        // and a replacement activation. Observe the old task's receiver being
+        // dropped instead of waiting for the five-second backoff to elapse.
+        for action in ["reset", "shutdown", "replace"] {
+            sdk.activate("KEY").await.unwrap();
+            let cancel = sdk
+                .inner
+                .activation_sync_cancel
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while events.recv().await.unwrap().kind != EventKind::MachineFileFetchError {}
+            })
+            .await
+            .expect("initial sync did not fail");
+            match action {
+                "reset" => sdk.try_reset().unwrap(),
+                "shutdown" => sdk.stop_background_tasks(),
+                "replace" => {
+                    sdk.activate("OTHER").await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            tokio::time::timeout(Duration::from_secs(1), cancel.closed())
+                .await
+                .unwrap_or_else(|_| panic!("{action} did not cancel the activation sync"));
+        }
+        assert_eq!(sdk.current_license().unwrap().license_key, "OTHER");
+        sdk.stop_background_tasks();
     }
 }
 
