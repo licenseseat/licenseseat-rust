@@ -2660,6 +2660,75 @@ async fn test_verify_machine_file_and_restore_offline() {
 
 #[cfg(feature = "offline")]
 #[tokio::test]
+async fn activation_sync_retries_without_periodic_workers_and_restores_offline() {
+    use licenseseat::EventKind;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    let server = MockServer::start().await;
+    let license_key = "OFFLINE-RETRY-KEY";
+    let fingerprint = "stable-fingerprint-123";
+    let (machine_file, public_key) = build_machine_file_fixture(license_key, fingerprint);
+    Mock::given(method("POST"))
+        .and(path_regex(r"/products/.*/licenses/activate"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(activation_response(license_key, fingerprint)),
+        )
+        .mount(&server)
+        .await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed_attempts = attempts.clone();
+    Mock::given(method("POST"))
+        .and(path("/products/test-product/licenses/machine-file"))
+        .respond_with(move |_: &wiremock::Request| {
+            if observed_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503)
+            } else {
+                ResponseTemplate::new(201).set_body_json(machine_file.clone())
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    let storage = tempfile::tempdir().unwrap();
+    config.storage_path = Some(storage.path().into());
+    config.device_identifier = Some(fingerprint.into());
+    config.signing_public_key = Some(public_key);
+    config.signing_key_id = Some("key-2026".into());
+    config.network_recheck_interval = Duration::ZERO;
+    config.offline_token_refresh_interval = Duration::ZERO;
+    config.max_retries = 0;
+    let sdk = LicenseSeat::try_new(config.clone()).unwrap();
+    let mut events = sdk.subscribe();
+    sdk.activate(license_key).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if events.recv().await.unwrap().kind == EventKind::OfflineAssetsRefreshed {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("activation-time retry did not download the artifact");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert!(sdk.current_machine_file().is_some());
+    drop(sdk);
+
+    config.api_base_url = "http://127.0.0.1:9".into();
+    let restored = LicenseSeat::try_new(config)
+        .unwrap()
+        .restore_license()
+        .await;
+    assert!(restored.restored, "offline restore failed: {restored:?}");
+    assert!(matches!(
+        restored.status,
+        LicenseStatus::OfflineValid { .. }
+    ));
+}
+
+#[cfg(feature = "offline")]
+#[tokio::test]
 async fn test_offline_restore_does_not_reuse_unsigned_activation_metadata_when_snapshot_is_missing()
 {
     let server = MockServer::start().await;

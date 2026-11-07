@@ -21,9 +21,11 @@
   `offline_token_refresh_interval` later — 72 hours on hosts that raise it
   — so an activation landing in a brief network gap left the install with no
   artifact for days, which is precisely when the bug above would bite. The
-  retry runs off a `Weak` and honours the background-task generation, so it
-  can neither keep the SDK alive after the host drops it nor outlive the
+  retry runs off a `Weak` and has its own activation-specific cancellation,
+  so it can neither keep the SDK alive after the host drops it nor outlive the
   activation it belongs to.
+- Activation-time artifact sync and its retries now run even when both periodic
+  support intervals are disabled; cancellation also interrupts retry backoff.
 
 ### Added
 
