@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-11-07
+
 ### Fixed
 
 - An offline validation that finds **no cached artifact at all** no longer
